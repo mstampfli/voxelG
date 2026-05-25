@@ -1,0 +1,1138 @@
+// Bit-packed voxel world with a 3-level u64 hierarchy.
+//
+// Hierarchy (every level fits in a single u64):
+//
+//   level   cell-size voxels   one cell stores                   axes
+//   ─────   ───────────────    ──────────────────────────────    ─────
+//   L1      4³  = 64           u64 = 1 bit per voxel             64×16×64 cells
+//   L2      16³ = 4³ bricks    u64 = 1 bit per child brick       16× 4×16 cells
+//   L3      64³ = 4³ tiles     u64 = 1 bit per child tile         4× 1× 4 cells
+//
+// At every level the cell is a 4³ subgrid → exactly one u64. So a single
+// bit-test "is this 64³ region of the world empty?" reads 8 bytes; if so we
+// skip that whole region during ray traversal.
+//
+// Within a brick, voxels are ordered (x, z, y) — y is the slowest axis. That
+// makes a 4×4 horizontal layer 16 contiguous bits, so falling-sand physics on
+// a u64 is `intra = sand & (~occupancy << 16)` — see physics.rs. Tile-in-chunk
+// and brick-in-tile linearisations follow the same convention.
+
+use glam::UVec3;
+
+pub const BRICK_DIM: u32 = 4;
+pub const BRICK_VOXELS: u32 = BRICK_DIM * BRICK_DIM * BRICK_DIM;
+
+pub const WORLD_BRICKS_X: u32 = 128;
+pub const WORLD_BRICKS_Y: u32 = 64;
+pub const WORLD_BRICKS_Z: u32 = 128;
+pub const WORLD_BRICKS_TOTAL: u32 = WORLD_BRICKS_X * WORLD_BRICKS_Y * WORLD_BRICKS_Z;
+
+pub const WORLD_VOXELS_X: u32 = WORLD_BRICKS_X * BRICK_DIM;
+pub const WORLD_VOXELS_Y: u32 = WORLD_BRICKS_Y * BRICK_DIM;
+pub const WORLD_VOXELS_Z: u32 = WORLD_BRICKS_Z * BRICK_DIM;
+
+pub const WORLD_TILES_X: u32 = WORLD_BRICKS_X / 4;
+pub const WORLD_TILES_Y: u32 = WORLD_BRICKS_Y / 4;
+pub const WORLD_TILES_Z: u32 = WORLD_BRICKS_Z / 4;
+pub const WORLD_TILES_TOTAL: u32 = WORLD_TILES_X * WORLD_TILES_Y * WORLD_TILES_Z;
+
+pub const WORLD_CHUNKS_X: u32 = (WORLD_TILES_X + 3) / 4;
+pub const WORLD_CHUNKS_Y: u32 = (WORLD_TILES_Y + 3) / 4;
+pub const WORLD_CHUNKS_Z: u32 = (WORLD_TILES_Z + 3) / 4;
+pub const WORLD_CHUNKS_TOTAL: u32 = WORLD_CHUNKS_X * WORLD_CHUNKS_Y * WORLD_CHUNKS_Z;
+
+// ---- storage chunks (the "chunked world") ----
+// A storage chunk holds 8x8x8 bricks = 32x32x32 voxels. Generation, dirty
+// tracking, and (eventually) GPU streaming all operate at this granularity.
+pub const STORAGE_CHUNK_BRICKS: u32 = 8;
+pub const STORAGE_CHUNK_VOXELS: u32 = STORAGE_CHUNK_BRICKS * BRICK_DIM;
+pub const WORLD_STORE_CX: u32 = WORLD_BRICKS_X / STORAGE_CHUNK_BRICKS;
+pub const WORLD_STORE_CY: u32 = WORLD_BRICKS_Y / STORAGE_CHUNK_BRICKS;
+pub const WORLD_STORE_CZ: u32 = WORLD_BRICKS_Z / STORAGE_CHUNK_BRICKS;
+pub const WORLD_STORE_CHUNKS: u32 = WORLD_STORE_CX * WORLD_STORE_CY * WORLD_STORE_CZ;
+
+#[inline(always)]
+pub const fn storage_chunk_idx(cx: u32, cy: u32, cz: u32) -> u32 {
+    cx + cy * WORLD_STORE_CX + cz * WORLD_STORE_CX * WORLD_STORE_CY
+}
+
+#[derive(Clone, Copy)]
+pub struct ChunkMeta {
+    pub generated: bool,
+}
+
+pub const MAT_AIR: u8 = 0;
+pub const MAT_SAND: u8 = 1;
+pub const MAT_GRASS: u8 = 2;
+pub const MAT_DIRT: u8 = 3;
+pub const MAT_STONE: u8 = 4;
+// 8 water-level variants encode mass per voxel (DwarfCorp-style cellular
+// fluid). L8 = a full cell of water (also what set_voxel places); the
+// physics step bleeds level into neighbours each tick.
+pub const MAT_WATER_L1: u8 = 5;
+pub const MAT_WATER_L2: u8 = 6;
+pub const MAT_WATER_L3: u8 = 7;
+pub const MAT_WATER_L4: u8 = 8;
+pub const MAT_WATER_L5: u8 = 9;
+pub const MAT_WATER_L6: u8 = 10;
+pub const MAT_WATER_L7: u8 = 11;
+pub const MAT_WATER_L8: u8 = 12;
+pub const MAT_WATER: u8 = MAT_WATER_L8; // alias for callers that just want "full water"
+pub const MAT_WOOD: u8 = 13;
+pub const MAT_LEAVES: u8 = 14;
+pub const MAT_SNOW: u8 = 15;
+pub const MAT_LAVA: u8 = 16;
+pub const MAT_ICE: u8 = 17;
+pub const MAT_GLASS: u8 = 18;
+pub const MAT_COAL: u8 = 19;
+pub const MAT_IRON: u8 = 20;
+pub const MAT_GOLD: u8 = 21;
+pub const MAT_DIAMOND: u8 = 22;
+pub const MAT_WOOD_BIRCH: u8 = 23;
+pub const MAT_WOOD_PINE: u8 = 24;
+pub const MAT_LEAVES_BIRCH: u8 = 25;
+pub const MAT_LEAVES_PINE: u8 = 26;
+pub const MAT_LEAVES_AUTUMN: u8 = 27;
+pub const MAT_SMOKE: u8 = 28;
+pub const MAT_FIRE: u8 = 29;
+
+#[inline(always)]
+pub fn is_leaf_mat(m: u8) -> bool {
+    m == MAT_LEAVES || m == MAT_LEAVES_BIRCH || m == MAT_LEAVES_PINE || m == MAT_LEAVES_AUTUMN
+}
+#[inline(always)]
+pub fn is_wood_mat(m: u8) -> bool {
+    m == MAT_WOOD || m == MAT_WOOD_BIRCH || m == MAT_WOOD_PINE
+}
+pub const MAX_WATER_LEVEL: u8 = 8;
+
+#[inline(always)]
+pub fn is_water_mat(m: u8) -> bool {
+    m >= MAT_WATER_L1 && m <= MAT_WATER_L8
+}
+
+#[inline(always)]
+pub fn is_movable_mat(m: u8) -> bool {
+    m == MAT_SAND || is_water_mat(m) || m == MAT_SMOKE
+}
+
+#[inline(always)]
+pub fn water_level_of(m: u8) -> u8 {
+    if is_water_mat(m) { m - MAT_WATER_L1 + 1 } else { 0 }
+}
+
+#[inline(always)]
+pub fn water_mat_for_level(level: u8) -> u8 {
+    if level == 0 { MAT_AIR } else { MAT_WATER_L1 + (level.min(MAX_WATER_LEVEL) - 1) }
+}
+
+#[inline(always)]
+pub const fn brick_voxel_idx(x: u32, y: u32, z: u32) -> u32 {
+    x + z * BRICK_DIM + y * BRICK_DIM * BRICK_DIM
+}
+
+#[inline(always)]
+pub const fn brick_idx(bx: u32, by: u32, bz: u32) -> u32 {
+    bx + by * WORLD_BRICKS_X + bz * WORLD_BRICKS_X * WORLD_BRICKS_Y
+}
+
+#[inline(always)]
+pub const fn tile_idx(tx: u32, ty: u32, tz: u32) -> u32 {
+    tx + ty * WORLD_TILES_X + tz * WORLD_TILES_X * WORLD_TILES_Y
+}
+
+#[inline(always)]
+pub const fn chunk_idx(cx: u32, cy: u32, cz: u32) -> u32 {
+    cx + cy * WORLD_CHUNKS_X + cz * WORLD_CHUNKS_X * WORLD_CHUNKS_Y
+}
+
+#[inline(always)]
+pub const fn brick_bit_in_tile(lx: u32, ly: u32, lz: u32) -> u32 {
+    lx + lz * 4 + ly * 16
+}
+
+#[inline(always)]
+pub const fn tile_bit_in_chunk(lx: u32, ly: u32, lz: u32) -> u32 {
+    lx + lz * 4 + ly * 16
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct Brick {
+    pub occupancy: u64,
+    pub materials: [u8; BRICK_VOXELS as usize],
+}
+
+impl Brick {
+    pub const EMPTY: Self = Self {
+        occupancy: 0,
+        materials: [0; BRICK_VOXELS as usize],
+    };
+
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.occupancy == 0
+    }
+
+    #[inline(always)]
+    pub fn set(&mut self, x: u32, y: u32, z: u32, mat: u8) {
+        let i = brick_voxel_idx(x, y, z);
+        let bit = 1u64 << i;
+        if mat == MAT_AIR {
+            self.occupancy &= !bit;
+            self.materials[i as usize] = 0;
+        } else {
+            self.occupancy |= bit;
+            self.materials[i as usize] = mat;
+        }
+    }
+}
+
+pub struct World {
+    pub bricks: Vec<Brick>,
+    pub tile_mask: Vec<u64>,
+    pub chunk_mask: Vec<u64>,
+    pub movable_mask: Vec<u64>,
+    pub active_bricks: Vec<u32>,
+    pub dirty_bricks: Vec<u32>,
+    pub all_dirty: bool,
+    pub chunk_meta: Vec<ChunkMeta>,
+    pub seed: u64,
+    /// Sliding-window origin in chunk coords (xz only — y axis is fixed).
+    /// Voxels stored locally at index `(x, y, z)` correspond to world voxel
+    /// `(world_origin.x * 32 + x, y, world_origin.z * 32 + z)`. As the camera
+    /// moves the origin shifts and edge chunks regenerate to give "infinite"
+    /// terrain. y stays in [0, WORLD_VOXELS_Y).
+    pub world_origin_chunk: glam::IVec2,
+    /// For each slot, the world chunk coord it currently holds. None = stale.
+    pub slot_world_chunk: Vec<Option<glam::IVec3>>,
+    pub regen_queue: std::collections::VecDeque<(u32, glam::IVec3)>,
+    /// Persistent voxel edits keyed by *world* voxel coord. Survives chunk
+    /// unload/regen — applied on top of fresh noise when a chunk reloads,
+    /// and synced over the network so all clients agree on player builds.
+    pub edits: std::collections::HashMap<(i32, i32, i32), u8>,
+}
+
+impl World {
+    pub fn new() -> Self {
+        Self::with_seed(0xC0FFEE_F00D_BEEFu64)
+    }
+
+    pub fn with_seed(seed: u64) -> Self {
+        Self {
+            bricks: vec![Brick::EMPTY; WORLD_BRICKS_TOTAL as usize],
+            tile_mask: vec![0u64; WORLD_TILES_TOTAL as usize],
+            chunk_mask: vec![0u64; WORLD_CHUNKS_TOTAL as usize],
+            movable_mask: vec![0u64; WORLD_BRICKS_TOTAL as usize],
+            active_bricks: Vec::with_capacity(4096),
+            dirty_bricks: Vec::with_capacity(4096),
+            all_dirty: true,
+            chunk_meta: vec![ChunkMeta { generated: false }; WORLD_STORE_CHUNKS as usize],
+            seed,
+            world_origin_chunk: glam::IVec2::ZERO,
+            slot_world_chunk: vec![None; WORLD_STORE_CHUNKS as usize],
+            regen_queue: std::collections::VecDeque::with_capacity(256),
+            edits: std::collections::HashMap::new(),
+        }
+    }
+
+    /// World-voxel offset of the loaded window's lower corner.
+    pub fn world_origin_voxel(&self) -> glam::IVec3 {
+        glam::IVec3::new(
+            self.world_origin_chunk.x * STORAGE_CHUNK_VOXELS as i32,
+            0,
+            self.world_origin_chunk.y * STORAGE_CHUNK_VOXELS as i32,
+        )
+    }
+
+    /// Record a persistent edit at WORLD-voxel coords and (if it's currently
+    /// inside the loaded window) apply it locally. The edit map drives
+    /// replay-on-regen so builds survive crossing the chunk-streaming edge.
+    pub fn apply_edit(&mut self, wx: i32, wy: i32, wz: i32, mat: u8) {
+        self.edits.insert((wx, wy, wz), mat);
+        let origin = self.world_origin_voxel();
+        let lx = wx - origin.x;
+        let ly = wy - origin.y;
+        let lz = wz - origin.z;
+        if lx >= 0 && ly >= 0 && lz >= 0
+            && (lx as u32) < WORLD_VOXELS_X
+            && (ly as u32) < WORLD_VOXELS_Y
+            && (lz as u32) < WORLD_VOXELS_Z
+        {
+            self.set_voxel(lx as u32, ly as u32, lz as u32, mat);
+        }
+    }
+
+    /// Target origin chunk-coord for a camera at the given world position.
+    /// Centres the loaded window on the camera.
+    pub fn target_origin_chunk(camera_world: glam::Vec3) -> glam::IVec2 {
+        let cam_cx = (camera_world.x / STORAGE_CHUNK_VOXELS as f32).floor() as i32;
+        let cam_cz = (camera_world.z / STORAGE_CHUNK_VOXELS as f32).floor() as i32;
+        let half_x = (WORLD_STORE_CX as i32) / 2;
+        let half_z = (WORLD_STORE_CZ as i32) / 2;
+        glam::IVec2::new(cam_cx - half_x, cam_cz - half_z)
+    }
+
+    /// Local voxel coords for `world_voxel`, given the current origin.
+    /// Returns None if `world_voxel` is outside the loaded window.
+    pub fn world_to_local(&self, world_voxel: glam::IVec3) -> Option<glam::UVec3> {
+        let origin_vox = glam::IVec3::new(
+            self.world_origin_chunk.x * STORAGE_CHUNK_VOXELS as i32,
+            0,
+            self.world_origin_chunk.y * STORAGE_CHUNK_VOXELS as i32,
+        );
+        let local = world_voxel - origin_vox;
+        if local.x < 0 || local.y < 0 || local.z < 0
+            || local.x >= WORLD_VOXELS_X as i32
+            || local.y >= WORLD_VOXELS_Y as i32
+            || local.z >= WORLD_VOXELS_Z as i32 { return None; }
+        Some(glam::UVec3::new(local.x as u32, local.y as u32, local.z as u32))
+    }
+
+    /// Shift the sliding window using TOROIDAL slot indexing. A slot at
+    /// store-coord `(sx, _, sz)` represents the world chunk in the loaded
+    /// window whose `mod WORLD_STORE_*` equals `(sx, sz)` — so a +1 origin
+    /// shift only invalidates the single column of slots that just dropped
+    /// out of the window.
+    pub fn shift_origin(&mut self, new_origin: glam::IVec2) {
+        if new_origin == self.world_origin_chunk { return; }
+        self.world_origin_chunk = new_origin;
+        let store_x = WORLD_STORE_CX as i32;
+        let store_z = WORLD_STORE_CZ as i32;
+        for cz in 0..WORLD_STORE_CZ {
+            for cy in 0..WORLD_STORE_CY {
+                for cx in 0..WORLD_STORE_CX {
+                    // For slot (cx, cy, cz), the world chunk currently in
+                    // the window with `wc mod store == slot` is computed via
+                    // the offset from origin's mod.
+                    let want_x = new_origin.x + (cx as i32 - new_origin.x).rem_euclid(store_x);
+                    let want_z = new_origin.y + (cz as i32 - new_origin.y).rem_euclid(store_z);
+                    let want = glam::IVec3::new(want_x, cy as i32, want_z);
+                    let slot = storage_chunk_idx(cx, cy, cz) as usize;
+                    if self.slot_world_chunk[slot] != Some(want) {
+                        self.clear_slot(cx, cy, cz);
+                        self.slot_world_chunk[slot] = Some(want);
+                        self.regen_queue.push_back((slot as u32, want));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Regenerate up to `budget` slots from the queue. Each regenerated slot
+    /// gets the persistent-edit map replayed on top so player builds survive
+    /// the chunk-streaming round-trip.
+    ///
+    /// Noise generation is **parallelised across rayon's thread pool** — each
+    /// worker computes a scratch `Vec<Brick>` for its slot independently
+    /// (pure function of world-chunk coord + seed), then the main thread
+    /// merges results into the flat world array serially. No shared mutable
+    /// state, no locks.
+    pub fn process_regen_queue(&mut self, budget: u32) {
+        use rayon::prelude::*;
+        let seed = self.seed;
+        // Drain budget items from the queue first.
+        let mut batch: Vec<(u32, glam::IVec3)> = Vec::with_capacity(budget as usize);
+        for _ in 0..budget {
+            let Some(item) = self.regen_queue.pop_front() else { break; };
+            batch.push(item);
+        }
+        if batch.is_empty() { return; }
+        // Parallel: each worker generates its slot's bricks into a private
+        // Vec — pure function of (world_chunk, seed), no shared state.
+        let results: Vec<(u32, glam::IVec3, Vec<Brick>)> = batch
+            .par_iter()
+            .map(|&(slot, want)| {
+                let bricks = gen_slot_bricks(want, seed);
+                (slot, want, bricks)
+            })
+            .collect();
+        // Serial merge: stitch each scratch chunk into the flat world array.
+        let mut regenerated_chunks: Vec<glam::IVec3> = Vec::with_capacity(results.len());
+        for (slot, want, scratch) in results {
+            let cx = slot % WORLD_STORE_CX;
+            let cy = (slot / WORLD_STORE_CX) % WORLD_STORE_CY;
+            let cz = slot / (WORLD_STORE_CX * WORLD_STORE_CY);
+            self.apply_slot_bricks(cx, cy, cz, &scratch);
+            regenerated_chunks.push(want);
+        }
+        if !regenerated_chunks.is_empty() && !self.edits.is_empty() {
+            let cv = STORAGE_CHUNK_VOXELS as i32;
+            let origin = self.world_origin_voxel();
+            // Pre-filter into a vec so we don't hold an immutable borrow on
+            // self.edits while calling self.set_voxel.
+            let mut to_apply: Vec<(i32, i32, i32, u8)> = Vec::new();
+            for (&(wx, wy, wz), &mat) in &self.edits {
+                let edit_chunk = glam::IVec3::new(
+                    wx.div_euclid(cv),
+                    wy.div_euclid(cv),
+                    wz.div_euclid(cv),
+                );
+                if regenerated_chunks.contains(&edit_chunk) {
+                    to_apply.push((wx, wy, wz, mat));
+                }
+            }
+            for (wx, wy, wz, mat) in to_apply {
+                let lx = wx - origin.x;
+                let ly = wy - origin.y;
+                let lz = wz - origin.z;
+                if lx >= 0 && ly >= 0 && lz >= 0
+                    && (lx as u32) < WORLD_VOXELS_X
+                    && (ly as u32) < WORLD_VOXELS_Y
+                    && (lz as u32) < WORLD_VOXELS_Z
+                {
+                    self.set_voxel(lx as u32, ly as u32, lz as u32, mat);
+                }
+            }
+        }
+    }
+
+    /// Wipe one slot's voxels (and the corresponding mask bits) so the
+    /// renderer immediately shows sky/air there. The slot stays empty until
+    /// `process_regen_queue` gets to it.
+    fn clear_slot(&mut self, slot_cx: u32, slot_cy: u32, slot_cz: u32) {
+        let x0 = slot_cx * STORAGE_CHUNK_BRICKS;
+        let y0 = slot_cy * STORAGE_CHUNK_BRICKS;
+        let z0 = slot_cz * STORAGE_CHUNK_BRICKS;
+        for dz in 0..STORAGE_CHUNK_BRICKS {
+            for dy in 0..STORAGE_CHUNK_BRICKS {
+                for dx in 0..STORAGE_CHUNK_BRICKS {
+                    let bi = brick_idx(x0 + dx, y0 + dy, z0 + dz);
+                    let was_nonempty = !self.bricks[bi as usize].is_empty();
+                    self.bricks[bi as usize] = Brick::EMPTY;
+                    self.movable_mask[bi as usize] = 0;
+                    if was_nonempty {
+                        self.refresh_masks_for_brick(x0 + dx, y0 + dy, z0 + dz);
+                    }
+                    self.mark_brick_dirty(bi);
+                }
+            }
+        }
+    }
+
+    /// Apply a precomputed slot's bricks (from `gen_slot_bricks`) into the
+    /// flat world array, refresh masks, mark bricks dirty.
+    fn apply_slot_bricks(&mut self, slot_cx: u32, slot_cy: u32, slot_cz: u32, scratch: &[Brick]) {
+        let base_bx = slot_cx * STORAGE_CHUNK_BRICKS;
+        let base_by = slot_cy * STORAGE_CHUNK_BRICKS;
+        let base_bz = slot_cz * STORAGE_CHUNK_BRICKS;
+        for dz in 0..STORAGE_CHUNK_BRICKS {
+            for dy in 0..STORAGE_CHUNK_BRICKS {
+                for dx in 0..STORAGE_CHUNK_BRICKS {
+                    let scratch_idx =
+                        (dx + dy * STORAGE_CHUNK_BRICKS + dz * STORAGE_CHUNK_BRICKS * STORAGE_CHUNK_BRICKS)
+                            as usize;
+                    let bx = base_bx + dx;
+                    let by = base_by + dy;
+                    let bz = base_bz + dz;
+                    let bi = brick_idx(bx, by, bz);
+                    self.bricks[bi as usize] = scratch[scratch_idx];
+                    // Recompute movable_mask.
+                    let b = &self.bricks[bi as usize];
+                    let mut m = 0u64;
+                    for i in 0..64usize {
+                        m |= (is_movable_mat(b.materials[i]) as u64) << i;
+                    }
+                    let new_movable = m & b.occupancy;
+                    let was_movable = self.movable_mask[bi as usize] != 0;
+                    self.movable_mask[bi as usize] = new_movable;
+                    let is_movable = new_movable != 0;
+                    if was_movable != is_movable {
+                        if is_movable {
+                            if let Err(pos) = self.active_bricks.binary_search(&bi) {
+                                self.active_bricks.insert(pos, bi);
+                            }
+                        } else if let Ok(pos) = self.active_bricks.binary_search(&bi) {
+                            self.active_bricks.remove(pos);
+                        }
+                    }
+                    self.refresh_masks_for_brick(bx, by, bz);
+                    self.mark_brick_dirty(bi);
+                }
+            }
+        }
+    }
+
+    /// Regenerate one slot. Slot must already be cleared (by `clear_slot`).
+    pub fn regenerate_slot(&mut self, slot_cx: u32, slot_cy: u32, slot_cz: u32, world_chunk: glam::IVec3, seed: u64) {
+        let sea_level: u32 = 88;
+        let (s_x, s_z) = seed_offset_xz(seed);
+
+        let local_x0 = slot_cx * STORAGE_CHUNK_VOXELS;
+        let local_y0 = slot_cy * STORAGE_CHUNK_VOXELS;
+        let local_z0 = slot_cz * STORAGE_CHUNK_VOXELS;
+        let world_x0 = world_chunk.x * STORAGE_CHUNK_VOXELS as i32;
+        let world_y0 = world_chunk.y * STORAGE_CHUNK_VOXELS as i32;
+        let world_z0 = world_chunk.z * STORAGE_CHUNK_VOXELS as i32;
+
+        // First, clear all bricks in this slot.
+        for dz in 0..STORAGE_CHUNK_BRICKS {
+            for dy in 0..STORAGE_CHUNK_BRICKS {
+                for dx in 0..STORAGE_CHUNK_BRICKS {
+                    let bx = local_x0 / BRICK_DIM + dx;
+                    let by = local_y0 / BRICK_DIM + dy;
+                    let bz = local_z0 / BRICK_DIM + dz;
+                    let bi = brick_idx(bx, by, bz) as usize;
+                    self.bricks[bi] = Brick::EMPTY;
+                    self.movable_mask[bi] = 0;
+                }
+            }
+        }
+
+        // Generate using WORLD coords for noise so neighbouring chunks line
+        // up seamlessly.
+        for dz in 0..STORAGE_CHUNK_VOXELS {
+            for dx in 0..STORAGE_CHUNK_VOXELS {
+                let wx = (world_x0 + dx as i32) as f32 + s_x;
+                let wz = (world_z0 + dz as i32) as f32 + s_z;
+                let hilly     = fbm_2d(wx * 0.007, wz * 0.007, 4);
+                let mountains = fbm_2d(wx * 0.0025, wz * 0.0025, 3).max(0.0).powf(1.6) * 1.8;
+                let detail    = fbm_2d(wx * 0.04, wz * 0.04, 2) * 0.4;
+                let h_signed = (sea_level as f32 + 14.0 + hilly * 22.0 + mountains * 40.0 + detail * 3.0)
+                    .clamp(2.0, (WORLD_VOXELS_Y - 1) as f32) as i32;
+                // Lower-frequency biome noise → larger, less-jumpy biomes.
+                let temperature = fbm_2d(wx * 0.0006, wz * 0.0006, 3);
+                let humidity    = fbm_2d(wx * 0.0008 + 100.0, wz * 0.0008 + 100.0, 3);
+                let biome = pick_biome(temperature, humidity, h_signed as u32, sea_level);
+                let local_x = local_x0 + dx;
+                let local_z = local_z0 + dz;
+
+                for dy in 0..STORAGE_CHUNK_VOXELS {
+                    let world_y = world_y0 + dy as i32;
+                    let local_y = local_y0 + dy;
+                    if world_y < 0 || world_y >= WORLD_VOXELS_Y as i32 { continue; }
+                    if world_y > h_signed { break; }
+                    let cn  = value_noise_3d(wx * 0.045, world_y as f32 * 0.085, wz * 0.045);
+                    let cn2 = value_noise_3d(wx * 0.110, world_y as f32 * 0.060, wz * 0.110);
+                    if world_y > 4 && world_y + 3 < h_signed && (cn + cn2 * 0.6) > 0.30 { continue; }
+                    let h_u32 = h_signed as u32;
+                    let mat = if world_y as u32 >= h_u32 {
+                        biome.top_block(h_u32, sea_level)
+                    } else if (world_y as u32) + 4 >= h_u32 {
+                        biome.subsoil()
+                    } else {
+                        stone_or_ore(wx, world_y as f32, wz, h_u32)
+                    };
+                    self.write_voxel_unchecked(local_x, local_y, local_z, mat);
+                }
+                // Sea fill
+                if (h_signed as u32) < sea_level {
+                    for wy in ((h_signed + 1) as i32)..=(sea_level as i32) {
+                        if wy < world_y0 || wy >= world_y0 + STORAGE_CHUNK_VOXELS as i32 { continue; }
+                        let local_y = local_y0 + (wy - world_y0) as u32;
+                        if local_y < WORLD_VOXELS_Y {
+                            self.write_voxel_unchecked(local_x, local_y, local_z, MAT_WATER);
+                        }
+                    }
+                }
+            }
+        }
+
+        // CRITICAL: write_voxel_unchecked bypasses every bookkeeping mask, so
+        // we must rebuild them per-brick now. Without this the shader's
+        // hierarchical DDA sees the chunk as empty (tile/chunk bits unset)
+        // and renders sky, even though the bricks have content on the CPU.
+        for dz in 0..STORAGE_CHUNK_BRICKS {
+            for dy in 0..STORAGE_CHUNK_BRICKS {
+                for dx in 0..STORAGE_CHUNK_BRICKS {
+                    let bx = local_x0 / BRICK_DIM + dx;
+                    let by = local_y0 / BRICK_DIM + dy;
+                    let bz = local_z0 / BRICK_DIM + dz;
+                    let bi = brick_idx(bx, by, bz);
+                    let b = &self.bricks[bi as usize];
+                    let mut m = 0u64;
+                    for i in 0..64usize {
+                        m |= (is_movable_mat(b.materials[i]) as u64) << i;
+                    }
+                    let new_movable = m & b.occupancy;
+                    let was_movable = self.movable_mask[bi as usize] != 0;
+                    self.movable_mask[bi as usize] = new_movable;
+                    let is_movable = new_movable != 0;
+                    if was_movable != is_movable {
+                        if is_movable {
+                            if let Err(pos) = self.active_bricks.binary_search(&bi) {
+                                self.active_bricks.insert(pos, bi);
+                            }
+                        } else if let Ok(pos) = self.active_bricks.binary_search(&bi) {
+                            self.active_bricks.remove(pos);
+                        }
+                    }
+                    self.refresh_masks_for_brick(bx, by, bz);
+                    self.mark_brick_dirty(bi);
+                }
+            }
+        }
+    }
+
+    pub fn recompute_movable_for_brick(&mut self, bi: u32) {
+        let b = &self.bricks[bi as usize];
+        let mut m = 0u64;
+        for i in 0..64usize {
+            let movable = is_movable_mat(b.materials[i]) as u64;
+            m |= movable << i;
+        }
+        let was_movable = self.movable_mask[bi as usize] != 0;
+        let new_mask = m & b.occupancy;
+        self.movable_mask[bi as usize] = new_mask;
+        let is_movable = new_mask != 0;
+        if was_movable != is_movable {
+            if is_movable {
+                self.active_bricks.push(bi);
+            } else if let Ok(pos) = self.active_bricks.binary_search(&bi) {
+                self.active_bricks.remove(pos);
+            }
+        }
+    }
+
+    pub fn rebuild_active_bricks(&mut self) {
+        self.active_bricks.clear();
+        for (i, m) in self.movable_mask.iter().enumerate() {
+            if *m != 0 {
+                self.active_bricks.push(i as u32);
+            }
+        }
+        // Already in ascending order because we walk indices in order.
+    }
+
+    pub fn mark_brick_dirty(&mut self, bi: u32) {
+        if !self.all_dirty {
+            self.dirty_bricks.push(bi);
+        }
+    }
+
+    /// Refresh tile/chunk bits for a brick after the brick's occupancy may
+    /// have changed. Called by physics and by set_voxel().
+    pub fn refresh_masks_for_brick(&mut self, bx: u32, by: u32, bz: u32) {
+        let bi = brick_idx(bx, by, bz);
+        let solid = !self.bricks[bi as usize].is_empty();
+        let (tx, ty, tz) = (bx / 4, by / 4, bz / 4);
+        let ti = tile_idx(tx, ty, tz);
+        let bit = brick_bit_in_tile(bx & 3, by & 3, bz & 3);
+        let prev = self.tile_mask[ti as usize];
+        if solid {
+            self.tile_mask[ti as usize] |= 1u64 << bit;
+        } else {
+            self.tile_mask[ti as usize] &= !(1u64 << bit);
+        }
+        let now = self.tile_mask[ti as usize];
+        if (prev == 0) != (now == 0) {
+            let (cx, cy, cz) = (tx / 4, ty / 4, tz / 4);
+            let ci = chunk_idx(cx, cy, cz);
+            let cbit = tile_bit_in_chunk(tx & 3, ty & 3, tz & 3);
+            if now == 0 {
+                self.chunk_mask[ci as usize] &= !(1u64 << cbit);
+            } else {
+                self.chunk_mask[ci as usize] |= 1u64 << cbit;
+            }
+        }
+    }
+
+    pub fn set_voxel(&mut self, x: u32, y: u32, z: u32, mat: u8) {
+        if x >= WORLD_VOXELS_X || y >= WORLD_VOXELS_Y || z >= WORLD_VOXELS_Z {
+            return;
+        }
+        let (bx, by, bz) = (x / BRICK_DIM, y / BRICK_DIM, z / BRICK_DIM);
+        let (lx, ly, lz) = (x % BRICK_DIM, y % BRICK_DIM, z % BRICK_DIM);
+        let bi = brick_idx(bx, by, bz);
+        let was_empty = self.bricks[bi as usize].is_empty();
+        self.bricks[bi as usize].set(lx, ly, lz, mat);
+        let is_empty = self.bricks[bi as usize].is_empty();
+        if was_empty != is_empty {
+            self.refresh_masks_for_brick(bx, by, bz);
+        }
+        self.recompute_movable_for_brick(bi);
+        self.mark_brick_dirty(bi);
+    }
+
+    pub fn rebuild_all_masks(&mut self) {
+        self.tile_mask.iter_mut().for_each(|m| *m = 0);
+        self.chunk_mask.iter_mut().for_each(|m| *m = 0);
+        for bz in 0..WORLD_BRICKS_Z {
+            for by in 0..WORLD_BRICKS_Y {
+                for bx in 0..WORLD_BRICKS_X {
+                    if !self.bricks[brick_idx(bx, by, bz) as usize].is_empty() {
+                        let (tx, ty, tz) = (bx / 4, by / 4, bz / 4);
+                        let ti = tile_idx(tx, ty, tz) as usize;
+                        self.tile_mask[ti] |= 1u64 << brick_bit_in_tile(bx & 3, by & 3, bz & 3);
+                    }
+                }
+            }
+        }
+        for tz in 0..WORLD_TILES_Z {
+            for ty in 0..WORLD_TILES_Y {
+                for tx in 0..WORLD_TILES_X {
+                    let ti = tile_idx(tx, ty, tz) as usize;
+                    if self.tile_mask[ti] != 0 {
+                        let (cx, cy, cz) = (tx / 4, ty / 4, tz / 4);
+                        let ci = chunk_idx(cx, cy, cz) as usize;
+                        self.chunk_mask[ci] |= 1u64 << tile_bit_in_chunk(tx & 3, ty & 3, tz & 3);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Top-level demo generation: walks every storage chunk and generates it
+    /// (terrain + ores + sea + trees). Trees place into neighbour chunks so
+    /// the tree pass runs after the terrain pass for the whole world.
+    pub fn fill_demo_terrain(&mut self) {
+        let seed = self.seed;
+        // Per-chunk terrain pass.
+        for cz in 0..WORLD_STORE_CZ {
+            for cy in 0..WORLD_STORE_CY {
+                for cx in 0..WORLD_STORE_CX {
+                    self.generate_chunk_terrain(cx, cy, cz, seed);
+                }
+            }
+        }
+        // Tree pass — global because canopies cross chunk boundaries.
+        let sea_level: u32 = 88;
+        for k in 0..2400u32 {
+            let tx = (k.wrapping_mul(2654435761).wrapping_add(7919)) % WORLD_VOXELS_X;
+            let tz = (k.wrapping_mul(40503).wrapping_add(4421)) % WORLD_VOXELS_Z;
+            let mut ground_y: i32 = -1;
+            for y in (0..WORLD_VOXELS_Y).rev() {
+                let bi = brick_idx(tx / BRICK_DIM, y / BRICK_DIM, tz / BRICK_DIM) as usize;
+                let vi = brick_voxel_idx(tx % BRICK_DIM, y % BRICK_DIM, tz % BRICK_DIM) as usize;
+                let bb = &self.bricks[bi];
+                if (bb.occupancy & (1u64 << vi)) != 0 {
+                    let gm = bb.materials[vi];
+                    if gm == MAT_GRASS || gm == MAT_DIRT { ground_y = y as i32; }
+                    break;
+                }
+            }
+            if ground_y < 0 { continue; }
+            let base_y = ground_y as u32 + 1;
+            let s_off = (seed_offset_xz(seed)).0;
+            let temperature = fbm_2d(tx as f32 * 0.0015 + s_off, tz as f32 * 0.0015 + s_off, 3);
+            let humidity = fbm_2d(tx as f32 * 0.0020 + 100.0 + s_off, tz as f32 * 0.0020 + 100.0 + s_off, 3);
+            let biome = pick_biome(temperature, humidity, base_y, sea_level);
+            if biome == Biome::Desert { continue; }
+            if base_y + 18 >= WORLD_VOXELS_Y { continue; }
+            let ttype = biome.tree_type(k.wrapping_add(seed as u32));
+            place_tree(self, tx as i32, base_y, tz as i32, ttype, k);
+        }
+
+        self.rebuild_all_masks();
+        for bi in 0..WORLD_BRICKS_TOTAL {
+            let b = &self.bricks[bi as usize];
+            let mut m = 0u64;
+            for i in 0..64usize {
+                m |= (is_movable_mat(b.materials[i]) as u64) << i;
+            }
+            self.movable_mask[bi as usize] = m & b.occupancy;
+        }
+        self.rebuild_active_bricks();
+        self.all_dirty = true;
+        for cm in self.chunk_meta.iter_mut() { cm.generated = true; }
+        // Initial slot ↔ world chunk mapping (origin starts at 0).
+        for cz in 0..WORLD_STORE_CZ {
+            for cy in 0..WORLD_STORE_CY {
+                for cx in 0..WORLD_STORE_CX {
+                    let slot = storage_chunk_idx(cx, cy, cz) as usize;
+                    self.slot_world_chunk[slot] = Some(glam::IVec3::new(cx as i32, cy as i32, cz as i32));
+                }
+            }
+        }
+    }
+
+    /// Generate one 32×32×32-voxel storage chunk. Idempotent — if the chunk
+    /// is already generated it returns immediately. World gen calls this in
+    /// a triple-loop, but the hook is here for future on-demand streaming.
+    pub fn generate_chunk_terrain(&mut self, cx: u32, cy: u32, cz: u32, seed: u64) {
+        let ci = storage_chunk_idx(cx, cy, cz) as usize;
+        if self.chunk_meta[ci].generated { return; }
+        let sea_level: u32 = 88;
+        let (s_x, s_z) = seed_offset_xz(seed);
+
+        let x0 = cx * STORAGE_CHUNK_VOXELS;
+        let y0 = cy * STORAGE_CHUNK_VOXELS;
+        let z0 = cz * STORAGE_CHUNK_VOXELS;
+        let x1 = (x0 + STORAGE_CHUNK_VOXELS).min(WORLD_VOXELS_X);
+        let y1 = (y0 + STORAGE_CHUNK_VOXELS).min(WORLD_VOXELS_Y);
+        let z1 = (z0 + STORAGE_CHUNK_VOXELS).min(WORLD_VOXELS_Z);
+
+        for z in z0..z1 {
+            for x in x0..x1 {
+                let fx = x as f32 + s_x;
+                let fz = z as f32 + s_z;
+                let hilly     = fbm_2d(fx * 0.007, fz * 0.007, 4);
+                let mountains = fbm_2d(fx * 0.0025, fz * 0.0025, 3).max(0.0).powf(1.6) * 1.8;
+                let detail    = fbm_2d(fx * 0.04, fz * 0.04, 2) * 0.4;
+                let h = (sea_level as f32 + 14.0 + hilly * 22.0 + mountains * 40.0 + detail * 3.0)
+                    .clamp(2.0, (WORLD_VOXELS_Y - 1) as f32) as u32;
+                let temperature = fbm_2d(fx * 0.0006, fz * 0.0006, 3);
+                let humidity    = fbm_2d(fx * 0.0008 + 100.0, fz * 0.0008 + 100.0, 3);
+                let biome = pick_biome(temperature, humidity, h, sea_level);
+                let y_top = y1.min(h + 1);
+                for y in y0..y_top {
+                    let cn  = value_noise_3d(fx * 0.045, y as f32 * 0.085, fz * 0.045);
+                    let cn2 = value_noise_3d(fx * 0.110, y as f32 * 0.060, fz * 0.110);
+                    if y > 4 && y + 3 < h && (cn + cn2 * 0.6) > 0.30 { continue; }
+                    let mat = if y >= h {
+                        biome.top_block(h, sea_level)
+                    } else if y + 4 >= h {
+                        biome.subsoil()
+                    } else {
+                        stone_or_ore(fx, y as f32, fz, h)
+                    };
+                    self.write_voxel_unchecked(x, y, z, mat);
+                }
+                // Sea fill within this chunk's Y range.
+                if h < sea_level && y0 <= sea_level {
+                    let yy0 = (h + 1).max(y0);
+                    let yy1 = sea_level.min(y1.saturating_sub(1));
+                    for y in yy0..=yy1 {
+                        self.write_voxel_unchecked(x, y, z, MAT_WATER);
+                    }
+                }
+            }
+        }
+        self.chunk_meta[ci].generated = true;
+    }
+
+    #[inline]
+    fn write_voxel_unchecked(&mut self, x: u32, y: u32, z: u32, mat: u8) {
+        let (bx, by, bz) = (x / BRICK_DIM, y / BRICK_DIM, z / BRICK_DIM);
+        let (lx, ly, lz) = (x % BRICK_DIM, y % BRICK_DIM, z % BRICK_DIM);
+        let bi = brick_idx(bx, by, bz);
+        self.bricks[bi as usize].set(lx, ly, lz, mat);
+    }
+
+    pub fn dims_voxels(&self) -> UVec3 {
+        UVec3::new(WORLD_VOXELS_X, WORLD_VOXELS_Y, WORLD_VOXELS_Z)
+    }
+}
+
+/// Decompose a 64-bit world seed into a pair of (x, z) float offsets used to
+/// shift noise queries. Different seeds → different terrain by sampling a
+/// different region of the same infinite noise field.
+#[inline(always)]
+pub fn seed_offset_xz(seed: u64) -> (f32, f32) {
+    let hi = ((seed >> 32) as u32) as i32 as f32;
+    let lo = ((seed & 0xFFFF_FFFF) as u32) as i32 as f32;
+    (hi * 0.01734, lo * 0.02153)
+}
+
+// ---------- value noise ----------
+
+#[inline(always)]
+fn hash2(x: i32, z: i32) -> f32 {
+    let h = (x as u32)
+        .wrapping_mul(0x9E3779B1)
+        .wrapping_add((z as u32).wrapping_mul(0x85EBCA77));
+    let h = h.wrapping_mul(0xC2B2AE3D);
+    let h = h ^ (h >> 16);
+    let h = h.wrapping_mul(0x85EBCA6B);
+    ((h & 0xFFFFFF) as f32) / (0xFFFFFF as f32) * 2.0 - 1.0
+}
+
+#[inline(always)]
+fn hash3(x: i32, y: i32, z: i32) -> f32 {
+    let h = (x as u32)
+        .wrapping_mul(0x9E3779B1)
+        .wrapping_add((y as u32).wrapping_mul(0x85EBCA77))
+        .wrapping_add((z as u32).wrapping_mul(0xC2B2AE3D));
+    let h = h.wrapping_mul(0xD2B74407);
+    let h = h ^ (h >> 16);
+    let h = h.wrapping_mul(0x85EBCA6B);
+    ((h & 0xFFFFFF) as f32) / (0xFFFFFF as f32) * 2.0 - 1.0
+}
+
+#[inline(always)]
+fn smoothstep(t: f32) -> f32 {
+    t * t * (3.0 - 2.0 * t)
+}
+
+pub fn value_noise_2d(x: f32, z: f32) -> f32 {
+    let xi = x.floor() as i32;
+    let zi = z.floor() as i32;
+    let xf = smoothstep(x - xi as f32);
+    let zf = smoothstep(z - zi as f32);
+    let v00 = hash2(xi, zi);
+    let v10 = hash2(xi + 1, zi);
+    let v01 = hash2(xi, zi + 1);
+    let v11 = hash2(xi + 1, zi + 1);
+    let a = v00 * (1.0 - xf) + v10 * xf;
+    let b = v01 * (1.0 - xf) + v11 * xf;
+    a * (1.0 - zf) + b * zf
+}
+
+pub fn fbm_2d(x: f32, z: f32, octaves: u32) -> f32 {
+    let mut total = 0.0;
+    let mut amp = 1.0;
+    let mut freq = 1.0;
+    let mut max_amp = 0.0;
+    for _ in 0..octaves {
+        total += value_noise_2d(x * freq, z * freq) * amp;
+        max_amp += amp;
+        amp *= 0.5;
+        freq *= 2.0;
+    }
+    total / max_amp
+}
+
+/// Pure function: produce one storage chunk's worth of bricks from a world
+/// chunk coord + seed. No shared state — safe to call from rayon workers.
+/// Returns 512 bricks in (x, y, z) order with x innermost.
+pub fn gen_slot_bricks(world_chunk: glam::IVec3, seed: u64) -> Vec<Brick> {
+    let total = (STORAGE_CHUNK_BRICKS * STORAGE_CHUNK_BRICKS * STORAGE_CHUNK_BRICKS) as usize;
+    let mut bricks: Vec<Brick> = vec![Brick::EMPTY; total];
+    let sea_level: u32 = 88;
+    let (s_x, s_z) = seed_offset_xz(seed);
+    let world_x0 = world_chunk.x * STORAGE_CHUNK_VOXELS as i32;
+    let world_y0 = world_chunk.y * STORAGE_CHUNK_VOXELS as i32;
+    let world_z0 = world_chunk.z * STORAGE_CHUNK_VOXELS as i32;
+
+    for dz in 0..STORAGE_CHUNK_VOXELS {
+        for dx in 0..STORAGE_CHUNK_VOXELS {
+            let wx = (world_x0 + dx as i32) as f32 + s_x;
+            let wz = (world_z0 + dz as i32) as f32 + s_z;
+            let hilly = fbm_2d(wx * 0.007, wz * 0.007, 4);
+            let mountains = fbm_2d(wx * 0.0025, wz * 0.0025, 3).max(0.0).powf(1.6) * 1.8;
+            let detail = fbm_2d(wx * 0.04, wz * 0.04, 2) * 0.4;
+            let h_signed = (sea_level as f32 + 14.0 + hilly * 22.0 + mountains * 40.0 + detail * 3.0)
+                .clamp(2.0, (WORLD_VOXELS_Y - 1) as f32) as i32;
+            let temperature = fbm_2d(wx * 0.0006, wz * 0.0006, 3);
+            let humidity = fbm_2d(wx * 0.0008 + 100.0, wz * 0.0008 + 100.0, 3);
+            let biome = pick_biome(temperature, humidity, h_signed as u32, sea_level);
+
+            for dy in 0..STORAGE_CHUNK_VOXELS {
+                let world_y = world_y0 + dy as i32;
+                if world_y < 0 || world_y >= WORLD_VOXELS_Y as i32 { continue; }
+                if world_y > h_signed { continue; }
+                let cn = value_noise_3d(wx * 0.045, world_y as f32 * 0.085, wz * 0.045);
+                let cn2 = value_noise_3d(wx * 0.110, world_y as f32 * 0.060, wz * 0.110);
+                if world_y > 4 && world_y + 3 < h_signed && (cn + cn2 * 0.6) > 0.30 { continue; }
+                let h_u32 = h_signed as u32;
+                let mat = if world_y as u32 >= h_u32 {
+                    biome.top_block(h_u32, sea_level)
+                } else if (world_y as u32) + 4 >= h_u32 {
+                    biome.subsoil()
+                } else {
+                    stone_or_ore(wx, world_y as f32, wz, h_u32)
+                };
+                write_into_scratch(&mut bricks, dx, dy, dz, mat);
+            }
+            // Sea fill within this chunk's Y range.
+            if (h_signed as u32) < sea_level {
+                for wy in ((h_signed + 1) as i32)..=(sea_level as i32) {
+                    if wy < world_y0 || wy >= world_y0 + STORAGE_CHUNK_VOXELS as i32 { continue; }
+                    let dy = (wy - world_y0) as u32;
+                    if dy >= STORAGE_CHUNK_VOXELS { continue; }
+                    write_into_scratch(&mut bricks, dx, dy, dz, MAT_WATER);
+                }
+            }
+        }
+    }
+    bricks
+}
+
+#[inline]
+fn write_into_scratch(bricks: &mut [Brick], dx: u32, dy: u32, dz: u32, mat: u8) {
+    let bb_x = dx / BRICK_DIM;
+    let bb_y = dy / BRICK_DIM;
+    let bb_z = dz / BRICK_DIM;
+    let bb_idx = (bb_x + bb_y * STORAGE_CHUNK_BRICKS + bb_z * STORAGE_CHUNK_BRICKS * STORAGE_CHUNK_BRICKS)
+        as usize;
+    bricks[bb_idx].set(dx % BRICK_DIM, dy % BRICK_DIM, dz % BRICK_DIM, mat);
+}
+
+// ---------------- biome + world-gen helpers ----------------
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum Biome {
+    Tundra,
+    Plains,
+    Forest,
+    Jungle,
+    Savanna,
+    Desert,
+    Beach,
+    Mountain,
+}
+
+pub fn pick_biome(temp: f32, humid: f32, h: u32, sea_level: u32) -> Biome {
+    if h > sea_level + 36 { return Biome::Mountain; }
+    if h <= sea_level + 1 { return Biome::Beach; }
+    if temp < -0.20 { return Biome::Tundra; }
+    if temp > 0.25 && humid < -0.05 { return Biome::Desert; }
+    if temp > 0.15 && humid > 0.25 { return Biome::Jungle; }
+    if temp > 0.10 && humid < 0.10 { return Biome::Savanna; }
+    if humid > 0.20 { return Biome::Forest; }
+    Biome::Plains
+}
+
+impl Biome {
+    pub fn top_block(self, h: u32, sea_level: u32) -> u8 {
+        match self {
+            Biome::Tundra => MAT_SNOW,
+            Biome::Desert | Biome::Beach | Biome::Savanna => MAT_SAND,
+            Biome::Mountain => if h > sea_level + 55 { MAT_SNOW } else { MAT_STONE },
+            _ => MAT_GRASS,
+        }
+    }
+    pub fn subsoil(self) -> u8 {
+        match self {
+            Biome::Desert | Biome::Beach => MAT_SAND,
+            Biome::Mountain => MAT_STONE,
+            Biome::Savanna => MAT_DIRT,
+            _ => MAT_DIRT,
+        }
+    }
+    pub fn tree_type(self, hash: u32) -> u32 {
+        match self {
+            Biome::Tundra | Biome::Mountain => 2, // pine
+            Biome::Plains => if hash % 3 == 0 { 1 } else { 0 }, // birch/oak
+            Biome::Forest => match hash % 4 { 0 => 1, 1 => 3, _ => 0 }, // birch/autumn/oak
+            Biome::Jungle => match hash % 4 { 0 => 3, _ => 0 },  // oak/autumn — dense
+            Biome::Savanna => 0,
+            _ => 0,
+        }
+    }
+    /// Trees per chunk multiplier — Jungle is dense, Savanna sparse.
+    pub fn tree_density(self) -> f32 {
+        match self {
+            Biome::Jungle => 4.0,
+            Biome::Forest => 2.0,
+            Biome::Plains => 0.5,
+            Biome::Tundra => 0.6,
+            Biome::Mountain => 0.3,
+            Biome::Savanna => 0.15,
+            _ => 0.0,
+        }
+    }
+    /// Elevation contribution — mountains are noticeably taller, jungles are
+    /// rolling, plains are nearly flat.
+    pub fn height_mult(self) -> f32 {
+        match self {
+            Biome::Mountain => 2.5,
+            Biome::Jungle => 1.4,
+            Biome::Forest => 1.0,
+            Biome::Plains => 0.4,
+            Biome::Savanna => 0.6,
+            Biome::Tundra => 1.2,
+            Biome::Desert => 0.5,
+            Biome::Beach => 0.2,
+        }
+    }
+}
+
+/// Replace some stone voxels with ore. Rarer / more valuable ores cluster
+/// deeper. Three noise scales give chunkier veins instead of single specks.
+pub fn stone_or_ore(x: f32, y: f32, z: f32, h: u32) -> u8 {
+    let depth = (h as f32 - y).max(0.0);
+    let n1 = value_noise_3d(x * 0.27, y * 0.27, z * 0.27);
+    let n2 = value_noise_3d(x * 0.55, y * 0.55, z * 0.55);
+    let combined = n1 + n2 * 0.30;
+    if depth > 30.0 && combined > 0.50 { return MAT_DIAMOND; }
+    if depth > 20.0 && combined > 0.36 { return MAT_GOLD; }
+    if depth > 10.0 && combined > 0.24 { return MAT_IRON; }
+    if combined > 0.32 { return MAT_COAL; }
+    MAT_STONE
+}
+
+pub fn place_tree(world: &mut World, cx: i32, base_y: u32, cz: i32, ttype: u32, hash: u32) {
+    // Scaled-up trees: trunks ~15 wide, canopies ~20 radius, heights ~50-70.
+    let (trunk_mat, leaf_mat, trunk_h, canopy_r, trunk_r, conical) = match ttype {
+        0 => (MAT_WOOD,       MAT_LEAVES,        45 + (hash % 20), 22i32, 7i32, false),
+        1 => (MAT_WOOD_BIRCH, MAT_LEAVES_BIRCH,  55 + (hash % 20), 18,    6,    false),
+        2 => (MAT_WOOD_PINE,  MAT_LEAVES_PINE,   65 + (hash % 20), 22,    7,    true),
+        3 => (MAT_WOOD,       MAT_LEAVES_AUTUMN, 45 + (hash % 20), 22,    7,    false),
+        _ => (MAT_WOOD,       MAT_LEAVES,        45,               22,    7,    false),
+    };
+    let trunk_r2 = trunk_r * trunk_r;
+
+    // Thick trunk: circular cross-section instead of a 3x3 box.
+    for dy in 0..trunk_h {
+        for dx in -trunk_r..=trunk_r {
+            for dz in -trunk_r..=trunk_r {
+                if dx * dx + dz * dz > trunk_r2 { continue; }
+                let wx = cx + dx;
+                let wz = cz + dz;
+                let wy = base_y + dy;
+                if wx >= 0 && wz >= 0
+                && (wx as u32) < WORLD_VOXELS_X
+                && (wz as u32) < WORLD_VOXELS_Z
+                && wy < WORLD_VOXELS_Y {
+                    world.write_voxel_unchecked(wx as u32, wy, wz as u32, trunk_mat);
+                }
+            }
+        }
+    }
+
+    // Canopy
+    if conical {
+        // Pine: stack of decreasing-radius disks.
+        let layers: i32 = 18;
+        for layer in 0..layers {
+            // Radius shrinks toward the top of the pine.
+            let r = ((canopy_r * (layers - layer)) / layers).max(2);
+            let wy_signed = base_y as i32 + trunk_h as i32 - 4 + layer * 2;
+            if wy_signed < 0 { continue; }
+            let wy = wy_signed as u32;
+            if wy >= WORLD_VOXELS_Y { continue; }
+            for dx in -r..=r {
+                for dz in -r..=r {
+                    if dx * dx + dz * dz > r * r { continue; }
+                    let wx = cx + dx;
+                    let wz = cz + dz;
+                    if wx < 0 || wz < 0 { continue; }
+                    if (wx as u32) >= WORLD_VOXELS_X || (wz as u32) >= WORLD_VOXELS_Z { continue; }
+                    let bi = brick_idx((wx as u32) / BRICK_DIM, wy / BRICK_DIM, (wz as u32) / BRICK_DIM) as usize;
+                    let vi = brick_voxel_idx((wx as u32) % BRICK_DIM, wy % BRICK_DIM, (wz as u32) % BRICK_DIM);
+                    if (world.bricks[bi].occupancy & (1u64 << vi)) == 0 {
+                        world.write_voxel_unchecked(wx as u32, wy, wz as u32, leaf_mat);
+                    }
+                }
+            }
+        }
+    } else {
+        let r = canopy_r;
+        let canopy_cy = base_y as i32 + trunk_h as i32 + 1;
+        for dy in -r..=r {
+            for dx in -r..=r {
+                for dz in -r..=r {
+                    let dd = dx * dx + dy * dy + dz * dz;
+                    if dd > r * r { continue; }
+                    let wx = cx + dx;
+                    let wz = cz + dz;
+                    let wy = canopy_cy + dy;
+                    if wx < 0 || wz < 0 || wy < 0 { continue; }
+                    if (wx as u32) >= WORLD_VOXELS_X
+                    || (wz as u32) >= WORLD_VOXELS_Z
+                    || (wy as u32) >= WORLD_VOXELS_Y { continue; }
+                    let bi = brick_idx((wx as u32) / BRICK_DIM, (wy as u32) / BRICK_DIM, (wz as u32) / BRICK_DIM) as usize;
+                    let vi = brick_voxel_idx((wx as u32) % BRICK_DIM, (wy as u32) % BRICK_DIM, (wz as u32) % BRICK_DIM);
+                    if (world.bricks[bi].occupancy & (1u64 << vi)) == 0 {
+                        world.write_voxel_unchecked(wx as u32, wy as u32, wz as u32, leaf_mat);
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub fn value_noise_3d(x: f32, y: f32, z: f32) -> f32 {
+    let xi = x.floor() as i32;
+    let yi = y.floor() as i32;
+    let zi = z.floor() as i32;
+    let xf = smoothstep(x - xi as f32);
+    let yf = smoothstep(y - yi as f32);
+    let zf = smoothstep(z - zi as f32);
+    let v000 = hash3(xi, yi, zi);
+    let v100 = hash3(xi + 1, yi, zi);
+    let v010 = hash3(xi, yi + 1, zi);
+    let v110 = hash3(xi + 1, yi + 1, zi);
+    let v001 = hash3(xi, yi, zi + 1);
+    let v101 = hash3(xi + 1, yi, zi + 1);
+    let v011 = hash3(xi, yi + 1, zi + 1);
+    let v111 = hash3(xi + 1, yi + 1, zi + 1);
+    let a = v000 * (1.0 - xf) + v100 * xf;
+    let b = v010 * (1.0 - xf) + v110 * xf;
+    let c = v001 * (1.0 - xf) + v101 * xf;
+    let d = v011 * (1.0 - xf) + v111 * xf;
+    let ab = a * (1.0 - yf) + b * yf;
+    let cd = c * (1.0 - yf) + d * yf;
+    ab * (1.0 - zf) + cd * zf
+}
