@@ -1,31 +1,34 @@
-// CPU-side DDA raycast for picking: which voxel is the player clicking on?
-// Mirrors the GPU traversal logic but doesn't need the hierarchy because we
-// only fire one ray per click, not one per pixel.
+// CPU-side DDA raycast for picking. WALKS WORLD COORDS — must mirror the
+// shader exactly because the storage is toroidal (slot_v = pos_mod(world_v,
+// WORLD_VOXELS_*)). The previous version walked `camera - origin` linearly,
+// which only matched the shader when origin == 0 (player still at spawn).
+// As soon as the player moved into a different chunk, the bricks CPU looked
+// at ≠ the bricks GPU rendered. That was the "click breaks the wrong voxel"
+// bug.
 
-use glam::Vec3;
+use glam::{IVec3, Vec3};
 
 use crate::voxel::*;
 
 pub struct PickHit {
+    /// WORLD voxel coordinate.
     pub voxel: [i32; 3],
     pub normal: [i32; 3],
 }
 
-const MAX_STEPS: i32 = 512;
+const MAX_STEPS: i32 = 4096;
 
-pub fn raycast(origin: Vec3, dir: Vec3, world: &World) -> Option<PickHit> {
-    let world_max = Vec3::new(
-        WORLD_VOXELS_X as f32,
-        WORLD_VOXELS_Y as f32,
-        WORLD_VOXELS_Z as f32,
+pub fn raycast(camera_world: Vec3, dir: Vec3, world: &World, world_origin: IVec3) -> Option<PickHit> {
+    let win_min = Vec3::new(
+        world_origin.x as f32,
+        world_origin.y as f32,
+        world_origin.z as f32,
     );
-    let inv_dir = Vec3::new(
-        safe_inv(dir.x),
-        safe_inv(dir.y),
-        safe_inv(dir.z),
-    );
-    let t0 = (Vec3::ZERO - origin) * inv_dir;
-    let t1 = (world_max - origin) * inv_dir;
+    let win_max = win_min
+        + Vec3::new(WORLD_VOXELS_X as f32, WORLD_VOXELS_Y as f32, WORLD_VOXELS_Z as f32);
+    let inv_dir = Vec3::new(safe_inv(dir.x), safe_inv(dir.y), safe_inv(dir.z));
+    let t0 = (win_min - camera_world) * inv_dir;
+    let t1 = (win_max - camera_world) * inv_dir;
     let tmin = t0.min(t1);
     let tmax = t0.max(t1);
     let t_enter = tmin.max_element().max(0.0);
@@ -34,8 +37,8 @@ pub fn raycast(origin: Vec3, dir: Vec3, world: &World) -> Option<PickHit> {
         return None;
     }
 
-    let mut p = origin + dir * (t_enter + 1e-3);
-    p = p.clamp(Vec3::splat(1e-3), world_max - 1e-3);
+    let mut p = camera_world + dir * (t_enter + 1e-3);
+    p = p.clamp(win_min + Vec3::splat(1e-3), win_max - Vec3::splat(1e-3));
     let mut voxel = [p.x.floor() as i32, p.y.floor() as i32, p.z.floor() as i32];
     let step = [sign_i32(dir.x), sign_i32(dir.y), sign_i32(dir.z)];
     let t_delta = [inv_dir.x.abs(), inv_dir.y.abs(), inv_dir.z.abs()];
@@ -43,45 +46,80 @@ pub fn raycast(origin: Vec3, dir: Vec3, world: &World) -> Option<PickHit> {
     let mut t_max = [0.0f32; 3];
     for k in 0..3 {
         let nxt = if step[k] > 0 { (voxel[k] + 1) as f32 } else { voxel[k] as f32 };
-        let o = [origin.x, origin.y, origin.z][k];
+        let o = [camera_world.x, camera_world.y, camera_world.z][k];
         let inv = [inv_dir.x, inv_dir.y, inv_dir.z][k];
         t_max[k] = (nxt - o) * inv;
     }
 
-    let mut last_axis: i32 = -1;
-    for _ in 0..MAX_STEPS {
-        if voxel[0] < 0 || voxel[0] >= WORLD_VOXELS_X as i32
-         || voxel[1] < 0 || voxel[1] >= WORLD_VOXELS_Y as i32
-         || voxel[2] < 0 || voxel[2] >= WORLD_VOXELS_Z as i32 {
-            return None;
-        }
-        let bx = (voxel[0] as u32) / BRICK_DIM;
-        let by = (voxel[1] as u32) / BRICK_DIM;
-        let bz = (voxel[2] as u32) / BRICK_DIM;
+    let in_window = |voxel: [i32; 3]| -> bool {
+        let rx = voxel[0] - world_origin.x;
+        let ry = voxel[1] - world_origin.y;
+        let rz = voxel[2] - world_origin.z;
+        rx >= 0 && ry >= 0 && rz >= 0
+            && (rx as u32) < WORLD_VOXELS_X
+            && (ry as u32) < WORLD_VOXELS_Y
+            && (rz as u32) < WORLD_VOXELS_Z
+    };
+
+    // World-voxel → storage brick + voxel-in-brick. Matches the shader's
+    // `world_to_slot_voxel` + brick_idx.
+    let in_solid = |voxel: [i32; 3]| -> bool {
+        if !in_window(voxel) { return false; }
+        let sx = voxel[0].rem_euclid(WORLD_VOXELS_X as i32) as u32;
+        let sy = voxel[1] as u32;
+        let sz = voxel[2].rem_euclid(WORLD_VOXELS_Z as i32) as u32;
+        let bx = sx / BRICK_DIM;
+        let by = sy / BRICK_DIM;
+        let bz = sz / BRICK_DIM;
         let bi = brick_idx(bx, by, bz) as usize;
         let b = &world.bricks[bi];
-        if b.occupancy != 0 {
-            let lx = voxel[0] as u32 - bx * BRICK_DIM;
-            let ly = voxel[1] as u32 - by * BRICK_DIM;
-            let lz = voxel[2] as u32 - bz * BRICK_DIM;
-            let vi = brick_voxel_idx(lx, ly, lz);
-            if (b.occupancy & (1u64 << vi)) != 0 {
-                let mut normal = [0i32; 3];
-                if last_axis >= 0 {
-                    normal[last_axis as usize] = -step[last_axis as usize];
-                }
-                return Some(PickHit { voxel, normal });
-            }
-        }
+        if b.occupancy == 0 { return false; }
+        let lx = sx % BRICK_DIM;
+        let ly = sy % BRICK_DIM;
+        let lz = sz % BRICK_DIM;
+        let vi = brick_voxel_idx(lx, ly, lz);
+        (b.occupancy & (1u64 << vi)) != 0
+    };
 
-        // Argmin tMax
-        let mut ax = 0;
-        let mut m = t_max[0];
-        if t_max[1] < m { ax = 1; m = t_max[1]; }
-        if t_max[2] < m { ax = 2; }
-        voxel[ax] += step[ax];
-        t_max[ax] += t_delta[ax];
-        last_axis = ax as i32;
+    let argmin_step = |t_max: &mut [f32; 3], voxel: &mut [i32; 3]| -> i32 {
+        let mut ax: i32 = -1;
+        let mut m = f32::INFINITY;
+        for k in 0..3 {
+            if step[k] != 0 && t_max[k] < m { ax = k as i32; m = t_max[k]; }
+        }
+        if ax < 0 { return -1; }
+        let axu = ax as usize;
+        voxel[axu] += step[axu];
+        t_max[axu] += t_delta[axu];
+        ax
+    };
+
+    let mut last_axis: i32 = -1;
+    let mut steps_left = MAX_STEPS;
+
+    // Phase 1: skip past any solid voxels we're standing inside.
+    while steps_left > 0 && in_solid(voxel) {
+        let ax = argmin_step(&mut t_max, &mut voxel);
+        if ax < 0 { return None; }
+        last_axis = ax;
+        steps_left -= 1;
+        if !in_window(voxel) { return None; }
+    }
+
+    // Phase 2: first solid voxel we hit is the visible surface.
+    while steps_left > 0 {
+        if !in_window(voxel) { return None; }
+        if in_solid(voxel) {
+            let mut normal = [0i32; 3];
+            if last_axis >= 0 {
+                normal[last_axis as usize] = -step[last_axis as usize];
+            }
+            return Some(PickHit { voxel, normal });
+        }
+        let ax = argmin_step(&mut t_max, &mut voxel);
+        if ax < 0 { return None; }
+        last_axis = ax;
+        steps_left -= 1;
     }
     None
 }

@@ -30,8 +30,13 @@ pub fn tick(world: &mut World) {
     let frame = FRAME_COUNTER.fetch_add(1, Ordering::Relaxed);
     // 1. Sand gravity (bitmask, multi-pass).
     sand_gravity_pass(world);
-    // 2. Water — process every active brick.
-    let active = world.active_bricks.clone();
+    // 2. Water — BOTTOM-UP brick order. Top-down used to interact badly with
+    // the per-brick pass-2 refill: bottom bricks would pull from the top
+    // brick's bottom row AGAIN after the top brick's pass 2 already filled
+    // it, draining a 1-cell gap. Bottom-up means each brick sees the FINAL
+    // state of the brick above (which has already finished its passes).
+    let mut active = world.active_bricks.clone();
+    active.sort_by_key(|&bi| (bi / WORLD_BRICKS_X) % WORLD_BRICKS_Y);
     let mut touched: Vec<u32> = Vec::with_capacity(active.len() * 2);
     for bi in &active {
         if world.movable_mask[*bi as usize] == 0 { continue; }
@@ -166,9 +171,22 @@ fn step_brick_sand_fall(world: &mut World, bx: u32, by: u32, bz: u32) {
 // ---------------- water (DwarfCorp-style level flow) ----------------
 
 fn step_brick_water(world: &mut World, bi: u32, touched: &mut Vec<u32>) {
-    // Snapshot the brick once; do every intra-brick computation on the local
-    // copy; write back once at the end. Cross-brick transfers touch the
-    // neighbour directly (one transfer per cell at most).
+    // ----------------------------------------------------------------
+    // Two-pass water physics:
+    //
+    //   Pass 1 (gravity, top-down)  — each water cell donates ALL of its
+    //     level downward. The source becomes empty when its target had
+    //     enough space.
+    //   Pass 2 (refill, bottom-up)  — each empty/non-full cell pulls from
+    //     the cell above to refill itself. The "drain" propagates UP the
+    //     column instead of leaving a half-empty middle cell.
+    //   Pass 3 (lateral)            — same as DwarfCorp: one level to a
+    //     strictly-lower neighbour, each side gets a turn.
+    //
+    // Net effect: a lake draining into a cave loses ONE cell at the lake's
+    // SURFACE per tick and gains one at the cave's TOP. Every cell along the
+    // column stays full at L8 — no dangling L1 sliver mid-fall.
+    // ----------------------------------------------------------------
     let bx = bi % WORLD_BRICKS_X;
     let by = (bi / WORLD_BRICKS_X) % WORLD_BRICKS_Y;
     let bz = bi / (WORLD_BRICKS_X * WORLD_BRICKS_Y);
@@ -181,126 +199,222 @@ fn step_brick_water(world: &mut World, bi: u32, touched: &mut Vec<u32>) {
     let mut new_movable = snap_movable;
     let mut any_change = false;
 
-    // Iterate ONLY the movable bits — sand and water — skipping all stone.
-    let mut bits = snap_movable;
+    // ---------- PASS 1: GRAVITY (top-down) ----------
+    // CRITICAL: read from a SNAPSHOT so a single drop doesn't cascade through
+    // every empty cell below it in one tick. Without the snapshot, when y=21
+    // donates to y=20, y=20 then processes and donates to y=19, etc — water
+    // teleports through the column in one tick. With snapshot, only cells
+    // that were ORIGINALLY water donate, so the column falls 1 cell/tick.
+    let p1_occ = new_occ;
+    let p1_mats = new_mats;
+    for ly in (0u32..4).rev() {
+        for lz in 0u32..4 {
+            for lx in 0u32..4 {
+                let i = (lx + lz * 4 + ly * 16) as i32;
+                let bit = 1u64 << i;
+                if (p1_occ & bit) == 0 { continue; }
+                let mat = p1_mats[i as usize];
+                if !is_water_mat(mat) { continue; }
+                let level = water_level_of(mat) as i32;
+                if level == 0 { continue; }
+
+                if ly > 0 {
+                    let below_i = i - 16;
+                    let below_bit = 1u64 << below_i;
+                    let below_solid_blocking = (p1_occ & below_bit) != 0
+                        && !is_water_mat(p1_mats[below_i as usize]);
+                    if below_solid_blocking { continue; }
+                    // Use SNAPSHOT for below-level so we don't double-donate
+                    // into the same cell from a snapshot+update interplay.
+                    let below_level = if (p1_occ & below_bit) != 0 {
+                        water_level_of(p1_mats[below_i as usize]) as i32
+                    } else { 0 };
+                    let space = MAX_WATER_LEVEL as i32 - below_level;
+                    let transfer = level.min(space);
+                    if transfer > 0 {
+                        let nl = below_level + transfer;
+                        new_mats[below_i as usize] = water_mat_for_level(nl as u8);
+                        new_occ |= below_bit;
+                        new_movable |= below_bit;
+                        let src_new = level - transfer;
+                        if src_new == 0 {
+                            new_occ &= !bit;
+                            new_movable &= !bit;
+                            new_mats[i as usize] = MAT_AIR;
+                        } else {
+                            new_mats[i as usize] = water_mat_for_level(src_new as u8);
+                        }
+                        any_change = true;
+                    }
+                } else if by > 0 {
+                    let below_bi = brick_idx(bx, by - 1, bz);
+                    let below_i_in = (lx + lz * 4 + 3 * 16) as usize;
+                    let below_bit = 1u64 << below_i_in;
+                    let nb_occ = world.bricks[below_bi as usize].occupancy;
+                    let nb_solid = (nb_occ & below_bit) != 0
+                        && !is_water_mat(world.bricks[below_bi as usize].materials[below_i_in]);
+                    if nb_solid { continue; }
+                    let below_level = if (nb_occ & below_bit) != 0 {
+                        water_level_of(world.bricks[below_bi as usize].materials[below_i_in]) as i32
+                    } else { 0 };
+                    let space = MAX_WATER_LEVEL as i32 - below_level;
+                    let transfer = level.min(space);
+                    if transfer > 0 {
+                        cross_apply_water(world, below_bi, below_i_in, (below_level + transfer) as u8, touched);
+                        let src_new = level - transfer;
+                        if src_new == 0 {
+                            new_occ &= !bit;
+                            new_movable &= !bit;
+                            new_mats[i as usize] = MAT_AIR;
+                        } else {
+                            new_mats[i as usize] = water_mat_for_level(src_new as u8);
+                        }
+                        any_change = true;
+                    }
+                }
+            }
+        }
+    }
+
+    // ---------- PASS 2: REFILL FROM ABOVE (bottom-up) ----------
+    // CRITICAL: only refill cells that were WATER IN THE SNAPSHOT. If we
+    // also refill cells that just received water in pass 1 (the falling
+    // drop), we'd steal that water UP to fill the empty cell below,
+    // creating a 1-cell gap right above the drop. By limiting pass 2 to
+    // original sources, the drop is left alone and the source-above-it
+    // refills from its own above. Net result: connected "beam".
+    for ly in 0u32..4 {
+        for lz in 0u32..4 {
+            for lx in 0u32..4 {
+                let i = (lx + lz * 4 + ly * 16) as i32;
+                let bit = 1u64 << i;
+                // Must have been a water source in the snapshot.
+                if (p1_occ & bit) == 0 { continue; }
+                let snap_mat = p1_mats[i as usize];
+                if !is_water_mat(snap_mat) { continue; }
+
+                let occupied = (new_occ & bit) != 0;
+                let mat = if occupied { new_mats[i as usize] } else { MAT_AIR };
+                if occupied && !is_water_mat(mat) { continue; }
+                let level = if is_water_mat(mat) { water_level_of(mat) as i32 } else { 0 };
+                if level >= MAX_WATER_LEVEL as i32 { continue; }
+                let space = MAX_WATER_LEVEL as i32 - level;
+
+                if ly < 3 {
+                    let above_i = i + 16;
+                    let above_bit = 1u64 << above_i;
+                    let above_occ = (new_occ & above_bit) != 0;
+                    let above_mat = if above_occ { new_mats[above_i as usize] } else { MAT_AIR };
+                    if !is_water_mat(above_mat) { continue; }
+                    let above_level = water_level_of(above_mat) as i32;
+                    if above_level == 0 { continue; }
+                    let transfer = above_level.min(space);
+                    if transfer > 0 {
+                        let new_level = level + transfer;
+                        new_mats[i as usize] = water_mat_for_level(new_level as u8);
+                        new_occ |= bit;
+                        new_movable |= bit;
+                        let above_new = above_level - transfer;
+                        if above_new == 0 {
+                            new_occ &= !above_bit;
+                            new_movable &= !above_bit;
+                            new_mats[above_i as usize] = MAT_AIR;
+                        } else {
+                            new_mats[above_i as usize] = water_mat_for_level(above_new as u8);
+                        }
+                        any_change = true;
+                    }
+                } else if by + 1 < WORLD_BRICKS_Y {
+                    // Cross-brick: pull from bottom row of brick directly above.
+                    let above_bi = brick_idx(bx, by + 1, bz);
+                    let above_i_in = (lx + lz * 4) as usize;
+                    let above_bit = 1u64 << above_i_in;
+                    let nb_occ = world.bricks[above_bi as usize].occupancy;
+                    let nb_mat = if (nb_occ & above_bit) != 0 {
+                        world.bricks[above_bi as usize].materials[above_i_in]
+                    } else { MAT_AIR };
+                    if !is_water_mat(nb_mat) { continue; }
+                    let above_level = water_level_of(nb_mat) as i32;
+                    if above_level == 0 { continue; }
+                    let transfer = above_level.min(space);
+                    if transfer > 0 {
+                        let new_level = level + transfer;
+                        new_mats[i as usize] = water_mat_for_level(new_level as u8);
+                        new_occ |= bit;
+                        new_movable |= bit;
+                        let above_new = above_level - transfer;
+                        cross_apply_water(world, above_bi, above_i_in, above_new as u8, touched);
+                        any_change = true;
+                    }
+                }
+            }
+        }
+    }
+
+    // ---------- PASS 3: LATERAL SPREAD ----------
+    let mut bits = new_movable;
     while bits != 0 {
-        let i = bits.trailing_zeros() as i32;
-        bits &= bits - 1;
+        let i = (63 - bits.leading_zeros()) as i32;
+        bits &= !(1u64 << i);
         let mat = new_mats[i as usize];
         if !is_water_mat(mat) { continue; }
+        let mut remaining = water_level_of(mat) as i32;
+        if remaining <= 1 { continue; }
 
         let lx = (i & 3) as u32;
         let lz = ((i >> 2) & 3) as u32;
         let ly = ((i >> 4) & 3) as u32;
-        let mut remaining = water_level_of(mat) as i32;
-
-        // ---- gravity ----
-        // Try the cell directly below: same brick if ly > 0, else top row of
-        // brick-below.
-        if ly > 0 {
-            let below_i = i - 16;
-            let below_bit = 1u64 << below_i;
-            let below_solid_blocking = (new_occ & below_bit) != 0
-                && !is_water_mat(new_mats[below_i as usize]);
-            if !below_solid_blocking {
-                let below_level = if (new_occ & below_bit) != 0 {
-                    water_level_of(new_mats[below_i as usize]) as i32
-                } else { 0 };
-                let space = MAX_WATER_LEVEL as i32 - below_level;
-                let transfer = remaining.min(space);
-                if transfer > 0 {
-                    let nl = below_level + transfer;
-                    new_mats[below_i as usize] = water_mat_for_level(nl as u8);
-                    new_occ |= below_bit;
-                    new_movable |= below_bit;
-                    remaining -= transfer;
+        let gx = bx * BRICK_DIM + lx;
+        let gy = by * BRICK_DIM + ly;
+        let gz = bz * BRICK_DIM + lz;
+        let h = (gx.wrapping_mul(0x9E3779B1)
+              ^ gy.wrapping_mul(0x85EBCA77)
+              ^ gz.wrapping_mul(0xC2B2AE3D)) as usize;
+        const DIRS: [(i32, i32); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
+        for k in 0..4 {
+            if remaining <= 1 { break; }
+            let (dx, dz) = DIRS[(h + k) & 3];
+            let tlx = lx as i32 + dx;
+            let tlz = lz as i32 + dz;
+            if tlx >= 0 && tlx < 4 && tlz >= 0 && tlz < 4 {
+                let target = (tlx + tlz * 4 + ly as i32 * 16) as i32;
+                let tbit = 1u64 << target;
+                let occupied = (new_occ & tbit) != 0;
+                let t_mat = new_mats[target as usize];
+                if occupied && !is_water_mat(t_mat) { continue; }
+                let t_level = if occupied { water_level_of(t_mat) as i32 } else { 0 };
+                if remaining > t_level + 1 {
+                    let nl = t_level + 1;
+                    new_mats[target as usize] = water_mat_for_level(nl as u8);
+                    new_occ |= tbit;
+                    new_movable |= tbit;
+                    remaining -= 1;
                     any_change = true;
                 }
-            }
-        } else if by > 0 {
-            // Cross-brick gravity (rare, expensive — still one transfer max).
-            let below_bi = brick_idx(bx, by - 1, bz);
-            let below_i_in = (lx + lz * 4 + 3 * 16) as usize;
-            let below_bit = 1u64 << below_i_in;
-            let nb_occ = world.bricks[below_bi as usize].occupancy;
-            let nb_solid = (nb_occ & below_bit) != 0
-                && !is_water_mat(world.bricks[below_bi as usize].materials[below_i_in]);
-            if !nb_solid {
-                let below_level = if (nb_occ & below_bit) != 0 {
-                    water_level_of(world.bricks[below_bi as usize].materials[below_i_in]) as i32
-                } else { 0 };
-                let space = MAX_WATER_LEVEL as i32 - below_level;
-                let transfer = remaining.min(space);
-                if transfer > 0 {
-                    cross_apply_water(world, below_bi, below_i_in, (below_level + transfer) as u8, touched);
-                    remaining -= transfer;
+            } else {
+                let nbx = bx as i32 + dx;
+                let nbz = bz as i32 + dz;
+                if nbx < 0 || nbx >= WORLD_BRICKS_X as i32
+                || nbz < 0 || nbz >= WORLD_BRICKS_Z as i32 { continue; }
+                let nbx = nbx as u32;
+                let nbz = nbz as u32;
+                let nb_lx = (tlx & 3) as u32;
+                let nb_lz = (tlz & 3) as u32;
+                let target = (nb_lx + nb_lz * 4 + ly * 16) as usize;
+                let tbit = 1u64 << target;
+                let nb_bi = brick_idx(nbx, by, nbz);
+                let nb_occ = world.bricks[nb_bi as usize].occupancy;
+                let occupied = (nb_occ & tbit) != 0;
+                let t_mat = if occupied { world.bricks[nb_bi as usize].materials[target] } else { MAT_AIR };
+                if occupied && !is_water_mat(t_mat) { continue; }
+                let t_level = if occupied { water_level_of(t_mat) as i32 } else { 0 };
+                if remaining > t_level + 1 {
+                    cross_apply_water(world, nb_bi, target, (t_level + 1) as u8, touched);
+                    remaining -= 1;
                 }
             }
         }
 
-        if remaining == 0 {
-            new_occ &= !(1u64 << i);
-            new_movable &= !(1u64 << i);
-            new_mats[i as usize] = MAT_AIR;
-            any_change = true;
-            continue;
-        }
-
-        // ---- lateral ----
-        if remaining > 1 {
-            let gx = bx * BRICK_DIM + lx;
-            let gy = by * BRICK_DIM + ly;
-            let gz = bz * BRICK_DIM + lz;
-            let h = (gx.wrapping_mul(0x9E3779B1)
-                  ^ gy.wrapping_mul(0x85EBCA77)
-                  ^ gz.wrapping_mul(0xC2B2AE3D)) as usize;
-            const DIRS: [(i32, i32); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
-            for k in 0..4 {
-                if remaining <= 1 { break; }
-                let (dx, dz) = DIRS[(h + k) & 3];
-                let tlx = lx as i32 + dx;
-                let tlz = lz as i32 + dz;
-                if tlx >= 0 && tlx < 4 && tlz >= 0 && tlz < 4 {
-                    let target = (tlx + tlz * 4 + ly as i32 * 16) as i32;
-                    let tbit = 1u64 << target;
-                    let occupied = (new_occ & tbit) != 0;
-                    let t_mat = new_mats[target as usize];
-                    if occupied && !is_water_mat(t_mat) { continue; }
-                    let t_level = if occupied { water_level_of(t_mat) as i32 } else { 0 };
-                    if remaining > t_level + 1 {
-                        let nl = t_level + 1;
-                        new_mats[target as usize] = water_mat_for_level(nl as u8);
-                        new_occ |= tbit;
-                        new_movable |= tbit;
-                        remaining -= 1;
-                        any_change = true;
-                    }
-                } else {
-                    let nbx = bx as i32 + dx;
-                    let nbz = bz as i32 + dz;
-                    if nbx < 0 || nbx >= WORLD_BRICKS_X as i32
-                    || nbz < 0 || nbz >= WORLD_BRICKS_Z as i32 { continue; }
-                    let nbx = nbx as u32;
-                    let nbz = nbz as u32;
-                    let nb_lx = (tlx & 3) as u32;
-                    let nb_lz = (tlz & 3) as u32;
-                    let target = (nb_lx + nb_lz * 4 + ly * 16) as usize;
-                    let tbit = 1u64 << target;
-                    let nb_bi = brick_idx(nbx, by, nbz);
-                    let nb_occ = world.bricks[nb_bi as usize].occupancy;
-                    let occupied = (nb_occ & tbit) != 0;
-                    let t_mat = if occupied { world.bricks[nb_bi as usize].materials[target] } else { MAT_AIR };
-                    if occupied && !is_water_mat(t_mat) { continue; }
-                    let t_level = if occupied { water_level_of(t_mat) as i32 } else { 0 };
-                    if remaining > t_level + 1 {
-                        cross_apply_water(world, nb_bi, target, (t_level + 1) as u8, touched);
-                        remaining -= 1;
-                    }
-                }
-            }
-        }
-
-        // Apply remaining level to current cell if it changed.
         let new_level = remaining as u8;
         let new_self_mat = water_mat_for_level(new_level);
         if new_self_mat != mat {

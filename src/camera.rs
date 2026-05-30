@@ -1,5 +1,6 @@
 use glam::Vec3;
 
+#[derive(Clone)]
 pub struct Camera {
     pub pos: Vec3,
     pub yaw: f32,
@@ -12,7 +13,7 @@ pub struct Camera {
 impl Camera {
     pub fn new() -> Self {
         Self {
-            pos: Vec3::new(256.0, 180.0, 256.0),
+            pos: Vec3::new(256.0, 80.0, 256.0),
             yaw: 0.0,
             pitch: -0.5,
             fov_y: 70.0_f32.to_radians(),

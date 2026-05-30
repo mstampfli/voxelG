@@ -209,6 +209,30 @@ fn is_voxel_solid(world_v: vec3<i32>) -> bool {
     return brick_voxel_solid(bi, vi);
 }
 
+// Material at a WORLD voxel coord, or 0 (MAT_AIR) if empty / outside window.
+// Used by `camera_in_water` for the underwater post-effect.
+fn voxel_material_at(world_v: vec3<i32>) -> u32 {
+    let rel = world_v - camera.world_origin;
+    if (rel.x < 0 || rel.x >= WORLD_VOXELS_X
+     || rel.y < 0 || rel.y >= WORLD_VOXELS_Y
+     || rel.z < 0 || rel.z >= WORLD_VOXELS_Z) { return 0u; }
+    let v = world_to_slot_voxel(world_v);
+    let bp = v >> vec3<u32>(2u);
+    let tp = v >> vec3<u32>(4u);
+    let cp = v >> vec3<u32>(6u);
+    let ci = world_chunk_idx(cp.x, cp.y, cp.z);
+    let tile_lin = (tp.x & 3) + (tp.z & 3) * 4 + (tp.y & 3) * 16;
+    if (!chunk_has_child(ci, tile_lin)) { return 0u; }
+    let ti = world_tile_idx(tp.x, tp.y, tp.z);
+    let brick_lin = (bp.x & 3) + (bp.z & 3) * 4 + (bp.y & 3) * 16;
+    if (!tile_has_child(ti, brick_lin)) { return 0u; }
+    let bi = world_brick_idx(bp.x, bp.y, bp.z);
+    let local = v - bp * BRICK_DIM;
+    let vi = brick_voxel_idx(local.x, local.y, local.z);
+    if (!brick_voxel_solid(bi, vi)) { return 0u; }
+    return brick_voxel_material(bi, vi);
+}
+
 fn sky(dir: vec3<f32>) -> vec3<f32> {
     return sky_color(dir);
 }
@@ -285,9 +309,23 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let beam_skip = max(0.0, beam_t_raw - 16.0);
     let ray_origin = camera.origin + dir * beam_skip;
 
-    var hit = trace(ray_origin, dir);
-    if (hit.hit) {
-        hit.t_hit = hit.t_hit + beam_skip;
+    // If the camera itself sits in a water voxel, the primary ray must
+    // skip water (we're inside it) and find the first NON-water surface.
+    // Otherwise the ray would hit the water voxel it's already inside and
+    // render an opaque wall in our face.
+    let cam_voxel_chk = vec3<i32>(floor(camera.origin));
+    let cam_mat_chk = voxel_material_at(cam_voxel_chk);
+    let cam_in_water = is_water_mat(cam_mat_chk);
+    var hit: Hit;
+    if (cam_in_water) {
+        // Skip beam-skip when underwater — beam pre-pass doesn't know about
+        // the camera being inside water and may have advanced past real geo.
+        hit = trace_no_water(camera.origin, dir);
+    } else {
+        hit = trace(ray_origin, dir);
+        if (hit.hit) {
+            hit.t_hit = hit.t_hit + beam_skip;
+        }
     }
     var col: vec3<f32>;
     if (hit.hit) {
@@ -328,19 +366,413 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Volumetric god rays — accumulate sun visibility along the primary ray.
     let t_far = select(200.0, hit.t_hit, hit.hit);
     col += god_rays(camera.origin, dir, t_far, vec2<f32>(f32(gid.x), f32(gid.y)));
+
+    // ---- underwater see-through post-effect ----
+    if (cam_in_water) {
+        let t_eye = select(80.0, hit.t_hit, hit.hit);
+        let absorb = vec3<f32>(0.32, 0.16, 0.06);
+        let trans = exp(-absorb * (t_eye * 0.18));
+        let water_col = vec3<f32>(0.04, 0.18, 0.28);
+        col = col * trans + water_col * (vec3<f32>(1.0) - trans);
+    }
+
     textureStore(output_tex, vec2<i32>(i32(gid.x), i32(gid.y)), vec4<f32>(col, 1.0));
 }
 
-const MAT_WATER_L1: u32 = 5u;
-const MAT_WATER_L8: u32 = 12u;
-const MAT_LEAVES:   u32 = 14u;
-const MAT_GLASS:    u32 = 18u;
+const MAT_GRASS:           u32 = 2u;
+const MAT_WATER_L1:        u32 = 5u;
+const MAT_WATER_L8:        u32 = 12u;
+const MAT_LEAVES:          u32 = 14u;
+const MAT_GLASS:           u32 = 18u;
+const MAT_LEAVES_BIRCH:    u32 = 25u;
+const MAT_LEAVES_PINE:     u32 = 26u;
+const MAT_LEAVES_AUTUMN:   u32 = 27u;
+const MAT_FLOWER:          u32 = 30u;
+const MAT_TALL_GRASS:      u32 = 31u;
 
 fn is_water_mat(m: u32) -> bool {
     return m >= MAT_WATER_L1 && m <= MAT_WATER_L8;
 }
 fn is_transparent_mat(m: u32) -> bool {
     return is_water_mat(m) || m == MAT_GLASS;
+}
+fn is_foliage_mat(m: u32) -> bool {
+    return m == MAT_LEAVES || m == MAT_LEAVES_BIRCH
+        || m == MAT_LEAVES_PINE || m == MAT_LEAVES_AUTUMN
+        || m == MAT_FLOWER || m == MAT_TALL_GRASS;
+}
+
+struct SubHit {
+    hit: bool,
+    t_hit: f32,
+    normal: vec3<f32>,
+    color_tint: vec3<f32>,  // multiplier for palette colour (1,1,1 = no change)
+}
+
+// Module-level: most recent foliage hit's colour tint. Set inside trace()
+// when a foliage SubHit returns, read inside shade() to multiply the
+// material colour (stem → green, blade → brightness variation).
+var<private> g_foliage_tint: vec3<f32> = vec3<f32>(1.0);
+
+// ---------- Wind: ONE consistent direction at any moment ----------
+// A single wind direction blowing across the whole map, with slow rotation
+// and time-varying strength. Per-voxel phase offsets the strength so not
+// every blade peaks together, but the direction is shared so the whole
+// scene leans the same way at the same time.
+// Slower, smoother wind — direction rotates very gradually, strength
+// oscillates calmly. Was way too fast before, made foliage look glitchy.
+fn wind_offset(voxel_min: vec3<f32>, phase: f32, base_amp: f32) -> vec2<f32> {
+    let dir_angle = camera.time * 0.04 + 0.4 * sin(camera.time * 0.12);
+    let wind_x = cos(dir_angle);
+    let wind_z = sin(dir_angle);
+    let strength = base_amp * (0.55 + 0.45 * sin(camera.time * 0.55 + phase));
+    return vec2<f32>(wind_x * strength, wind_z * strength);
+}
+
+// ---------- LEAVES: Minecraft-style full-cube with alpha-cutout texture ----------
+// The leaf voxel keeps its CUBE shape. When the ray hits a face, we sample
+// a 16x16 alpha-cutout "leaf texture" at that face's (u, v). If the texel
+// is opaque we hit; if transparent we continue ray to test the EXIT face.
+// Result: chunky cube-shaped foliage that looks like solid leaf tiles with
+// holes (exactly Minecraft "fast" leaves). Wind shifts the UV sample.
+fn leaf_face_alpha(voxel_min: vec3<f32>, face_axis: i32, uv: vec2<f32>, salt: f32) -> bool {
+    let texel = clamp(floor(uv * 16.0), vec2<f32>(0.0), vec2<f32>(15.0));
+    let h1 = hash3f(vec3<f32>(
+        voxel_min.x * 16.0 + texel.x,
+        voxel_min.y * 16.0 + texel.y + salt,
+        voxel_min.z * 16.0 + f32(face_axis) * 2.7,
+    ));
+    let h2 = hash3f(vec3<f32>(
+        voxel_min.x * 8.0 + floor(texel.x * 0.5),
+        voxel_min.y * 8.0 + floor(texel.y * 0.5) + salt * 0.3,
+        voxel_min.z * 8.0 + f32(face_axis),
+    ));
+    // Cluster bias — lower threshold = more see-through (about 50% opaque
+    // pixels). Real Minecraft "fancy leaves" are sparser than my previous
+    // 72% — the gaps make tree silhouettes feel actually leafy.
+    let combined = h1 * 0.4 + h2 * 0.6;
+    return combined < 0.52;
+}
+
+fn leaf_density_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>) -> SubHit {
+    var out: SubHit;
+    out.hit = false;
+    out.color_tint = vec3<f32>(1.0);
+    let voxel_min_base = vec3<f32>(f32(voxel.x), f32(voxel.y), f32(voxel.z));
+    let vh_pre = hash3f(voxel_min_base);
+    // PER-FACE sway: only the faces that aren't pressed against another
+    // leaf voxel actually move. Inner leaf-to-leaf faces stay put; outer
+    // faces extrude in the wind. Each of the 4 horizontal faces shifts
+    // independently — the cube deforms into an asymmetric box.
+    let n_xm = is_foliage_mat(voxel_material_at(voxel + vec3<i32>(-1, 0, 0)));
+    let n_xp = is_foliage_mat(voxel_material_at(voxel + vec3<i32>( 1, 0, 0)));
+    let n_zm = is_foliage_mat(voxel_material_at(voxel + vec3<i32>( 0, 0,-1)));
+    let n_zp = is_foliage_mat(voxel_material_at(voxel + vec3<i32>( 0, 0, 1)));
+
+    let phase_pre = voxel_min_base.x * 0.25 + voxel_min_base.z * 0.31 + vh_pre * 6.28;
+    let wind_pre = wind_offset(voxel_min_base, phase_pre, 0.40);
+
+    // Each face shifts ONLY if its corresponding neighbour is non-foliage.
+    let s_xm = select(wind_pre.x, 0.0, n_xm);
+    let s_xp = select(wind_pre.x, 0.0, n_xp);
+    let s_zm = select(wind_pre.y, 0.0, n_zm);
+    let s_zp = select(wind_pre.y, 0.0, n_zp);
+
+    let voxel_min = vec3<f32>(
+        voxel_min_base.x + s_xm,
+        voxel_min_base.y,
+        voxel_min_base.z + s_zm,
+    );
+    let voxel_max = vec3<f32>(
+        voxel_min_base.x + 1.0 + s_xp,
+        voxel_min_base.y + 1.0,
+        voxel_min_base.z + 1.0 + s_zp,
+    );
+    let inv_dir = vec3<f32>(safe_inv(dir.x), safe_inv(dir.y), safe_inv(dir.z));
+    let t0 = (voxel_min - origin) * inv_dir;
+    let t1 = (voxel_max - origin) * inv_dir;
+    let tmin = min(t0, t1);
+    let tmax = max(t0, t1);
+    let t_enter = max(max(tmin.x, tmin.y), max(tmin.z, 0.0));
+    let t_exit = min(min(tmax.x, tmax.y), tmax.z);
+    if (t_enter >= t_exit) { return out; }
+
+    let vh = vh_pre;
+    // Cube already moves — leave UV LOCKED to the (shifted) voxel so the
+    // texture doesn't slide on top of the wobble. Was creating glitch
+    // double-motion before.
+    let uv_wind = vec2<f32>(0.0);
+
+    // ENTRY-face alpha test.
+    var entry_axis: i32 = 0;
+    if (tmin.x >= tmin.y && tmin.x >= tmin.z) { entry_axis = 0; }
+    else if (tmin.y >= tmin.z) { entry_axis = 1; }
+    else { entry_axis = 2; }
+    let p_entry = origin + dir * t_enter;
+    let lp_e = p_entry - voxel_min;
+    var uv_e: vec2<f32>;
+    if (entry_axis == 0) { uv_e = vec2<f32>(lp_e.y, lp_e.z + uv_wind.y); }
+    else if (entry_axis == 1) { uv_e = vec2<f32>(lp_e.x + uv_wind.x, lp_e.z + uv_wind.y); }
+    else { uv_e = vec2<f32>(lp_e.x + uv_wind.x, lp_e.y); }
+    if (leaf_face_alpha(voxel_min_base, entry_axis, fract(uv_e), 0.0)) {
+        out.hit = true;
+        out.t_hit = t_enter;
+        var n = vec3<f32>(0.0);
+        if (entry_axis == 0) { n.x = select(1.0, -1.0, dir.x > 0.0); }
+        else if (entry_axis == 1) { n.y = select(1.0, -1.0, dir.y > 0.0); }
+        else { n.z = select(1.0, -1.0, dir.z > 0.0); }
+        out.normal = n;
+        return out;
+    }
+
+    // ENTRY transparent — test EXIT face. Same pattern, different salt so
+    // the back of the cube isn't a mirror of the front.
+    var exit_axis: i32 = 0;
+    if (tmax.x <= tmax.y && tmax.x <= tmax.z) { exit_axis = 0; }
+    else if (tmax.y <= tmax.z) { exit_axis = 1; }
+    else { exit_axis = 2; }
+    let p_exit = origin + dir * t_exit;
+    let lp_x = p_exit - voxel_min;
+    var uv_x: vec2<f32>;
+    if (exit_axis == 0) { uv_x = vec2<f32>(lp_x.y, lp_x.z + uv_wind.y); }
+    else if (exit_axis == 1) { uv_x = vec2<f32>(lp_x.x + uv_wind.x, lp_x.z + uv_wind.y); }
+    else { uv_x = vec2<f32>(lp_x.x + uv_wind.x, lp_x.y); }
+    if (leaf_face_alpha(voxel_min_base, exit_axis, fract(uv_x), 5.7)) {
+        out.hit = true;
+        out.t_hit = t_exit;
+        var n = vec3<f32>(0.0);
+        if (exit_axis == 0) { n.x = select(-1.0, 1.0, dir.x > 0.0); }
+        else if (exit_axis == 1) { n.y = select(-1.0, 1.0, dir.y > 0.0); }
+        else { n.z = select(-1.0, 1.0, dir.z > 0.0); }
+        out.normal = n;
+        return out;
+    }
+
+    return out;
+}
+
+// ---------- GRASS: 3D bundle of tapered blades scattered through cell ----------
+// Each grass voxel = ~14 thin vertical blades at hash-randomised xz positions
+// across the FULL cell (not an X cross), with varied heights and per-blade
+// tints. Each blade is a tapered AABB-bounded silhouette that tilts in the
+// wind. Fills the volume of the voxel like a real tuft.
+// (Flowers still use the simple X-plane silhouette below.)
+// Returns (is_opaque, blade_brightness 0..1).
+fn grass_blade_alpha(voxel_min: vec3<f32>, plane_id: i32, s: f32, v: f32) -> vec2<f32> {
+    let plane_span = 0.92;
+    let n_strips: i32 = 8;
+    let strip_w = plane_span / f32(n_strips);
+    for (var b: i32 = 0; b < 8; b = b + 1) {
+        let strip_center_base = -plane_span * 0.5 + strip_w * (f32(b) + 0.5);
+        let h1 = hash3f(vec3<f32>(voxel_min.x + f32(b) * 1.3, f32(plane_id) + voxel_min.z, voxel_min.y));
+        if (h1 > 0.82) { continue; }
+        let jitter = (h1 - 0.5) * strip_w * 0.7;
+        let strip_center = strip_center_base + jitter;
+        let h2 = hash3f(vec3<f32>(voxel_min.x + f32(b) * 0.9, f32(plane_id) * 0.5 + voxel_min.z + 11.0, voxel_min.y));
+        let blade_top = 0.55 + h2 * 0.40;
+        if (v > blade_top) { continue; }
+        let v_norm = v / blade_top;
+        let half_w = 0.045 * mix(1.0, 0.22, v_norm);
+        if (abs(s - strip_center) < half_w) {
+            let bright = 0.75 + v_norm * 0.35 + (h2 - 0.5) * 0.15;
+            return vec2<f32>(1.0, bright);
+        }
+    }
+    return vec2<f32>(0.0, 1.0);
+}
+
+// Returns (is_opaque, is_stem). Stem and petals need different colours.
+fn flower_alpha_part(s: f32, v: f32) -> vec2<f32> {
+    // STEM: thin vertical strip from bottom up to 0.55. (is_stem = 1)
+    if (v < 0.55 && abs(s) < 0.025) { return vec2<f32>(1.0, 1.0); }
+    // PETALS: 5 lobes around the top centre at y=0.78. Plus a small bud.
+    let pc = vec2<f32>(0.0, 0.78);
+    let d = vec2<f32>(s, v) - pc;
+    if (dot(d, d) < 0.05 * 0.05) { return vec2<f32>(1.0, 0.0); }
+    for (var i: i32 = 0; i < 5; i = i + 1) {
+        let ang = f32(i) * 1.2566;
+        let lobe_c = pc + vec2<f32>(cos(ang), sin(ang) * 0.6) * 0.12;
+        let ld = vec2<f32>(s, v) - lobe_c;
+        if (dot(ld, ld) < 0.07 * 0.07) { return vec2<f32>(1.0, 0.0); }
+    }
+    return vec2<f32>(0.0, 0.0);
+}
+
+fn grass_bundle_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u32) -> SubHit {
+    var out: SubHit;
+    out.hit = false;
+    out.color_tint = vec3<f32>(1.0);
+    let voxel_min = vec3<f32>(f32(voxel.x), f32(voxel.y), f32(voxel.z));
+    let vh = hash3f(voxel_min);
+    if (vh > 0.92) { return out; }
+
+    // Flowers stay on the X-plane silhouette (recognisable shape).
+    if (mat == MAT_FLOWER) {
+        return flower_planes_hit(voxel, origin, dir, voxel_min, vh);
+    }
+
+    // GRASS — packed bundle of 22 tapered, bowed blades filling the cell.
+    // Each blade has independent xz position, height, lean direction, and
+    // colour tint. Looks like a proper bushy tuft, not strips.
+    let phase = voxel_min.x * 0.40 + voxel_min.z * 0.55 + vh * 6.28;
+    let wind = wind_offset(voxel_min, phase, 0.22);
+    let inv_dir = vec3<f32>(safe_inv(dir.x), safe_inv(dir.y), safe_inv(dir.z));
+
+    let n_blades: i32 = 22;
+    let blade_half_w_base = 0.030;
+
+    var best_t: f32 = 1e30;
+    var best_n = vec3<f32>(0.0, 1.0, 0.0);
+    var best_bright: f32 = 1.0;
+
+    for (var i: i32 = 0; i < 22; i = i + 1) {
+        if (i >= n_blades) { break; }
+        let h1 = hash3f(voxel_min + vec3<f32>(f32(i) * 1.13, 0.0, f32(i) * 0.71));
+        let h2 = hash3f(voxel_min + vec3<f32>(f32(i) * 0.91, 0.0, f32(i) * 1.27));
+        let h3 = hash3f(voxel_min + vec3<f32>(f32(i) * 1.31, 0.0, f32(i) * 0.83));
+        let h4 = hash3f(voxel_min + vec3<f32>(f32(i) * 2.07, 0.0, f32(i) * 1.93));
+        if (h1 > 0.93) { continue; }
+        let bx_local = 0.05 + h1 * 0.90;
+        let bz_local = 0.05 + h2 * 0.90;
+        // VERY varied heights: short stubs (~0.2) to tall blades (~1.0).
+        let blade_top = 0.20 + h3 * 0.80;
+        // Per-blade natural lean direction (independent of wind) — gives
+        // the tuft a curly random look rather than every blade ramrod.
+        let lean_angle = h4 * 6.28318;
+        let lean_amt = 0.05 + h4 * 0.10;
+        let lean_x = cos(lean_angle) * lean_amt;
+        let lean_z = sin(lean_angle) * lean_amt;
+
+        // Combined sway = natural lean + wind shift.
+        let total_x = lean_x + wind.x;
+        let total_z = lean_z + wind.y;
+        let sway_max_x = max(0.0, total_x);
+        let sway_min_x = max(0.0, -total_x);
+        let sway_max_z = max(0.0, total_z);
+        let sway_min_z = max(0.0, -total_z);
+        let bmin = vec3<f32>(
+            voxel_min.x + bx_local - blade_half_w_base - sway_min_x,
+            voxel_min.y,
+            voxel_min.z + bz_local - blade_half_w_base - sway_min_z,
+        );
+        let bmax = vec3<f32>(
+            voxel_min.x + bx_local + blade_half_w_base + sway_max_x,
+            voxel_min.y + blade_top,
+            voxel_min.z + bz_local + blade_half_w_base + sway_max_z,
+        );
+        let t0b = (bmin - origin) * inv_dir;
+        let t1b = (bmax - origin) * inv_dir;
+        let tmin_b = min(t0b, t1b);
+        let tmax_b = max(t0b, t1b);
+        let t_enter_b = max(max(tmin_b.x, tmin_b.y), max(tmin_b.z, 0.0));
+        let t_exit_b = min(min(tmax_b.x, tmax_b.y), tmax_b.z);
+        if (t_enter_b >= t_exit_b) { continue; }
+
+        let n_in: i32 = 5;
+        let s_step = (t_exit_b - t_enter_b) / f32(n_in);
+        for (var j: i32 = 0; j < n_in; j = j + 1) {
+            let t = t_enter_b + s_step * (f32(j) + 0.5);
+            let p = origin + dir * t;
+            let y_n = (p.y - voxel_min.y) / blade_top;
+            if (y_n < 0.0 || y_n > 1.0) { continue; }
+            let half_w = blade_half_w_base * mix(1.0, 0.15, y_n);
+            // Bowed blade arcing in (lean + wind) direction. pow(y, 1.7)
+            // curves smoothly from straight base to arched tip.
+            let bow = pow(y_n, 1.7);
+            let cx = voxel_min.x + bx_local + total_x * bow;
+            let cz = voxel_min.z + bz_local + total_z * bow;
+            let dxc = p.x - cx;
+            let dzc = p.z - cz;
+            if (abs(dxc) > half_w || abs(dzc) > half_w) { continue; }
+            if (t < best_t) {
+                best_t = t;
+                best_n = normalize(vec3<f32>(dxc, 0.15, dzc) + vec3<f32>(0.0001));
+                // Wider tint range: dark base 0.55 → bright tip 1.20.
+                // Per-blade hue offset adds the colour variation a real
+                // tuft has (some yellow-green tips, some deeper green).
+                best_bright = 0.55 + y_n * 0.55 + (h4 - 0.5) * 0.30;
+            }
+            break;
+        }
+    }
+
+    if (best_t < 1e30) {
+        out.hit = true;
+        out.t_hit = best_t;
+        out.normal = best_n;
+        out.color_tint = vec3<f32>(best_bright);
+    }
+    return out;
+}
+
+fn flower_planes_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, voxel_min: vec3<f32>, vh: f32) -> SubHit {
+    var out: SubHit;
+    out.hit = false;
+    out.color_tint = vec3<f32>(1.0);
+    let voxel_center = voxel_min + vec3<f32>(0.5);
+    let phase = voxel_min.x * 0.40 + voxel_min.z * 0.55 + vh * 6.28;
+    let wind = wind_offset(voxel_min, phase, 0.22);
+
+    var best_t: f32 = 1e30;
+    var best_n = vec3<f32>(0.0, 1.0, 0.0);
+    var tint = vec3<f32>(1.0);
+
+    for (var i: i32 = 0; i < 2; i = i + 1) {
+        var pn: vec3<f32>;
+        var pt: vec3<f32>;
+        if (i == 0) {
+            pn = vec3<f32>(0.7071, 0.0, 0.7071);
+            pt = vec3<f32>(0.7071, 0.0, -0.7071);
+        } else {
+            pn = vec3<f32>(0.7071, 0.0, -0.7071);
+            pt = vec3<f32>(0.7071, 0.0, 0.7071);
+        }
+        let denom = dot(dir, pn);
+        if (abs(denom) < 0.0001) { continue; }
+        let t = dot(voxel_center - origin, pn) / denom;
+        if (t < 0.0) { continue; }
+        let p_hit = origin + dir * t;
+        let local = p_hit - voxel_min;
+        if (local.x < 0.0 || local.x > 1.0
+         || local.y < 0.0 || local.y > 1.0
+         || local.z < 0.0 || local.z > 1.0) { continue; }
+
+        let s = (local.x - 0.5) * pt.x + (local.z - 0.5) * pt.z;
+        let v = local.y;
+        let wind_along = (wind.x * pt.x + wind.y * pt.z) * v;
+        let s_w = s - wind_along;
+
+        let fa = flower_alpha_part(s_w, v);
+        if (fa.x < 0.5) { continue; }
+        var local_tint = vec3<f32>(1.0);
+        if (fa.y > 0.5) {
+            // Stem → green.
+            local_tint = vec3<f32>(0.32 / 1.10, 0.62 / 0.35, 0.20 / 0.65);
+        }
+        if (t < best_t) {
+            best_t = t;
+            best_n = select(pn, -pn, denom > 0.0);
+            tint = local_tint;
+        }
+    }
+
+    if (best_t < 1e30) {
+        out.hit = true;
+        out.t_hit = best_t;
+        out.normal = best_n;
+        out.color_tint = tint;
+    }
+    return out;
+}
+
+fn foliage_subvoxel(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u32) -> SubHit {
+    var hit: SubHit;
+    if (mat == MAT_TALL_GRASS || mat == MAT_FLOWER) {
+        hit = grass_bundle_hit(voxel, origin, dir, mat);
+    } else {
+        hit = leaf_density_hit(voxel, origin, dir);
+    }
+    return hit;
 }
 
 // Sun rotates east→up→west→under. Start near midday so the very first frame
@@ -402,17 +834,21 @@ fn cloud_density(p: vec3<f32>, t: f32) -> f32 {
     let cov_mid = vnoise3(pa * 0.85);
     let coverage = cov_lo * 0.7 + cov_mid * 0.3 - 0.50;
     if (coverage < 0.0) { return 0.0; }
-    // Body: 4 octaves of fbm.
-    let n1 = vnoise3(pa);
-    let n2 = vnoise3(pa * 2.7);
-    let n3 = vnoise3(pa * 6.3);
-    let n4 = vnoise3(pa * 13.1);
+    // Body: 4 octaves of fbm. Vertical noise is scaled finer so a horizontal
+    // slice doesn't look like a flat layer when viewed sideways.
+    let pb = vec3<f32>(pa.x, pa.y * 3.5, pa.z);
+    let n1 = vnoise3(pb);
+    let n2 = vnoise3(pb * 2.7);
+    let n3 = vnoise3(pb * 6.3);
+    let n4 = vnoise3(pb * 13.1);
     let body = n1 * 0.50 + n2 * 0.28 + n3 * 0.15 + n4 * 0.07;
-    // Vertical bell: 0 at slab edges, 1 in the middle. Makes flat undersides
-    // and rounded tops without needing extra slabs.
+    // Softer vertical envelope — flat bottoms / rounded tops without making
+    // the slab so thin it reads as a flat layer when viewed obliquely.
     let h = clamp((p.y - CLOUD_BASE) / max(1.0, CLOUD_TOP - CLOUD_BASE), 0.0, 1.0);
-    let bell = pow(4.0 * h * (1.0 - h), 0.6);
-    let d = (body - 0.38) * coverage * 4.5 * bell;
+    let bottom_fade = smoothstep(0.0, 0.15, h);
+    let top_fade = 1.0 - smoothstep(0.85, 1.0, h);
+    let envelope = min(bottom_fade, top_fade);
+    let d = (body - 0.38) * coverage * 4.5 * envelope;
     return clamp(d, 0.0, 1.0);
 }
 
@@ -463,6 +899,114 @@ fn sky_color(dir: vec3<f32>) -> vec3<f32> {
 
     // Clouds disabled for now.
     return col;
+}
+
+// ---- world-projected procedural textures ----------------------------------
+// Tri-planar UV: pick the plane perpendicular to the face's dominant axis,
+// then read world-space coords on that plane. Same material across multiple
+// voxels reads continuous texture; voxel boundaries vanish.
+fn tex_uv(p: vec3<f32>, n: vec3<f32>) -> vec2<f32> {
+    let an = abs(n);
+    if (an.y > an.x && an.y > an.z) { return p.xz; }    // top/bottom face
+    if (an.x > an.z)                { return p.zy; }    // ±X face
+    return p.xy;                                        // ±Z face
+}
+
+// Classic running-bond brick: rows offset by half a brick. Returns a
+// brightness multiplier (1.0 = brick face, 0.55 = mortar gap).
+fn brick_pattern(uv: vec2<f32>) -> f32 {
+    let bw = 1.6;   // brick width  (voxels)
+    let bh = 0.8;   // brick height (voxels)
+    let mw = 0.10;  // mortar thickness
+    let row = floor(uv.y / bh);
+    var offset_row: f32 = 0.0;
+    if ((i32(row) & 1) == 1) { offset_row = bw * 0.5; }
+    let lx = fract((uv.x + offset_row) / bw) * bw;
+    let ly = fract(uv.y / bh) * bh;
+    let in_v = (lx < mw) || (lx > bw - mw);
+    let in_h = (ly < mw) || (ly > bh - mw);
+    if (in_v || in_h) { return 0.55; }
+    return 1.0;
+}
+
+// Wood grain — rings concentric around the trunk's vertical axis (Y) on
+// horizontal faces, longitudinal stripes on side faces.
+fn wood_pattern(p: vec3<f32>, n: vec3<f32>) -> f32 {
+    let an = abs(n);
+    if (an.y > 0.5) {
+        // End-grain: rings.
+        let r = sqrt(p.x * p.x + p.z * p.z);
+        let rings = 0.5 + 0.5 * sin(r * 4.5 + vnoise3(vec3<f32>(p.x * 0.4, 0.0, p.z * 0.4)) * 2.0);
+        return 0.75 + rings * 0.25;
+    }
+    // Side: longitudinal grain.
+    let grain = 0.5 + 0.5 * sin(p.y * 6.0 + vnoise3(p * 0.3) * 3.0);
+    let fine = vnoise3(vec3<f32>(p.x * 8.0, p.y * 1.2, p.z * 8.0));
+    return 0.78 + grain * 0.18 + fine * 0.08;
+}
+
+// All material textures return a *luminance multiplier* (~0.7–1.2 range)
+// applied to the material's base palette colour. That way each material
+// keeps its identifying colour but gains world-projected detail — voxels of
+// the same material show continuous texture across faces, single voxels
+// removed just gap a slice of the pattern. We deliberately avoid recolouring
+// (e.g. the previous brick pattern turned stone terra-cotta — that was a
+// surprise; user wanted "texture", not a colour swap).
+fn material_texture(p: vec3<f32>, n: vec3<f32>, mat: u32) -> vec3<f32> {
+    let uv = tex_uv(p, n);
+    // Stone — cracked mortar look, but the gray base colour is preserved.
+    if (mat == 4u) {
+        let cracks = brick_pattern(uv);          // 0.55 in mortar, 1.0 in face
+        let grain = vnoise3(vec3<f32>(uv * 2.0, 0.0)) * 0.20 + 0.90;
+        return vec3<f32>(grain * mix(0.7, 1.0, cracks));
+    }
+    // Wood variants — directional grain.
+    if (mat == 13u || mat == 23u || mat == 24u) {
+        return vec3<f32>(wood_pattern(p, n));
+    }
+    // Grass — small clumpy variation.
+    if (mat == 2u) {
+        let nn = vnoise3(vec3<f32>(uv * 2.2, 0.0));
+        return vec3<f32>(0.85 + nn * 0.30);
+    }
+    // Dirt.
+    if (mat == 3u) {
+        let nn = vnoise3(vec3<f32>(uv * 1.6, 0.0));
+        return vec3<f32>(0.78 + nn * 0.30);
+    }
+    // Sand — fine granular.
+    if (mat == 1u) {
+        let nn = vnoise3(vec3<f32>(uv * 7.0, 0.0));
+        return vec3<f32>(0.92 + nn * 0.16);
+    }
+    // Snow — sparkles.
+    if (mat == 15u) {
+        let nn = vnoise3(vec3<f32>(uv * 16.0, 0.0));
+        let sparkle = max(0.0, (nn - 0.85) * 6.0);
+        return vec3<f32>(0.97 + sparkle);
+    }
+    // Leaves variants.
+    if (mat == 14u || mat == 25u || mat == 26u || mat == 27u) {
+        let nn = vnoise3(vec3<f32>(uv * 4.0, 0.0));
+        return vec3<f32>(0.80 + nn * 0.40);
+    }
+    // Ice.
+    if (mat == 17u) {
+        let nn = vnoise3(vec3<f32>(uv * 1.2, 0.0));
+        return vec3<f32>(0.88 + nn * 0.20);
+    }
+    // Coal.
+    if (mat == 19u) {
+        let nn = vnoise3(vec3<f32>(uv * 3.5, 0.0));
+        return vec3<f32>(0.70 + nn * 0.50);
+    }
+    // Lava — keep the warm palette colour; modulate luminance with crack noise.
+    if (mat == 16u) {
+        let nn = vnoise3(vec3<f32>(uv * 1.4, p.y * 0.05));
+        let crack = smoothstep(0.45, 0.55, nn);
+        return vec3<f32>(mix(1.15, 0.55, crack));
+    }
+    return vec3<f32>(1.0);
 }
 
 fn ambient_color() -> vec3<f32> {
@@ -553,9 +1097,9 @@ fn trace_no_water(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
     let t_exit = min(min(tmax3.x, tmax3.y), tmax3.z);
     if (t_enter >= t_exit || t_exit < 0.0) { return out; }
 
-    let bias = 1e-3;
+    let bias = 1e-2;
     var p = origin + dir * (t_enter + bias);
-    p = clamp(p, win_min + vec3<f32>(0.001), win_max - vec3<f32>(0.001));
+    p = clamp(p, win_min + vec3<f32>(0.01), win_max - vec3<f32>(0.01));
     let step = vec3<i32>(sign(dir));
     let t_delta = abs(inv_dir);
 
@@ -666,7 +1210,10 @@ fn shade_water_top(hit: Hit, origin: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
     let depth = max(0.0, under.t_hit);
     let absorb = vec3<f32>(0.55, 0.25, 0.10); // per-unit-distance attenuation
     let transmittance = exp(-absorb * depth);
-    let water_tint = vec3<f32>(0.10, 0.32, 0.42);
+    // Water tint modulated by ambient + a bit of sun colour, so the water
+    // body actually goes dark at night instead of staying daytime-blue.
+    let tint_base = vec3<f32>(0.10, 0.32, 0.42);
+    let water_tint = tint_base * (ambient_color() * 1.6 + sc * 0.20);
     let refr_col = under_col * transmittance + water_tint * (1.0 - transmittance.x);
 
     // ---- Fresnel mix of reflection and refraction ----
@@ -698,29 +1245,42 @@ fn shade_water_top(hit: Hit, origin: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
     let caustic = 0.6 + 0.8 * pow(max(0.0, n.y), 18.0);
 
     var col = mix(refr_col * caustic, refl_col, fresnel) + sc * spec * shadow * 1.4;
-    col = mix(col, vec3<f32>(1.0, 1.05, 1.10), foam);
+    // Foam colour also dims at night — at dawn/dusk it picks up the warm
+    // sun tint, at noon it's bright white, at night it fades into ambient.
+    let foam_col = ambient_color() * 1.5 + sc * 0.50;
+    col = mix(col, foam_col, foam);
     let fog_t = clamp(hit.t_hit / 280.0, 0.0, 0.85);
     return mix(col, fog_atmospheric(dir), fog_t);
 }
 
 fn shade(hit: Hit, origin: vec3<f32>, dir: vec3<f32>, pix_jit: f32) -> vec3<f32> {
-    var base = palette[hit.mat].rgb;
-    let ao = compute_ao(hit, origin, dir);
     let p_hit = origin + dir * hit.t_hit;
+    let tex = material_texture(p_hit, hit.normal, hit.mat);
+    var base = palette[hit.mat].rgb * tex;
+    // Foliage sub-hit may override colour (flower stem → green, blade
+    // shading variations etc.)
+    if (hit.last_axis < 0 && is_foliage_mat(hit.mat)) {
+        base = base * g_foliage_tint;
+    }
+    // Skip the cube-face AO for sub-voxel sphere hits (foliage). The curved
+    // sphere normal already gives rim/falloff that reads as 3D.
+    let ao = select(compute_ao(hit, origin, dir), 1.0, hit.last_axis < 0);
 
     // ---- swaying foliage ----
     // Leaves and grass-tops perturb their shading normal with a wind field
     // so they look animated even though the underlying voxel is rigid.
     var n = hit.normal;
-    if (hit.mat == MAT_LEAVES) {
+    if (is_foliage_mat(hit.mat)) {
         let t = camera.time;
         let sway = sin(p_hit.x * 0.40 + t * 1.8) * cos(p_hit.z * 0.40 + t * 1.2)
                  + 0.4 * sin((p_hit.x + p_hit.z) * 0.25 + t * 2.4);
-        n.x += sway * 0.30;
-        n.z += sway * 0.20;
+        // Flowers + tall grass sway harder (thin & light) than tree leaves.
+        let amp = select(0.30, 0.55, hit.mat == MAT_FLOWER || hit.mat == MAT_TALL_GRASS);
+        n.x += sway * amp;
+        n.z += sway * amp * 0.7;
         n = normalize(n);
-        base *= 1.0 + sway * 0.10;
-    } else if (hit.mat == 2u /* MAT_GRASS */ && hit.normal.y > 0.5) {
+        base *= 1.0 + sway * 0.12;
+    } else if (hit.mat == MAT_GRASS && hit.normal.y > 0.5) {
         let t = camera.time;
         let sway = sin(p_hit.x * 0.55 + t * 2.1) * cos(p_hit.z * 0.55 + t * 1.7);
         n.x += sway * 0.20;
@@ -735,15 +1295,17 @@ fn shade(hit: Hit, origin: vec3<f32>, dir: vec3<f32>, pix_jit: f32) -> vec3<f32>
     let n_dot_l = max(0.0, dot(n, s));
     var shadow_term = 0.0;
     if (n_dot_l > 0.0 && s_int > 0.0) {
-        // PCF using per-PIXEL jitter (not position-based — that's what made
-        // the chess pattern). 4 golden-spiral samples.
+        // PCF using per-PIXEL jitter — 2 golden-spiral samples (was 4; the
+        // temporal-differential pass averages adjacent frames so the noise
+        // washes out across time anyway, and shadows are the single most
+        // expensive per-pixel cost).
         let tau = 6.28318530;
         let golden = 2.39996323; // 137.5° in radians
         let cone = 0.07;
         var sum = 0.0;
-        for (var i: i32 = 0; i < 4; i = i + 1) {
+        for (var i: i32 = 0; i < 2; i = i + 1) {
             let theta = (f32(i) + pix_jit) * golden;
-            let radius = cone * sqrt((f32(i) + pix_jit) * 0.25);
+            let radius = cone * sqrt((f32(i) + pix_jit) * 0.5);
             // Build a tangent frame around the sun direction (s) so the offset
             // is in the *plane perpendicular to s* — not just in xz. That way
             // shadows are uniformly soft regardless of sun azimuth.
@@ -756,7 +1318,7 @@ fn shade(hit: Hit, origin: vec3<f32>, dir: vec3<f32>, pix_jit: f32) -> vec3<f32>
             let ss = normalize(s + off);
             if (!trace_any(p_off, ss)) { sum = sum + 1.0; }
         }
-        shadow_term = sum * 0.25;
+        shadow_term = sum * 0.5;
     }
 
     let direct = sun_color(s) * (n_dot_l * shadow_term);
@@ -850,12 +1412,12 @@ fn shade_glass(hit: Hit, origin: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
     return mix(combined, fog_atmospheric(dir), fog_t);
 }
 
-// Volumetric clouds: raymarch a horizontal slab between [CLOUD_BASE, CLOUD_TOP].
-// Per sample: density gate (Worley-ish via vnoise3 in cloud_density), 3 cone
-// samples up the sun ray for self-shadowing, front-to-back composite. Bails
-// when transmittance saturates so all-sky pixels still cost ~constant.
-const CLOUD_BASE: f32 = 200.0;
-const CLOUD_TOP:  f32 = 250.0;
+// Volumetric clouds: raymarch a horizontal slab. Altitude lowered (was
+// 200-250) so clouds sit inside the world Y = 192 — view rays past
+// mountains can actually reach the cloud band instead of stopping at the
+// world ceiling.
+const CLOUD_BASE: f32 = 145.0;
+const CLOUD_TOP:  f32 = 180.0;
 
 fn render_clouds(origin: vec3<f32>, dir: vec3<f32>, t_terrain: f32, pix: vec2<f32>) -> vec4<f32> {
     // Slab intersection. A horizontal ray (|dir.y| ~ 0) gets nothing because
@@ -876,9 +1438,11 @@ fn render_clouds(origin: vec3<f32>, dir: vec3<f32>, t_terrain: f32, pix: vec2<f3
 
     let N: i32 = 12;
     let step_t = (t_far_clamp - t_start) / f32(N);
-    // IGN jitter — far better noise distribution than sin-hash for what
-    // temporal differential averages over.
-    let h = ign(pix.x, pix.y, camera.time * 60.0);
+    // Spatial-only jitter (no time) — time-varying jitter combined with the
+    // temporal-differential pass that re-renders only some tiles per frame
+    // creates a stable-but-time-correlated mismatch between adjacent
+    // pixels, which reads as a checkerboard pattern over time.
+    let h = ign(pix.x, pix.y, 0.0);
 
     // Henyey-Greenstein forward-scatter — gives the "silver lining" effect
     // when looking toward the sun through cloud edges.
@@ -887,7 +1451,9 @@ fn render_clouds(origin: vec3<f32>, dir: vec3<f32>, t_terrain: f32, pix: vec2<f3
 
     var transmittance: f32 = 1.0;
     var scattered: vec3<f32> = vec3<f32>(0.0);
-    let ambient = vec3<f32>(0.55, 0.62, 0.74) + sc * 0.10;
+    // Day/night-aware ambient (was hardcoded blue — clouds glowed at night).
+    // Scale ambient_color a bit so daytime clouds still read as bright.
+    let ambient = ambient_color() * 1.6 + sc * 0.10;
 
     for (var i: i32 = 0; i < N; i = i + 1) {
         let t = t_start + (f32(i) + h) * step_t;
@@ -971,9 +1537,9 @@ fn trace_any(origin: vec3<f32>, dir: vec3<f32>) -> bool {
     let t_exit = min(min(tmax3.x, tmax3.y), tmax3.z);
     if (t_enter >= t_exit || t_exit < 0.0) { return false; }
 
-    let bias = 1e-3;
+    let bias = 1e-2;
     var p = origin + dir * (t_enter + bias);
-    p = clamp(p, win_min + vec3<f32>(0.001), win_max - vec3<f32>(0.001));
+    p = clamp(p, win_min + vec3<f32>(0.01), win_max - vec3<f32>(0.01));
     let step = vec3<i32>(sign(dir));
     let t_delta = abs(inv_dir);
 
@@ -1009,7 +1575,17 @@ fn trace_any(origin: vec3<f32>, dir: vec3<f32>) -> bool {
         let bi = world_brick_idx(bp.x, bp.y, bp.z);
         let local = slot_v - bp * BRICK_DIM;
         let vi = brick_voxel_idx(local.x, local.y, local.z);
-        if (brick_voxel_solid(bi, vi)) { return true; }
+        if (brick_voxel_solid(bi, vi)) {
+            let m = brick_voxel_material(bi, vi);
+            if (is_foliage_mat(m)) {
+                // Sub-voxel sphere blocks shadow only if the shadow ray
+                // actually hits the sphere — dappled light through gaps.
+                let fh = foliage_subvoxel(voxel, origin, dir, m);
+                if (fh.hit) { return true; }
+            } else {
+                return true;
+            }
+        }
 
         if (t_max.x < t_max.y && t_max.x < t_max.z) {
             voxel.x = voxel.x + step.x;
@@ -1093,10 +1669,8 @@ fn axis_select(v: vec3<f32>, ax: i32) -> f32 {
 }
 
 // LOD: past this many voxels of distance, terminate the DDA at brick
-// granularity instead of per-voxel. A brick is 4 voxels — at 220+ voxels a
-// 4-voxel jump is sub-pixel anyway, so the visual loss is invisible while
-// the per-voxel inner loop disappears for far rays.
-const LOD_BRICK_T: f32 = 220.0;
+// granularity instead of per-voxel.
+const LOD_BRICK_T: f32 = 400.0;
 
 fn trace(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
     var out: Hit;
@@ -1208,31 +1782,44 @@ fn trace(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
         let vi = brick_voxel_idx(local.x, local.y, local.z);
         if (brick_voxel_solid(bi, vi)) {
             let m = brick_voxel_material(bi, vi);
-            var n = vec3<f32>(0.0);
-            var t_hit: f32;
-            if (last_axis == 0) {
-                n.x = -f32(step.x);
-                t_hit = t_max.x - t_delta.x;
-            } else if (last_axis == 1) {
-                n.y = -f32(step.y);
-                t_hit = t_max.y - t_delta.y;
-            } else if (last_axis == 2) {
-                n.z = -f32(step.z);
-                t_hit = t_max.z - t_delta.z;
+            if (is_foliage_mat(m)) {
+                let fh = foliage_subvoxel(voxel, origin, dir, m);
+                if (fh.hit) {
+                    out.hit = true;
+                    out.mat = m;
+                    out.normal = fh.normal;
+                    out.voxel = voxel;
+                    out.last_axis = -1;
+                    out.t_hit = fh.t_hit;
+                    g_foliage_tint = fh.color_tint;
+                    return out;
+                }
             } else {
-                // First voxel — we entered through the world AABB face.
-                t_hit = t_enter;
-                if      (tmin3.x >= tmin3.y && tmin3.x >= tmin3.z) { n.x = -f32(step.x); }
-                else if (tmin3.y >= tmin3.z)                      { n.y = -f32(step.y); }
-                else                                              { n.z = -f32(step.z); }
+                var n = vec3<f32>(0.0);
+                var t_hit: f32;
+                if (last_axis == 0) {
+                    n.x = -f32(step.x);
+                    t_hit = t_max.x - t_delta.x;
+                } else if (last_axis == 1) {
+                    n.y = -f32(step.y);
+                    t_hit = t_max.y - t_delta.y;
+                } else if (last_axis == 2) {
+                    n.z = -f32(step.z);
+                    t_hit = t_max.z - t_delta.z;
+                } else {
+                    t_hit = t_enter;
+                    if      (tmin3.x >= tmin3.y && tmin3.x >= tmin3.z) { n.x = -f32(step.x); }
+                    else if (tmin3.y >= tmin3.z)                      { n.y = -f32(step.y); }
+                    else                                              { n.z = -f32(step.z); }
+                }
+                out.hit = true;
+                out.mat = m;
+                out.normal = n;
+                out.voxel = voxel;
+                out.last_axis = last_axis_after_entry(last_axis, tmin3);
+                out.t_hit = t_hit;
+                return out;
             }
-            out.hit = true;
-            out.mat = m;
-            out.normal = n;
-            out.voxel = voxel;
-            out.last_axis = last_axis_after_entry(last_axis, tmin3);
-            out.t_hit = t_hit;
-            return out;
         }
 
         if (t_max.x < t_max.y && t_max.x < t_max.z) {
@@ -1290,9 +1877,26 @@ fn skip_to_cell(
     if (step.x != 0 && t_face.x > eps && t_face.x < t_min) { t_min = t_face.x; ax = 0; }
     if (step.y != 0 && t_face.y > eps && t_face.y < t_min) { t_min = t_face.y; ax = 1; }
     if (step.z != 0 && t_face.z > eps && t_face.z < t_min) { t_min = t_face.z; ax = 2; }
-    let bias = 1e-3;
+    // Matches the main trace bias — small bias was creating 1-pixel sky gaps
+    // at large world coords where float rounding straddles voxel boundaries.
+    let bias = 1e-2;
     let p_new = origin + dir * (t_min + bias);
-    (*voxel) = vec3<i32>(floor(p_new));
+    var nv = vec3<i32>(floor(p_new));
+    // Integer-snap the crossed axis. Float-floor of `origin + dir * t` can
+    // land on the *wrong side* of a boundary at far distance no matter how
+    // big the bias; snapping uses the exact cell math instead. This is what
+    // was causing the "huge sky gaps between voxels" while moving sideways.
+    if (ax == 0) {
+        if (step.x > 0) { nv.x = cell_origin.x + cell_size; }
+        else            { nv.x = cell_origin.x - 1; }
+    } else if (ax == 1) {
+        if (step.y > 0) { nv.y = cell_origin.y + cell_size; }
+        else            { nv.y = cell_origin.y - 1; }
+    } else {
+        if (step.z > 0) { nv.z = cell_origin.z + cell_size; }
+        else            { nv.z = cell_origin.z - 1; }
+    }
+    (*voxel) = nv;
     if (step.x > 0) { (*t_max).x = (f32((*voxel).x + 1) - origin.x) * inv_dir.x; } else { (*t_max).x = (f32((*voxel).x) - origin.x) * inv_dir.x; }
     if (step.y > 0) { (*t_max).y = (f32((*voxel).y + 1) - origin.y) * inv_dir.y; } else { (*t_max).y = (f32((*voxel).y) - origin.y) * inv_dir.y; }
     if (step.z > 0) { (*t_max).z = (f32((*voxel).z + 1) - origin.z) * inv_dir.z; } else { (*t_max).z = (f32((*voxel).z) - origin.z) * inv_dir.z; }

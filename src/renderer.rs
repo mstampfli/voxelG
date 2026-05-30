@@ -11,7 +11,7 @@ use crate::voxel::{
     MAT_WOOD, MAT_LEAVES, MAT_SNOW, MAT_LAVA, MAT_ICE, MAT_GLASS,
     MAT_COAL, MAT_IRON, MAT_GOLD, MAT_DIAMOND,
     MAT_WOOD_BIRCH, MAT_WOOD_PINE, MAT_LEAVES_BIRCH, MAT_LEAVES_PINE, MAT_LEAVES_AUTUMN,
-    MAT_SMOKE, MAT_FIRE,
+    MAT_SMOKE, MAT_FIRE, MAT_FLOWER, MAT_TALL_GRASS,
 };
 
 #[repr(C)]
@@ -58,13 +58,16 @@ fn default_palette() -> [PaletteEntry; PALETTE_SIZE] {
     p[MAT_LEAVES_AUTUMN as usize] = PaletteEntry([0.90, 0.42, 0.15, 1.0]);
     p[MAT_SMOKE as usize]   = PaletteEntry([0.65, 0.65, 0.70, 1.0]);
     p[MAT_FIRE as usize]    = PaletteEntry([1.60, 0.60, 0.10, 1.0]);
+    p[MAT_FLOWER as usize]      = PaletteEntry([1.10, 0.35, 0.65, 1.0]);
+    p[MAT_TALL_GRASS as usize]  = PaletteEntry([0.38, 0.70, 0.25, 1.0]);
     p
 }
 
-/// Render at 1/N the swapchain resolution per axis. 2 = half-res = 1/4 pixel
-/// count — the raymarch's biggest single perf win. The blit upscales with
-/// bilinear filtering so the result still reads as crisp.
-pub const RENDER_SCALE: u32 = 2;
+/// Render at 1/N the swapchain resolution per axis. 1 = native resolution,
+/// 2 = half-res = 1/4 pixel count. The blit upscales with bilinear filtering
+/// + light sharpen so values >1 still read as crisp, but the user prefers
+/// the sharp native look so we run at 1:1.
+pub const RENDER_SCALE: u32 = 1;
 
 pub struct Renderer {
     pub device: wgpu::Device,

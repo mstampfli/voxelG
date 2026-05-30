@@ -59,6 +59,13 @@ struct App {
     last_sent_pose: Option<(Vec3, f32, f32)>,
     last_net_send: Instant,
     remote_players: std::collections::HashMap<net::PlayerId, ([f32; 3], f32, f32)>,
+
+    // Click queue. The MouseInput handler enqueues here; RedrawRequested
+    // consumes after all camera state for the about-to-render frame is
+    // settled. Guarantees the raycast direction MATCHES the rendered
+    // crosshair, so the placed marker lands exactly under the crosshair the
+    // player sees.
+    pending_clicks: Vec<winit::event::MouseButton>,
 }
 
 impl App {
@@ -86,6 +93,7 @@ impl App {
             last_sent_pose: None,
             last_net_send: Instant::now(),
             remote_players: std::collections::HashMap::new(),
+            pending_clicks: Vec::new(),
         }
     }
 
@@ -210,43 +218,12 @@ impl ApplicationHandler for App {
                 if !self.grabbed {
                     self.grab(true);
                 } else {
-                    use winit::event::MouseButton;
-                    // Raycast uses the camera's *local* position (raycast walks
-                    // the local brick grid). Camera is in world coords now, so
-                    // translate first.
-                    let origin = self.world_origin_voxel();
-                    let local_cam = self.camera.pos - Vec3::new(origin.x as f32, 0.0, origin.z as f32);
-                    if let Some(hit) = raycast::raycast(local_cam, self.camera.forward(), &self.world) {
-                        let v = hit.voxel;
-                        match button {
-                            MouseButton::Left => {
-                                // Sphere-of-impact destruction. Apply locally
-                                // and send ONE Explode message — server fans
-                                // out and expands it.
-                                let origin = self.world_origin_voxel();
-                                let cx = v[0] + origin.x;
-                                let cy = v[1] + origin.y;
-                                let cz = v[2] + origin.z;
-                                let r: u8 = 2;
-                                self.apply_sphere(cx, cy, cz, r, voxel::MAT_AIR);
-                                if let Some(net) = self.net.as_ref() {
-                                    net.send(net::Message::Explode { cx, cy, cz, radius: r, mat: voxel::MAT_AIR });
-                                }
-                            }
-                            MouseButton::Right => {
-                                let p = [v[0] + hit.normal[0], v[1] + hit.normal[1], v[2] + hit.normal[2]];
-                                if p[0] >= 0 && p[1] >= 0 && p[2] >= 0 {
-                                    let origin = self.world_origin_voxel();
-                                    let wx = p[0] + origin.x;
-                                    let wy = p[1] + origin.y;
-                                    let wz = p[2] + origin.z;
-                                    self.world.apply_edit(wx, wy, wz, self.current_material);
-                                    self.broadcast_edit_world(wx, wy, wz, self.current_material);
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
+                    // Queue the click — actual raycast runs at the top of
+                    // the next RedrawRequested using the same camera state
+                    // that's about to be rendered, so the marker lands under
+                    // the rendered crosshair regardless of intervening
+                    // mouse-motion events.
+                    self.pending_clicks.push(button);
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
@@ -270,6 +247,25 @@ impl ApplicationHandler for App {
                         KeyCode::Digit8 if pressed => self.current_material = MAT_ICE,
                         KeyCode::Digit9 if pressed => self.current_material = MAT_SNOW,
                         KeyCode::Digit0 if pressed => self.current_material = MAT_SMOKE,
+                        // Test-fire: drop a lava block 15 voxels in front of
+                        // the camera with NO raycast. If this lava lands at
+                        // the crosshair, raycast/coords are the bug. If it
+                        // lands off-crosshair, the camera vectors disagree
+                        // between CPU and GPU.
+                        KeyCode::KeyT if pressed => {
+                            let fwd = self.camera.forward();
+                            let p = self.camera.pos + fwd * 15.0;
+                            let wx = p.x.floor() as i32;
+                            let wy = p.y.floor() as i32;
+                            let wz = p.z.floor() as i32;
+                            log::info!(
+                                "TEST-FIRE cam=({:.2},{:.2},{:.2}) fwd=({:.3},{:.3},{:.3}) -> world=({},{},{})",
+                                self.camera.pos.x, self.camera.pos.y, self.camera.pos.z,
+                                fwd.x, fwd.y, fwd.z,
+                                wx, wy, wz,
+                            );
+                            self.world.apply_edit(wx, wy, wz, voxel::MAT_LAVA);
+                        }
                         KeyCode::Escape if pressed => {
                             if self.grabbed {
                                 self.grab(false);
@@ -292,8 +288,6 @@ impl ApplicationHandler for App {
                 self.poll_net();
                 self.maybe_send_pose(now);
 
-                let renderer = self.renderer.as_mut().unwrap();
-
                 let speed = if self.keys.sprint { 4.0 } else { 1.0 };
                 let f = (self.keys.forward as i32 - self.keys.back as i32) as f32;
                 let r = (self.keys.right as i32 - self.keys.left as i32) as f32;
@@ -311,6 +305,55 @@ impl ApplicationHandler for App {
                 // can chew through 16 slots in roughly the same wall-time
                 // that 8 took serially.
                 self.world.process_regen_queue(16);
+
+                // ---- consume queued clicks ----
+                // At this point self.camera is in the EXACT state that's
+                // about to be rendered: WASD translation applied above,
+                // every queued mouse-motion already accounted for. Raycasting
+                // here guarantees the marker lands under the rendered
+                // crosshair the player sees.
+                if !self.pending_clicks.is_empty() {
+                    use winit::event::MouseButton;
+                    let clicks = std::mem::take(&mut self.pending_clicks);
+                    let world_origin = self.world_origin_voxel();
+                    for button in clicks {
+                        // raycast now walks WORLD coords (matching shader's
+                        // toroidal storage lookup). hit.voxel is in WORLD
+                        // coords — no translation needed.
+                        let hit_opt = raycast::raycast(
+                            self.camera.pos, self.camera.forward(), &self.world, world_origin,
+                        );
+                        log::info!(
+                            "click {:?} cam_world={:.1?} fwd={:.3?} -> {:?}",
+                            button, self.camera.pos, self.camera.forward(),
+                            hit_opt.as_ref().map(|h| h.voxel),
+                        );
+                        let Some(hit) = hit_opt else { continue; };
+                        let v = hit.voxel;
+                        match button {
+                            MouseButton::Left => {
+                                let cx = v[0];
+                                let cy = v[1];
+                                let cz = v[2];
+                                let r: u8 = 2;
+                                self.apply_sphere(cx, cy, cz, r, voxel::MAT_AIR);
+                                if let Some(net) = self.net.as_ref() {
+                                    net.send(net::Message::Explode {
+                                        cx, cy, cz, radius: r, mat: voxel::MAT_AIR,
+                                    });
+                                }
+                            }
+                            MouseButton::Right => {
+                                let wx = v[0] + hit.normal[0];
+                                let wy = v[1] + hit.normal[1];
+                                let wz = v[2] + hit.normal[2];
+                                self.world.apply_edit(wx, wy, wz, self.current_material);
+                                self.broadcast_edit_world(wx, wy, wz, self.current_material);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
 
                 self.physics_acc += dt;
                 let step = 1.0 / 30.0;
@@ -333,7 +376,7 @@ impl ApplicationHandler for App {
                     || camera_changed;
                 let any_dirty = force_full || physics_changed;
 
-                let (rw, rh) = renderer.size;
+                let (rw, rh) = self.renderer.as_ref().unwrap().size;
                 let tiles_w = (rw + 7) / 8;
                 let tiles_h = (rh + 7) / 8;
                 let word_count = ((tiles_w * tiles_h) as usize + 31) / 32;
@@ -351,6 +394,7 @@ impl ApplicationHandler for App {
                     }
                 }
 
+                let renderer = self.renderer.as_mut().unwrap();
                 renderer.upload_world(&mut self.world);
                 let t = (now - self.start_time).as_secs_f32();
                 let world_origin_voxel = glam::IVec3::new(
