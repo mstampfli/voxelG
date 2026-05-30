@@ -64,6 +64,24 @@ struct PlayersBuf {
 };
 @group(0) @binding(8) var<storage, read> players: PlayersBuf;
 
+// Uniform-material lookup tables. brick_uniform[bi] / tile_uniform[ti] = 0 means
+// the brick/tile is non-uniform (must traverse children); any non-zero value is
+// the material that fills it entirely. Packed 4 bytes per u32.
+@group(0) @binding(9) var<storage, read> brick_uniform_packed: array<u32>;
+@group(0) @binding(10) var<storage, read> tile_uniform_packed: array<u32>;
+
+fn brick_uniform_mat(bi: i32) -> u32 {
+    let w = brick_uniform_packed[bi >> 2];
+    let shift = u32(bi & 3) * 8u;
+    return (w >> shift) & 0xFFu;
+}
+
+fn tile_uniform_mat(ti: i32) -> u32 {
+    let w = tile_uniform_packed[ti >> 2];
+    let shift = u32(ti & 3) * 8u;
+    return (w >> shift) & 0xFFu;
+}
+
 fn ray_aabb_t(origin: vec3<f32>, inv_dir: vec3<f32>, mn: vec3<f32>, mx: vec3<f32>) -> f32 {
     let t0 = (mn - origin) * inv_dir;
     let t1 = (mx - origin) * inv_dir;
@@ -395,6 +413,10 @@ fn is_water_mat(m: u32) -> bool {
 }
 fn is_transparent_mat(m: u32) -> bool {
     return is_water_mat(m) || m == MAT_GLASS;
+}
+fn is_uniform_optimisable(m: u32) -> bool {
+    // Skip foliage (sub-voxel cutout) + transparent (refraction / wave anim).
+    return !is_foliage_mat(m) && !is_transparent_mat(m);
 }
 fn is_foliage_mat(m: u32) -> bool {
     return m == MAT_LEAVES || m == MAT_LEAVES_BIRCH
@@ -1736,6 +1758,31 @@ fn trace(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
         }
 
         let ti = world_tile_idx(tp.x, tp.y, tp.z);
+
+        // ---- Fast-skip: uniform 16-voxel tile (one material throughout) ----
+        // Whole 4096-voxel tile is one opaque material — surface at entry face.
+        let tum = tile_uniform_mat(ti);
+        if (tum != 0u && is_uniform_optimisable(tum)) {
+            var n = vec3<f32>(0.0);
+            var t_hit: f32;
+            if (last_axis == 0)      { n.x = -f32(step.x); t_hit = t_max.x - t_delta.x; }
+            else if (last_axis == 1) { n.y = -f32(step.y); t_hit = t_max.y - t_delta.y; }
+            else if (last_axis == 2) { n.z = -f32(step.z); t_hit = t_max.z - t_delta.z; }
+            else {
+                t_hit = t_enter;
+                if      (tmin3.x >= tmin3.y && tmin3.x >= tmin3.z) { n.x = -f32(step.x); }
+                else if (tmin3.y >= tmin3.z)                       { n.y = -f32(step.y); }
+                else                                               { n.z = -f32(step.z); }
+            }
+            out.hit = true;
+            out.mat = tum;
+            out.normal = n;
+            out.voxel = voxel;
+            out.last_axis = last_axis_after_entry(last_axis, tmin3);
+            out.t_hit = t_hit;
+            return out;
+        }
+
         let brick_in_tile_lin = (bp.x & 3) + (bp.z & 3) * 4 + (bp.y & 3) * 16;
         if (!tile_has_child(ti, brick_in_tile_lin)) {
             skip_to_cell(4, &voxel, &t_max, origin, dir, inv_dir, step, &last_axis);
@@ -1744,6 +1791,29 @@ fn trace(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
         }
 
         let bi = world_brick_idx(bp.x, bp.y, bp.z);
+
+        // ---- Fast-skip: uniform 4-voxel brick (one material throughout) ----
+        let bum = brick_uniform_mat(bi);
+        if (bum != 0u && is_uniform_optimisable(bum)) {
+            var n = vec3<f32>(0.0);
+            var t_hit: f32;
+            if (last_axis == 0)      { n.x = -f32(step.x); t_hit = t_max.x - t_delta.x; }
+            else if (last_axis == 1) { n.y = -f32(step.y); t_hit = t_max.y - t_delta.y; }
+            else if (last_axis == 2) { n.z = -f32(step.z); t_hit = t_max.z - t_delta.z; }
+            else {
+                t_hit = t_enter;
+                if      (tmin3.x >= tmin3.y && tmin3.x >= tmin3.z) { n.x = -f32(step.x); }
+                else if (tmin3.y >= tmin3.z)                       { n.y = -f32(step.y); }
+                else                                               { n.z = -f32(step.z); }
+            }
+            out.hit = true;
+            out.mat = bum;
+            out.normal = n;
+            out.voxel = voxel;
+            out.last_axis = last_axis_after_entry(last_axis, tmin3);
+            out.t_hit = t_hit;
+            return out;
+        }
 
         // ---- LOD: brick-level early termination at far distance ----
         // If we're far enough away that voxels are sub-pixel anyway, take
