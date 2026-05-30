@@ -147,6 +147,43 @@ fn brick_voxel_material(bi: i32, vi: i32) -> u32 {
     return (bricks[bi].materials[word] >> u32(byte * 8)) & 0xFFu;
 }
 
+// LOD support: representative material of an entire brick — used at far
+// distance where we terminate the DDA at brick granularity instead of
+// per-voxel. Picks the topmost solid voxel so distant terrain reads as its
+// surface (grass/snow/sand) rather than its hidden interior (stone/dirt).
+fn brick_topmost_material(bi: i32) -> u32 {
+    let b = bricks[bi];
+    // Brick layout: voxel idx = x + z*4 + y*16. So y=3 layer = bits 48..63.
+    // Walk from top y=3 layer down.
+    let occ_hi = b.occ_hi;
+    let occ_lo = b.occ_lo;
+    // y=3 layer is occ_hi >> 16 (16 bits at bit 48..63).
+    let y3 = (occ_hi >> 16u) & 0xFFFFu;
+    if (y3 != 0u) {
+        let bit = firstTrailingBit(y3);
+        return brick_voxel_material(bi, i32(48u + bit));
+    }
+    // y=2 layer = occ_hi & 0xFFFF (bits 32..47).
+    let y2 = occ_hi & 0xFFFFu;
+    if (y2 != 0u) {
+        let bit = firstTrailingBit(y2);
+        return brick_voxel_material(bi, i32(32u + bit));
+    }
+    // y=1 layer = occ_lo >> 16 (bits 16..31).
+    let y1 = (occ_lo >> 16u) & 0xFFFFu;
+    if (y1 != 0u) {
+        let bit = firstTrailingBit(y1);
+        return brick_voxel_material(bi, i32(16u + bit));
+    }
+    // y=0 layer = occ_lo & 0xFFFF (bits 0..15).
+    let y0 = occ_lo & 0xFFFFu;
+    if (y0 != 0u) {
+        let bit = firstTrailingBit(y0);
+        return brick_voxel_material(bi, i32(bit));
+    }
+    return 0u;
+}
+
 fn is_voxel_solid(world_v: vec3<i32>) -> bool {
     // Bounds: voxel must be inside the loaded window.
     let rel = world_v - camera.world_origin;
@@ -283,6 +320,11 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 
+    // Volumetric clouds — slab raymarch with cone-shadowed sun samples.
+    let t_terrain = select(1e6, hit.t_hit, hit.hit);
+    let clouds = render_clouds(camera.origin, dir, t_terrain, vec2<f32>(f32(gid.x), f32(gid.y)));
+    col = col * (1.0 - clouds.a) + clouds.rgb;
+
     // Volumetric god rays — accumulate sun visibility along the primary ray.
     let t_far = select(200.0, hit.t_hit, hit.hit);
     col += god_rays(camera.origin, dir, t_far, vec2<f32>(f32(gid.x), f32(gid.y)));
@@ -348,21 +390,29 @@ fn vnoise3(p: vec3<f32>) -> f32 {
     return mix(mix(a, b, u.y), mix(c, d, u.y), u.z);
 }
 
-// Real cumulus-style cloud density: a sparse coverage mask (so most of the
-// sky has zero clouds) gates a multi-octave body. Result: discrete fluffy
-// clumps, not a uniform haze.
+// Cumulus-style cloud density. Low-frequency coverage mask gates a fbm body
+// so the sky has discrete clumps with empty regions between (not haze). The
+// height-falloff bell concentrates density mid-slab — flat bottoms and
+// rounded tops, like real cumulus.
 fn cloud_density(p: vec3<f32>, t: f32) -> f32 {
-    let pa = p * 0.0060 + vec3<f32>(t * 0.07, 0.0, t * 0.04);
-    // Coverage: low-frequency mask. Subtracting a constant gives wide gaps
-    // between cloud regions.
-    let coverage = vnoise3(pa * 0.35) - 0.45;
+    let pa = p * 0.0055 + vec3<f32>(t * 0.06, 0.0, t * 0.035);
+    // Coverage: very low-freq + secondary mid-freq — produces irregular
+    // clump outlines rather than uniformly-sized blobs.
+    let cov_lo = vnoise3(pa * 0.30);
+    let cov_mid = vnoise3(pa * 0.85);
+    let coverage = cov_lo * 0.7 + cov_mid * 0.3 - 0.50;
     if (coverage < 0.0) { return 0.0; }
-    // Inside cloud regions, multi-octave detail builds fluffy texture.
+    // Body: 4 octaves of fbm.
     let n1 = vnoise3(pa);
     let n2 = vnoise3(pa * 2.7);
-    let n3 = vnoise3(pa * 7.3);
-    let body = n1 * 0.55 + n2 * 0.30 + n3 * 0.15;
-    let d = (body - 0.40) * (coverage * 4.0);
+    let n3 = vnoise3(pa * 6.3);
+    let n4 = vnoise3(pa * 13.1);
+    let body = n1 * 0.50 + n2 * 0.28 + n3 * 0.15 + n4 * 0.07;
+    // Vertical bell: 0 at slab edges, 1 in the middle. Makes flat undersides
+    // and rounded tops without needing extra slabs.
+    let h = clamp((p.y - CLOUD_BASE) / max(1.0, CLOUD_TOP - CLOUD_BASE), 0.0, 1.0);
+    let bell = pow(4.0 * h * (1.0 - h), 0.6);
+    let d = (body - 0.38) * coverage * 4.5 * bell;
     return clamp(d, 0.0, 1.0);
 }
 
@@ -423,20 +473,62 @@ fn ambient_color() -> vec3<f32> {
     return mix(night, day, day_t);
 }
 
+// Real Gerstner-style wave normals. Four waves with varied directions,
+// wavelengths, amplitudes and steepness so the surface looks like genuine
+// ocean — not a tiled sinusoid. We return the perturbed normal computed
+// from the closed-form partial derivatives of the wave height field.
+//
+//   h_i(P,t) = A_i · cos(D_i · P · k_i - ω_i · t + φ_i)
+//   ∂h_i/∂x = -A_i · k_i · D_i.x · sin(...)
+//   ∂h_i/∂z = -A_i · k_i · D_i.z · sin(...)
+//
+// Then normal = normalize(vec3(-Σ∂h/∂x, 1, -Σ∂h/∂z)).
 fn water_normal(p: vec3<f32>, t: f32) -> vec3<f32> {
-    // Three octaves of moving waves. Amplitudes and frequencies tuned so
-    // the perturbed normal tilts ~5-15° from vertical — visibly rippling
-    // but not so steep the reflection looks shattered.
-    let a1 = 0.18; let f1 = 0.45; let s1 = 1.4;
-    let a2 = 0.12; let f2 = 0.35; let s2 = 1.1;
-    let a3 = 0.06; let f3 = 0.90; let s3 = 2.3;
-    let dx = a1 * f1 *  cos(p.x * f1 + t * s1)
-           + a2 * f2 *  cos((p.x + p.z) * f2 + t * s2)
-           + a3 * f3 *  cos(p.x * f3 - p.z * 0.3 + t * s3);
-    let dz = a1 * f1 * -sin(p.z * f1 + t * s1 * 0.9)
-           + a2 * f2 *  cos((p.x + p.z) * f2 + t * s2)
-           + a3 * f3 * -sin(p.z * f3 + p.x * 0.3 + t * s3);
+    // (dir.x, dir.z, k=2π/λ, A, ω-multiplier, phase)
+    let w1: array<f32, 6> = array<f32, 6>(  1.00,  0.20, 0.60, 0.16, 1.10, 0.0);
+    let w2: array<f32, 6> = array<f32, 6>( -0.55,  0.85, 0.95, 0.10, 1.40, 1.7);
+    let w3: array<f32, 6> = array<f32, 6>(  0.30, -0.95, 1.50, 0.05, 1.90, 3.1);
+    let w4: array<f32, 6> = array<f32, 6>( -0.90, -0.30, 2.40, 0.03, 2.60, 5.2);
+
+    var dx = 0.0;
+    var dz = 0.0;
+    for (var i: i32 = 0; i < 4; i = i + 1) {
+        var w: array<f32, 6>;
+        if      (i == 0) { w = w1; }
+        else if (i == 1) { w = w2; }
+        else if (i == 2) { w = w3; }
+        else             { w = w4; }
+        let dirx = w[0];
+        let dirz = w[1];
+        let k = w[2];
+        let A = w[3];
+        let om = w[4];
+        let ph = w[5];
+        let phase = (p.x * dirx + p.z * dirz) * k - t * om + ph;
+        let s = sin(phase);
+        dx = dx - A * k * dirx * s;
+        dz = dz - A * k * dirz * s;
+    }
     return normalize(vec3<f32>(-dx, 1.0, -dz));
+}
+
+// Vertical height field — used for foam thresholding and caustics.
+fn water_height(p: vec3<f32>, t: f32) -> f32 {
+    let w1: array<f32, 6> = array<f32, 6>(  1.00,  0.20, 0.60, 0.16, 1.10, 0.0);
+    let w2: array<f32, 6> = array<f32, 6>( -0.55,  0.85, 0.95, 0.10, 1.40, 1.7);
+    let w3: array<f32, 6> = array<f32, 6>(  0.30, -0.95, 1.50, 0.05, 1.90, 3.1);
+    let w4: array<f32, 6> = array<f32, 6>( -0.90, -0.30, 2.40, 0.03, 2.60, 5.2);
+    var h = 0.0;
+    for (var i: i32 = 0; i < 4; i = i + 1) {
+        var w: array<f32, 6>;
+        if      (i == 0) { w = w1; }
+        else if (i == 1) { w = w2; }
+        else if (i == 2) { w = w3; }
+        else             { w = w4; }
+        let phase = (p.x * w[0] + p.z * w[1]) * w[2] - t * w[4] + w[5];
+        h = h + w[3] * cos(phase);
+    }
+    return h;
 }
 
 // Variant of `trace` that treats every water voxel as empty. Used to find
@@ -582,15 +674,31 @@ fn shade_water_top(hit: Hit, origin: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
     let f0 = 0.02;
     let fresnel = f0 + (1.0 - f0) * pow(1.0 - cos_theta, 5.0);
 
-    // ---- specular sun glint on the surface ----
+    // ---- specular sun glint (sharper for stronger highlight) ----
     let h = normalize(s - dir);
-    let spec = pow(max(0.0, dot(n, h)), 128.0);
+    let spec = pow(max(0.0, dot(n, h)), 256.0);
     var shadow = 0.0;
     if (sun_intensity(s) > 0.0 && dot(n, s) > 0.0) {
         shadow = select(1.0, 0.0, trace_any(refl_origin, s));
     }
 
-    var col = mix(refr_col, refl_col, fresnel) + sc * spec * shadow * 1.2;
+    // ---- shoreline foam: triggered by shallow water (under.t_hit small) ----
+    // The closer the underwater hit, the brighter the white foam contribution.
+    // Wave-crest noise modulates so foam looks like spray, not a flat ring.
+    var foam = 0.0;
+    if (under.hit && under.t_hit < 2.5) {
+        let shore = 1.0 - clamp(under.t_hit / 2.5, 0.0, 1.0);
+        let crest = clamp(water_height(p_hit, camera.time) * 4.0 + 0.5, 0.0, 1.0);
+        foam = shore * crest * 0.85;
+    }
+
+    // ---- caustics: brighten the underwater colour where the surface wave
+    // gradient focuses light. Approximation: |∇h| → dispersion factor, where
+    // small gradient = focused beams. Only applies to the refracted column.
+    let caustic = 0.6 + 0.8 * pow(max(0.0, n.y), 18.0);
+
+    var col = mix(refr_col * caustic, refl_col, fresnel) + sc * spec * shadow * 1.4;
+    col = mix(col, vec3<f32>(1.0, 1.05, 1.10), foam);
     let fog_t = clamp(hit.t_hit / 280.0, 0.0, 0.85);
     return mix(col, fog_atmospheric(dir), fog_t);
 }
@@ -659,8 +767,9 @@ fn shade(hit: Hit, origin: vec3<f32>, dir: vec3<f32>, pix_jit: f32) -> vec3<f32>
     return mix(lit, fog_atmospheric(dir), fog_t);
 }
 
-// Glass — high-fresnel reflection + low-tint refraction. Reuses the same
-// trace_no_water that skips water (now also skips glass) to look through.
+// Glass — Fresnel reflection + per-channel refraction (chromatic dispersion),
+// Total Internal Reflection handling, and a specular sun glint. The cyan
+// tint compounds with travel distance for chunky glass blocks.
 fn shade_glass(hit: Hit, origin: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
     let p_hit = origin + dir * hit.t_hit;
     let n = hit.normal;
@@ -678,61 +787,174 @@ fn shade_glass(hit: Hit, origin: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
         refl_col = sky(refl_dir);
     }
 
-    let eta = 1.0 / 1.50;
-    var refr_dir = refract(dir, n, eta);
-    if (length(refr_dir) < 0.01) { refr_dir = dir; }
-    let refr_origin = p_hit + dir * 0.001;
-    let under = trace_no_water(refr_origin, refr_dir);
-    var under_col: vec3<f32>;
-    if (under.hit) {
-        under_col = shade(under, refr_origin, refr_dir, jit);
-    } else {
-        under_col = sky(refr_dir);
+    // Chromatic dispersion: shift the refractive index slightly per channel.
+    // R refracts less than B, so a flat glass face shows a faint rainbow at
+    // grazing angles. Three trace calls is more expensive — only do it when
+    // we'd actually see the dispersion (cos_theta < 0.9, i.e. near edges).
+    let cos_theta_pre = clamp(dot(-dir, n), 0.0, 1.0);
+    let eta_r = 1.0 / 1.48;
+    let eta_g = 1.0 / 1.50;
+    let eta_b = 1.0 / 1.52;
+
+    var refr_dir_r = refract(dir, n, eta_r);
+    var refr_dir_g = refract(dir, n, eta_g);
+    var refr_dir_b = refract(dir, n, eta_b);
+
+    // Total internal reflection on any channel → fall back to the reflection.
+    let tir = length(refr_dir_g) < 0.01;
+    if (tir) {
+        let fog_t = clamp(hit.t_hit / 280.0, 0.0, 0.85);
+        return mix(refl_col, fog_atmospheric(dir), fog_t);
     }
-    // Very faint cyan tint per unit travelled — glass is mostly clear.
-    let depth = max(0.0, under.t_hit);
-    let tint = vec3<f32>(0.04, 0.02, 0.02) * depth;
-    let glass_col = under_col * exp(-tint);
+    if (length(refr_dir_r) < 0.01) { refr_dir_r = refr_dir_g; }
+    if (length(refr_dir_b) < 0.01) { refr_dir_b = refr_dir_g; }
+
+    let refr_origin = p_hit + dir * 0.001;
+    var glass_col: vec3<f32>;
+    if (cos_theta_pre > 0.92) {
+        // Near head-on: dispersion invisible — single trace, save 2/3 cost.
+        let under = trace_no_water(refr_origin, refr_dir_g);
+        var under_col: vec3<f32>;
+        if (under.hit) { under_col = shade(under, refr_origin, refr_dir_g, jit); }
+        else { under_col = sky(refr_dir_g); }
+        let depth = max(0.0, under.t_hit);
+        let tint = vec3<f32>(0.05, 0.02, 0.02) * depth;
+        glass_col = under_col * exp(-tint);
+    } else {
+        let ur = trace_no_water(refr_origin, refr_dir_r);
+        let ug = trace_no_water(refr_origin, refr_dir_g);
+        let ub = trace_no_water(refr_origin, refr_dir_b);
+        var cr = select(sky(refr_dir_r).r, shade(ur, refr_origin, refr_dir_r, jit).r, ur.hit);
+        var cg = select(sky(refr_dir_g).g, shade(ug, refr_origin, refr_dir_g, jit).g, ug.hit);
+        var cb = select(sky(refr_dir_b).b, shade(ub, refr_origin, refr_dir_b, jit).b, ub.hit);
+        let depth_g = max(0.0, ug.t_hit);
+        let tint = vec3<f32>(0.05, 0.02, 0.02) * depth_g;
+        glass_col = vec3<f32>(cr, cg, cb) * exp(-tint);
+    }
+
+    // Specular sun glint on the glass face — bright pinpoint highlight when
+    // the surface aligns the sun reflection toward the camera.
+    let h_vec = normalize(s - dir);
+    let spec = pow(max(0.0, dot(n, h_vec)), 200.0);
+    var shadow = 0.0;
+    if (sun_intensity(s) > 0.0 && dot(n, s) > 0.0) {
+        shadow = select(1.0, 0.0, trace_any(refl_origin, s));
+    }
 
     let cos_theta = clamp(dot(-dir, n), 0.0, 1.0);
     let f0 = 0.04;
     let fresnel = f0 + (1.0 - f0) * pow(1.0 - cos_theta, 5.0);
 
     let fog_t = clamp(hit.t_hit / 280.0, 0.0, 0.85);
-    let combined = mix(glass_col, refl_col, fresnel);
+    let combined = mix(glass_col, refl_col, fresnel) + sc * spec * shadow * 1.2;
     return mix(combined, fog_atmospheric(dir), fog_t);
 }
 
-// Volumetric god rays: accumulate sun visibility along the primary ray.
-// Stochastic sampling — combined with the temporal-differential gate that
-// reuses prior-frame pixels, this denoises well in steady-state views.
+// Volumetric clouds: raymarch a horizontal slab between [CLOUD_BASE, CLOUD_TOP].
+// Per sample: density gate (Worley-ish via vnoise3 in cloud_density), 3 cone
+// samples up the sun ray for self-shadowing, front-to-back composite. Bails
+// when transmittance saturates so all-sky pixels still cost ~constant.
+const CLOUD_BASE: f32 = 200.0;
+const CLOUD_TOP:  f32 = 250.0;
+
+fn render_clouds(origin: vec3<f32>, dir: vec3<f32>, t_terrain: f32, pix: vec2<f32>) -> vec4<f32> {
+    // Slab intersection. A horizontal ray (|dir.y| ~ 0) gets nothing because
+    // the slab is thin compared to the marchable distance.
+    if (abs(dir.y) < 1e-3) { return vec4<f32>(0.0); }
+    let inv_dy = 1.0 / dir.y;
+    var t_in  = (CLOUD_BASE - origin.y) * inv_dy;
+    var t_out = (CLOUD_TOP  - origin.y) * inv_dy;
+    if (t_in > t_out) { let tmp = t_in; t_in = t_out; t_out = tmp; }
+    let t_start = max(t_in, 0.0);
+    let t_end   = min(t_out, t_terrain);
+    if (t_end <= t_start + 0.5) { return vec4<f32>(0.0); }
+    // Distance-clamp the slab — beyond this clouds blend into atmospheric fog.
+    let t_far_clamp = min(t_end, t_start + 600.0);
+
+    let s = sun_dir();
+    let sc = sun_color(s);
+
+    let N: i32 = 12;
+    let step_t = (t_far_clamp - t_start) / f32(N);
+    // IGN jitter — far better noise distribution than sin-hash for what
+    // temporal differential averages over.
+    let h = ign(pix.x, pix.y, camera.time * 60.0);
+
+    // Henyey-Greenstein forward-scatter — gives the "silver lining" effect
+    // when looking toward the sun through cloud edges.
+    let cos_sun = dot(dir, s);
+    let phase = phase_hg(cos_sun, 0.65) * 4.0 + 0.5;
+
+    var transmittance: f32 = 1.0;
+    var scattered: vec3<f32> = vec3<f32>(0.0);
+    let ambient = vec3<f32>(0.55, 0.62, 0.74) + sc * 0.10;
+
+    for (var i: i32 = 0; i < N; i = i + 1) {
+        let t = t_start + (f32(i) + h) * step_t;
+        let p = origin + dir * t;
+        let d = cloud_density(p, camera.time);
+        if (d < 0.01) { continue; }
+
+        // 3 cone samples toward the sun for self-shadowing.
+        var sun_dens: f32 = 0.0;
+        for (var j: i32 = 1; j <= 3; j = j + 1) {
+            let pj = p + s * f32(j) * 7.0;
+            sun_dens = sun_dens + cloud_density(pj, camera.time);
+        }
+        let sun_t = exp(-sun_dens * 0.45);
+        let local_col = ambient + sc * sun_t * phase;
+
+        let sample_t = exp(-d * step_t * 0.14);
+        let alpha = (1.0 - sample_t) * transmittance;
+        scattered = scattered + local_col * alpha;
+        transmittance = transmittance * sample_t;
+        if (transmittance < 0.02) { break; }
+    }
+
+    let alpha = 1.0 - transmittance;
+    return vec4<f32>(scattered, alpha);
+}
+
+// Henyey-Greenstein phase function — anisotropic single-scatter widely used
+// for clouds/atmosphere. g ∈ [-1, 1]: positive = forward-scatter (Mie-like),
+// matches real sunbeam behaviour. Returns the *relative* phase; we apply our
+// own brightness scaling.
+fn phase_hg(cos_th: f32, g: f32) -> f32 {
+    let denom = 1.0 + g * g - 2.0 * g * cos_th;
+    return (1.0 - g * g) / (4.0 * 3.14159265 * pow(max(denom, 1e-3), 1.5));
+}
+
+// Volumetric god rays. Henyey-Greenstein phase (g≈0.7) gives the natural
+// "halo gets brighter as you look closer to the sun" falloff. IGN jitter is
+// reused so adjacent pixels get well-distributed offsets — important for
+// noise that the temporal-differential pass can average away.
 fn god_rays(origin: vec3<f32>, dir: vec3<f32>, t_far: f32, pix: vec2<f32>) -> vec3<f32> {
     let s = sun_dir();
     let s_int = sun_intensity(s);
     if (s_int <= 0.0) { return vec3<f32>(0.0); }
-    // EARLY-OUT: god rays are a Mie-style forward-scatter effect, so the
-    // contribution drops sharply as the camera looks away from the sun.
-    // Compute the phase weight first and skip the entire shadow-ray loop
-    // when it's negligible — this saves the cost on ~75% of the screen.
-    let cos_sun = max(0.0, dot(dir, s));
-    let phase = 0.4 + 0.6 * pow(cos_sun, 6.0);
-    if (phase < 0.45) { return vec3<f32>(0.0); }
+    let cos_sun = dot(dir, s);
+    // Normalize HG phase to a 0..~1 scale at g=0.7 — peak ≈ 0.65 forward, ≈ 0.014 back.
+    let phase = phase_hg(cos_sun, 0.7) * 4.0;
+    if (phase < 0.05) { return vec3<f32>(0.0); }
 
-    let t_max = min(t_far, 100.0);
+    let t_max = min(t_far, 140.0);
     if (t_max <= 1.0) { return vec3<f32>(0.0); }
-    let N: i32 = 4;
+    // Sample count scales with phase — looking right at the sun gets denser
+    // sampling for a smooth halo; off-axis stays cheap.
+    let N: i32 = select(4, 8, phase > 0.40);
     let step_t = t_max / f32(N);
-    let h = fract(sin(pix.x * 12.9898 + pix.y * 78.233 + camera.time * 0.13) * 43758.5453);
+    let h = ign(pix.x, pix.y, camera.time * 60.0);
     var sum = 0.0;
     for (var i: i32 = 0; i < N; i = i + 1) {
         let t = (f32(i) + h) * step_t;
         let p = origin + dir * t;
         if (!trace_any(p + s * 0.5, s)) {
-            sum = sum + 1.0;
+            // Distance-weighted contribution: nearer scatter looks brighter.
+            sum = sum + exp(-t * 0.008);
         }
     }
     let frac = sum / f32(N);
-    return sun_color(s) * frac * phase * 0.18;
+    return sun_color(s) * frac * phase * 0.22 * s_int;
 }
 
 // Stripped-down DDA — same hierarchy as `trace()` but returns the moment we
@@ -864,6 +1086,18 @@ fn ao_corner(face_base: vec3<i32>, da: vec3<i32>, db: vec3<i32>) -> f32 {
     return 1.0 - f32(cnt) * 0.22;
 }
 
+fn axis_select(v: vec3<f32>, ax: i32) -> f32 {
+    if (ax == 0) { return v.x; }
+    if (ax == 1) { return v.y; }
+    return v.z;
+}
+
+// LOD: past this many voxels of distance, terminate the DDA at brick
+// granularity instead of per-voxel. A brick is 4 voxels — at 220+ voxels a
+// 4-voxel jump is sub-pixel anyway, so the visual loss is invisible while
+// the per-voxel inner loop disappears for far rays.
+const LOD_BRICK_T: f32 = 220.0;
+
 fn trace(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
     var out: Hit;
     out.hit = false;
@@ -903,6 +1137,7 @@ fn trace(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
     if (step.z > 0) { t_max.z = (f32(voxel.z + 1) - origin.z) * inv_dir.z; } else { t_max.z = (f32(voxel.z) - origin.z) * inv_dir.z; }
 
     var last_axis: i32 = -1;
+    var t_cur: f32 = t_enter;
     let max_steps: i32 = 1024;
     for (var s: i32 = 0; s < max_steps; s = s + 1) {
         // Bounds check on the LOADED WINDOW (world coords).
@@ -922,6 +1157,7 @@ fn trace(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
         let tile_in_chunk_lin = (tp.x & 3) + (tp.z & 3) * 4 + (tp.y & 3) * 16;
         if (!chunk_has_child(ci, tile_in_chunk_lin)) {
             skip_to_cell(16, &voxel, &t_max, origin, dir, inv_dir, step, &last_axis);
+            t_cur = axis_select(t_max, last_axis) - axis_select(t_delta, last_axis);
             continue;
         }
 
@@ -929,10 +1165,45 @@ fn trace(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
         let brick_in_tile_lin = (bp.x & 3) + (bp.z & 3) * 4 + (bp.y & 3) * 16;
         if (!tile_has_child(ti, brick_in_tile_lin)) {
             skip_to_cell(4, &voxel, &t_max, origin, dir, inv_dir, step, &last_axis);
+            t_cur = axis_select(t_max, last_axis) - axis_select(t_delta, last_axis);
             continue;
         }
 
         let bi = world_brick_idx(bp.x, bp.y, bp.z);
+
+        // ---- LOD: brick-level early termination at far distance ----
+        // If we're far enough away that voxels are sub-pixel anyway, take
+        // the brick's representative material and return — saves the inner
+        // per-voxel DDA loop (up to ~7 steps per brick).
+        if (t_cur > LOD_BRICK_T) {
+            let b = bricks[bi];
+            if ((b.occ_lo | b.occ_hi) != 0u) {
+                let m = brick_topmost_material(bi);
+                var n = vec3<f32>(0.0);
+                var t_hit: f32;
+                if (last_axis == 0)      { n.x = -f32(step.x); t_hit = t_max.x - t_delta.x; }
+                else if (last_axis == 1) { n.y = -f32(step.y); t_hit = t_max.y - t_delta.y; }
+                else if (last_axis == 2) { n.z = -f32(step.z); t_hit = t_max.z - t_delta.z; }
+                else {
+                    t_hit = t_enter;
+                    if      (tmin3.x >= tmin3.y && tmin3.x >= tmin3.z) { n.x = -f32(step.x); }
+                    else if (tmin3.y >= tmin3.z)                      { n.y = -f32(step.y); }
+                    else                                              { n.z = -f32(step.z); }
+                }
+                out.hit = true;
+                out.mat = m;
+                out.normal = n;
+                out.voxel = voxel;
+                out.last_axis = last_axis_after_entry(last_axis, tmin3);
+                out.t_hit = t_hit;
+                return out;
+            }
+            // Brick empty — skip the whole 4-voxel cell.
+            skip_to_cell(4, &voxel, &t_max, origin, dir, inv_dir, step, &last_axis);
+            t_cur = axis_select(t_max, last_axis) - axis_select(t_delta, last_axis);
+            continue;
+        }
+
         let local = slot_v - bp * BRICK_DIM;
         let vi = brick_voxel_idx(local.x, local.y, local.z);
         if (brick_voxel_solid(bi, vi)) {
@@ -965,14 +1236,17 @@ fn trace(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
         }
 
         if (t_max.x < t_max.y && t_max.x < t_max.z) {
+            t_cur = t_max.x;
             voxel.x = voxel.x + step.x;
             t_max.x = t_max.x + t_delta.x;
             last_axis = 0;
         } else if (t_max.y < t_max.z) {
+            t_cur = t_max.y;
             voxel.y = voxel.y + step.y;
             t_max.y = t_max.y + t_delta.y;
             last_axis = 1;
         } else {
+            t_cur = t_max.z;
             voxel.z = voxel.z + step.z;
             t_max.z = t_max.z + t_delta.z;
             last_axis = 2;

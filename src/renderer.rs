@@ -61,12 +61,23 @@ fn default_palette() -> [PaletteEntry; PALETTE_SIZE] {
     p
 }
 
+/// Render at 1/N the swapchain resolution per axis. 2 = half-res = 1/4 pixel
+/// count — the raymarch's biggest single perf win. The blit upscales with
+/// bilinear filtering so the result still reads as crisp.
+pub const RENDER_SCALE: u32 = 2;
+
 pub struct Renderer {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub surface: wgpu::Surface<'static>,
     pub config: wgpu::SurfaceConfiguration,
+    /// Compute / raymarch render-target size. = `surface_size / RENDER_SCALE`.
+    /// Dispatch counts, temporal-differential tile counts and the camera
+    /// uniform's `resolution` all use this.
     pub size: (u32, u32),
+    /// Swapchain / window size — used for surface configuration and the blit
+    /// pass. Stays at the native resolution the OS gives us.
+    pub surface_size: (u32, u32),
 
     camera_buf: wgpu::Buffer,
     bricks_buf: wgpu::Buffer,
@@ -98,7 +109,11 @@ pub struct Renderer {
 impl Renderer {
     pub fn new(window: Arc<Window>, world: &World) -> Self {
         let inner = window.inner_size();
-        let (width, height) = (inner.width.max(1), inner.height.max(1));
+        let (surface_w, surface_h) = (inner.width.max(1), inner.height.max(1));
+        let (width, height) = (
+            (surface_w / RENDER_SCALE).max(1),
+            (surface_h / RENDER_SCALE).max(1),
+        );
 
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::PRIMARY,
@@ -140,8 +155,8 @@ impl Renderer {
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
-            width,
-            height,
+            width: surface_w,
+            height: surface_h,
             present_mode: caps
                 .present_modes
                 .iter()
@@ -211,13 +226,14 @@ impl Renderer {
         let (output_tex, output_view) = create_output_texture(&device, width, height);
         let (beam_tex, beam_view) = create_beam_texture(&device, width, height);
 
+        // Bilinear filtering for the half-res → full-res blit upscale.
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("blit sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
             mipmap_filter: wgpu::FilterMode::Nearest,
             ..Default::default()
         });
@@ -408,7 +424,7 @@ impl Renderer {
                     binding: 0,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
                         view_dimension: wgpu::TextureViewDimension::D2,
                         multisampled: false,
                     },
@@ -417,7 +433,7 @@ impl Renderer {
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
                     visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
             ],
@@ -462,6 +478,7 @@ impl Renderer {
         Self {
             device, queue, surface, config,
             size: (width, height),
+            surface_size: (surface_w, surface_h),
             camera_buf, bricks_buf, tile_mask_buf, chunk_mask_buf, palette_buf,
             tile_dirty_buf, players_buf,
             output_tex, output_view, beam_tex, beam_view, sampler,
@@ -472,16 +489,19 @@ impl Renderer {
     }
 
     pub fn resize(&mut self, w: u32, h: u32) {
-        if w == 0 || h == 0 || (w, h) == self.size { return; }
-        self.size = (w, h);
+        if w == 0 || h == 0 || (w, h) == self.surface_size { return; }
+        self.surface_size = (w, h);
+        let rw = (w / RENDER_SCALE).max(1);
+        let rh = (h / RENDER_SCALE).max(1);
+        self.size = (rw, rh);
         self.config.width = w;
         self.config.height = h;
         self.surface.configure(&self.device, &self.config);
 
-        let (tex, view) = create_output_texture(&self.device, w, h);
+        let (tex, view) = create_output_texture(&self.device, rw, rh);
         self.output_tex = tex;
         self.output_view = view;
-        let (btex, bview) = create_beam_texture(&self.device, w, h);
+        let (btex, bview) = create_beam_texture(&self.device, rw, rh);
         self.beam_tex = btex;
         self.beam_view = bview;
 
