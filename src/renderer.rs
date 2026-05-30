@@ -4,6 +4,20 @@ use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
+/// Pack a Vec<u8> into Vec<u32> for storage-buffer upload (WGSL storage
+/// buffers can't directly index u8 arrays; reading byte b of word w via
+/// `(packed[w] >> ((b & 3) * 8)) & 0xFF` is the canonical pattern).
+fn pack_u8_to_u32(src: &[u8]) -> Vec<u32> {
+    let n_words = (src.len() + 3) / 4;
+    let mut out = vec![0u32; n_words];
+    for (i, &b) in src.iter().enumerate() {
+        let w = i >> 2;
+        let bit = (i & 3) * 8;
+        out[w] |= (b as u32) << bit;
+    }
+    out
+}
+
 use crate::camera::{Camera, CameraUniform};
 use crate::voxel::{
     World, MAT_AIR, MAT_SAND, MAT_GRASS, MAT_DIRT, MAT_STONE,
@@ -86,6 +100,8 @@ pub struct Renderer {
     bricks_buf: wgpu::Buffer,
     tile_mask_buf: wgpu::Buffer,
     chunk_mask_buf: wgpu::Buffer,
+    brick_uniform_buf: wgpu::Buffer,
+    tile_uniform_buf: wgpu::Buffer,
     palette_buf: wgpu::Buffer,
     tile_dirty_buf: wgpu::Buffer,
     players_buf: wgpu::Buffer,
@@ -195,6 +211,22 @@ impl Renderer {
         let chunk_mask_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("chunk_mask"),
             contents: bytemuck::cast_slice(&world.chunk_mask),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+
+        // Packed uniform-material lookups (1 byte per brick / tile, packed
+        // 4 per u32 word). Lets the DDA skip uniform regions in 1 lookup
+        // instead of walking them.
+        let brick_uniform_packed = pack_u8_to_u32(&world.brick_uniform);
+        let tile_uniform_packed = pack_u8_to_u32(&world.tile_uniform);
+        let brick_uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("brick_uniform"),
+            contents: bytemuck::cast_slice(&brick_uniform_packed),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+        let tile_uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("tile_uniform"),
+            contents: bytemuck::cast_slice(&tile_uniform_packed),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
@@ -337,6 +369,28 @@ impl Renderer {
                     },
                     count: None,
                 },
+                // Packed per-brick uniform-material bytes (4 per u32).
+                wgpu::BindGroupLayoutEntry {
+                    binding: 9,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // Packed per-tile uniform-material bytes.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 10,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -361,7 +415,7 @@ impl Renderer {
         let compute_bg = make_compute_bg(
             &device, &compute_bgl, &camera_buf, &bricks_buf,
             &tile_mask_buf, &chunk_mask_buf, &palette_buf, &output_view, &beam_view,
-            &tile_dirty_buf, &players_buf,
+            &tile_dirty_buf, &players_buf, &brick_uniform_buf, &tile_uniform_buf,
         );
 
         // -- beam pipeline (1/8-res coarse pre-pass) --
@@ -483,6 +537,7 @@ impl Renderer {
             size: (width, height),
             surface_size: (surface_w, surface_h),
             camera_buf, bricks_buf, tile_mask_buf, chunk_mask_buf, palette_buf,
+            brick_uniform_buf, tile_uniform_buf,
             tile_dirty_buf, players_buf,
             output_tex, output_view, beam_tex, beam_view, sampler,
             beam_bgl, beam_pipeline, beam_bg,
@@ -511,7 +566,7 @@ impl Renderer {
         self.compute_bg = make_compute_bg(
             &self.device, &self.compute_bgl, &self.camera_buf, &self.bricks_buf,
             &self.tile_mask_buf, &self.chunk_mask_buf, &self.palette_buf, &self.output_view, &self.beam_view,
-            &self.tile_dirty_buf, &self.players_buf,
+            &self.tile_dirty_buf, &self.players_buf, &self.brick_uniform_buf, &self.tile_uniform_buf,
         );
         self.beam_bg = make_beam_bg(
             &self.device, &self.beam_bgl, &self.camera_buf, &self.chunk_mask_buf, &self.beam_view,
@@ -528,6 +583,11 @@ impl Renderer {
             self.queue.write_buffer(&self.bricks_buf, 0, bytemuck::cast_slice(&world.bricks));
             self.queue.write_buffer(&self.tile_mask_buf, 0, bytemuck::cast_slice(&world.tile_mask));
             self.queue.write_buffer(&self.chunk_mask_buf, 0, bytemuck::cast_slice(&world.chunk_mask));
+            // Re-pack and re-upload uniform tables (whole-world refresh path).
+            let bu = pack_u8_to_u32(&world.brick_uniform);
+            let tu = pack_u8_to_u32(&world.tile_uniform);
+            self.queue.write_buffer(&self.brick_uniform_buf, 0, bytemuck::cast_slice(&bu));
+            self.queue.write_buffer(&self.tile_uniform_buf, 0, bytemuck::cast_slice(&tu));
             world.all_dirty = false;
             world.dirty_bricks.clear();
             return;
@@ -692,6 +752,8 @@ fn make_compute_bg(
     beam_view: &wgpu::TextureView,
     tile_dirty_buf: &wgpu::Buffer,
     players_buf: &wgpu::Buffer,
+    brick_uniform_buf: &wgpu::Buffer,
+    tile_uniform_buf: &wgpu::Buffer,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("compute bg"),
@@ -706,6 +768,8 @@ fn make_compute_bg(
             wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(beam_view) },
             wgpu::BindGroupEntry { binding: 7, resource: tile_dirty_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 8, resource: players_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 9, resource: brick_uniform_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 10, resource: tile_uniform_buf.as_entire_binding() },
         ],
     })
 }

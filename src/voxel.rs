@@ -195,6 +195,13 @@ pub struct World {
     pub tile_mask: Vec<u64>,
     pub chunk_mask: Vec<u64>,
     pub movable_mask: Vec<u64>,
+    /// Per-brick "this whole brick is one material" hint. 0 = not uniform;
+    /// any non-zero value = uniform with that material id. Lets the DDA
+    /// skip the whole brick in one step instead of walking 4 voxels.
+    pub brick_uniform: Vec<u8>,
+    /// Per-tile uniform hint (same idea at the 16-voxel scale). When set
+    /// the DDA can skip 16 voxels in one step.
+    pub tile_uniform: Vec<u8>,
     pub active_bricks: Vec<u32>,
     pub dirty_bricks: Vec<u32>,
     pub all_dirty: bool,
@@ -226,6 +233,8 @@ impl World {
             tile_mask: vec![0u64; WORLD_TILES_TOTAL as usize],
             chunk_mask: vec![0u64; WORLD_CHUNKS_TOTAL as usize],
             movable_mask: vec![0u64; WORLD_BRICKS_TOTAL as usize],
+            brick_uniform: vec![0u8; WORLD_BRICKS_TOTAL as usize],
+            tile_uniform: vec![0u8; WORLD_TILES_TOTAL as usize],
             active_bricks: Vec::with_capacity(4096),
             dirty_bricks: Vec::with_capacity(4096),
             all_dirty: true,
@@ -465,7 +474,25 @@ impl World {
                         }
                     }
                     self.refresh_masks_for_brick(bx, by, bz);
+                    self.recompute_uniform_for_brick(bi);
                     self.mark_brick_dirty(bi);
+                }
+            }
+        }
+        // Recompute affected tile_uniform flags. A storage chunk is 8x8x8
+        // bricks = 2x2x2 tiles, so 8 tiles touched per slot.
+        let base_tx = (base_bx) / 4;
+        let base_ty = (base_by) / 4;
+        let base_tz = (base_bz) / 4;
+        for dtz in 0..2u32 {
+            for dty in 0..2u32 {
+                for dtx in 0..2u32 {
+                    let tx = base_tx + dtx;
+                    let ty = base_ty + dty;
+                    let tz = base_tz + dtz;
+                    if tx < WORLD_TILES_X && ty < WORLD_TILES_Y && tz < WORLD_TILES_Z {
+                        self.recompute_uniform_for_tile(tile_idx(tx, ty, tz));
+                    }
                 }
             }
         }
@@ -659,7 +686,100 @@ impl World {
             self.refresh_masks_for_brick(bx, by, bz);
         }
         self.recompute_movable_for_brick(bi);
+        self.recompute_uniform_for_brick(bi);
+        // The tile this brick lives in may have lost its uniform status.
+        let ti = tile_idx(bx / 4, by / 4, bz / 4);
+        self.recompute_uniform_for_tile(ti);
         self.mark_brick_dirty(bi);
+    }
+
+    /// Recompute brick_uniform[bi] from the brick's current contents.
+    pub fn recompute_uniform_for_brick(&mut self, bi: u32) {
+        let b = &self.bricks[bi as usize];
+        // Uniform if: every voxel is occupied AND every material is identical.
+        if b.occupancy != !0u64 {
+            self.brick_uniform[bi as usize] = 0;
+            return;
+        }
+        let m0 = b.materials[0];
+        if m0 == 0 {
+            self.brick_uniform[bi as usize] = 0;
+            return;
+        }
+        for i in 1..(BRICK_VOXELS as usize) {
+            if b.materials[i] != m0 {
+                self.brick_uniform[bi as usize] = 0;
+                return;
+            }
+        }
+        self.brick_uniform[bi as usize] = m0;
+    }
+
+    /// Recompute tile_uniform[ti] from its 64 child bricks. Tile is uniform
+    /// iff every child brick is uniform with the same material.
+    pub fn recompute_uniform_for_tile(&mut self, ti: u32) {
+        let tx = ti % WORLD_TILES_X;
+        let ty = (ti / WORLD_TILES_X) % WORLD_TILES_Y;
+        let tz = ti / (WORLD_TILES_X * WORLD_TILES_Y);
+        let bx0 = tx * 4;
+        let by0 = ty * 4;
+        let bz0 = tz * 4;
+        let first_bi = brick_idx(bx0, by0, bz0);
+        let m0 = self.brick_uniform[first_bi as usize];
+        if m0 == 0 {
+            self.tile_uniform[ti as usize] = 0;
+            return;
+        }
+        for dz in 0..4 {
+            for dy in 0..4 {
+                for dx in 0..4 {
+                    let bi = brick_idx(bx0 + dx, by0 + dy, bz0 + dz);
+                    if self.brick_uniform[bi as usize] != m0 {
+                        self.tile_uniform[ti as usize] = 0;
+                        return;
+                    }
+                }
+            }
+        }
+        self.tile_uniform[ti as usize] = m0;
+    }
+
+    /// Recompute ALL uniform flags from current brick contents. Use after
+    /// bulk gen / fill_demo_terrain. O(total_voxels) — runs in parallel.
+    pub fn rebuild_all_uniform(&mut self) {
+        use rayon::prelude::*;
+        let bricks = &self.bricks;
+        self.brick_uniform = bricks.par_iter().map(|b| {
+            if b.occupancy != !0u64 { return 0u8; }
+            let m0 = b.materials[0];
+            if m0 == 0 { return 0u8; }
+            for i in 1..(BRICK_VOXELS as usize) {
+                if b.materials[i] != m0 { return 0u8; }
+            }
+            m0
+        }).collect();
+        // Tiles depend on the brick_uniform array we just computed.
+        let bu = &self.brick_uniform;
+        self.tile_uniform = (0..WORLD_TILES_TOTAL as usize).into_par_iter().map(|ti| {
+            let tx = (ti as u32) % WORLD_TILES_X;
+            let ty = ((ti as u32) / WORLD_TILES_X) % WORLD_TILES_Y;
+            let tz = (ti as u32) / (WORLD_TILES_X * WORLD_TILES_Y);
+            let bx0 = tx * 4;
+            let by0 = ty * 4;
+            let bz0 = tz * 4;
+            let first_bi = brick_idx(bx0, by0, bz0);
+            let m0 = bu[first_bi as usize];
+            if m0 == 0 { return 0u8; }
+            for dz in 0..4 {
+                for dy in 0..4 {
+                    for dx in 0..4 {
+                        let bi = brick_idx(bx0 + dx, by0 + dy, bz0 + dz);
+                        if bu[bi as usize] != m0 { return 0u8; }
+                    }
+                }
+            }
+            m0
+        }).collect();
     }
 
     pub fn rebuild_all_masks(&mut self) {
@@ -736,6 +856,7 @@ impl World {
         }
 
         self.rebuild_all_masks();
+        self.rebuild_all_uniform();
         for bi in 0..WORLD_BRICKS_TOTAL {
             let b = &self.bricks[bi as usize];
             let mut m = 0u64;
