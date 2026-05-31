@@ -22,9 +22,9 @@ use glam::UVec3;
 pub const BRICK_DIM: u32 = 4;
 pub const BRICK_VOXELS: u32 = BRICK_DIM * BRICK_DIM * BRICK_DIM;
 
-pub const WORLD_BRICKS_X: u32 = 128;
-pub const WORLD_BRICKS_Y: u32 = 64;
-pub const WORLD_BRICKS_Z: u32 = 128;
+pub const WORLD_BRICKS_X: u32 = 256;
+pub const WORLD_BRICKS_Y: u32 = 128;
+pub const WORLD_BRICKS_Z: u32 = 256;
 pub const WORLD_BRICKS_TOTAL: u32 = WORLD_BRICKS_X * WORLD_BRICKS_Y * WORLD_BRICKS_Z;
 
 pub const WORLD_VOXELS_X: u32 = WORLD_BRICKS_X * BRICK_DIM;
@@ -916,56 +916,42 @@ pub fn sample_terrain(wx: f32, wz: f32, seed: u64) -> TerrainSample {
     let px = wx + s_x;
     let pz = wz + s_z;
 
-    let warp_x = fbm_2d(px * 0.005, pz * 0.005, 2) * 8.0;
-    let warp_z = fbm_2d(px * 0.005 + 50.0, pz * 0.005 + 50.0, 2) * 8.0;
+    // 2× voxel-scale: noise freqs × 0.5, amplitudes × 2 so a feature that was
+    // N voxels wide × M voxels tall is now 2N × 2M (same physical size if
+    // we treat 2 new voxels = 1 old voxel).
+    let warp_x = fbm_2d(px * 0.0025, pz * 0.0025, 2) * 16.0;
+    let warp_z = fbm_2d(px * 0.0025 + 50.0, pz * 0.0025 + 50.0, 2) * 16.0;
     let wpx = px + warp_x;
     let wpz = pz + warp_z;
 
-    // Hills — strong amplitude so terrain is genuinely rolling.
-    let base = fbm_2d(wpx * 0.012, wpz * 0.012, 4) * 22.0;
+    let base = fbm_2d(wpx * 0.006, wpz * 0.006, 4) * 44.0;
 
-    // Mountains — huge (amp 110), more common (mask shifted +0.2 so most of
-    // the map has at least some elevation contribution; peaks reach the
-    // world's roof).
-    let mountain_mask = (fbm_2d(wpx * 0.0028, wpz * 0.0028, 2) + 0.2).max(0.0);
+    let mountain_mask = (fbm_2d(wpx * 0.0014, wpz * 0.0014, 2) + 0.2).max(0.0);
     let mountain_amp = mountain_mask.min(1.0);
-    let mountain_h = fbm_2d(wpx * 0.009, wpz * 0.009, 5).max(0.0).powf(1.15)
-        * mountain_amp * 110.0;
+    let mountain_h = fbm_2d(wpx * 0.0045, wpz * 0.0045, 5).max(0.0).powf(1.15)
+        * mountain_amp * 220.0;
 
-    // Ravines — rare (threshold 0.97, was 0.95).
-    let ravine_n = ridge_noise_2d(wpx * 0.012, wpz * 0.012);
-    let ravine_cut = ((ravine_n - 0.97).max(0.0) * 20.0).min(1.0) * 6.0;
+    let ravine_n = ridge_noise_2d(wpx * 0.006, wpz * 0.006);
+    let ravine_cut = ((ravine_n - 0.97).max(0.0) * 20.0).min(1.0) * 12.0;
 
-    // Sea level raised (38 → 64) AND world ceiling doubled (192 → 256) so
-    // lakes/seas have real depth and mountains still loom above with
-    // headroom. base_h offset stays at 8 so terrain typically sits ~72,
-    // ~8 voxels above sea, with mountains pushing well into the 200s.
-    let sea_level: f32 = 64.0;
-    let base_h = sea_level + 8.0 + base + mountain_h - ravine_cut;
+    let sea_level: f32 = 180.0;
+    let base_h = sea_level + 16.0 + base + mountain_h - ravine_cut;
 
-    // Rivers via SMOOTH BLEND with strict low-elevation gating. Rivers only
-    // appear where terrain is naturally near sea level; they smoothly blend
-    // the bed down so water (always at sea_level) shows in the channel.
-    let river_n = ridge_noise_2d(px * 0.0050 + 1000.0, pz * 0.0050 + 1000.0);
+    let river_n = ridge_noise_2d(px * 0.0025 + 1000.0, pz * 0.0025 + 1000.0);
     let river_strength_raw = ((river_n - 0.85) / 0.15).clamp(0.0, 1.0);
     let elevation_above_sea = (base_h - sea_level).max(0.0);
-    // Hard cutoff at +8 vox above sea — full strength up to +4, linear
-    // fade-out from +4 to +8, zero past that. No rivers on hills.
-    let elevation_fade = if elevation_above_sea < 4.0 {
+    let elevation_fade = if elevation_above_sea < 8.0 {
         1.0
-    } else if elevation_above_sea < 8.0 {
-        1.0 - (elevation_above_sea - 4.0) * 0.25
+    } else if elevation_above_sea < 16.0 {
+        1.0 - (elevation_above_sea - 8.0) * 0.125
     } else {
         0.0
     };
     let actual_strength = river_strength_raw * elevation_fade;
 
-    // Blend terrain DOWN toward bed_target. At full strength terrain reaches
-    // sea_level - 3 → 3 voxels of water. At river edges it tapers back to
-    // base_h naturally.
-    let bed_target = sea_level - 3.0;
+    let bed_target = sea_level - 6.0;
     let h_blended = base_h * (1.0 - actual_strength) + bed_target * actual_strength;
-    let h = h_blended.clamp(2.0, (WORLD_VOXELS_Y - 1) as f32);
+    let h = h_blended.clamp(4.0, (WORLD_VOXELS_Y - 1) as f32);
     let h_i = h as i32;
     let is_river = actual_strength > 0.0 && h_i < sea_level as i32;
 
@@ -982,7 +968,7 @@ pub fn sample_terrain(wx: f32, wz: f32, seed: u64) -> TerrainSample {
 pub fn gen_slot_bricks(world_chunk: glam::IVec3, seed: u64) -> Vec<Brick> {
     let total = (STORAGE_CHUNK_BRICKS * STORAGE_CHUNK_BRICKS * STORAGE_CHUNK_BRICKS) as usize;
     let mut bricks: Vec<Brick> = vec![Brick::EMPTY; total];
-    let sea_level: u32 = 64;
+    let sea_level: u32 = 180;
     let (s_x, s_z) = seed_offset_xz(seed);
     let world_x0 = world_chunk.x * STORAGE_CHUNK_VOXELS as i32;
     let world_y0 = world_chunk.y * STORAGE_CHUNK_VOXELS as i32;
@@ -1016,20 +1002,21 @@ pub fn gen_slot_bricks(world_chunk: glam::IVec3, seed: u64) -> Vec<Brick> {
             // perforate the river/lake bed and let the water drain into
             // them. Caves are still allowed deeper underground.
             let has_water_above = ts.water_top > h_signed;
-            let cave_seal_y = if has_water_above { h_signed - 5 } else { i32::MIN };
+            // 2× scale: seal depth 5 → 10, cave freqs / 2, subsoil 4 → 8.
+            let cave_seal_y = if has_water_above { h_signed - 10 } else { i32::MIN };
             for world_y in y_start..y_end {
                 if world_y > h_signed { break; }
                 let in_water_seal = world_y >= cave_seal_y;
                 if !in_water_seal {
-                    let cn = value_noise_3d(wx * 0.045, world_y as f32 * 0.085, wz * 0.045);
-                    let cn2 = value_noise_3d(wx * 0.110, world_y as f32 * 0.060, wz * 0.110);
-                    if world_y > 4 && world_y + 3 < h_signed && (cn + cn2 * 0.6) > 0.30 { continue; }
+                    let cn = value_noise_3d(wx * 0.0225, world_y as f32 * 0.0425, wz * 0.0225);
+                    let cn2 = value_noise_3d(wx * 0.055, world_y as f32 * 0.030, wz * 0.055);
+                    if world_y > 8 && world_y + 6 < h_signed && (cn + cn2 * 0.6) > 0.30 { continue; }
                 }
                 let mat = if ts.is_river && world_y as u32 >= h_u32 {
                     MAT_SAND
                 } else if world_y as u32 >= h_u32 {
                     biome.top_block(h_u32, sea_level)
-                } else if (world_y as u32) + 4 >= h_u32 {
+                } else if (world_y as u32) + 8 >= h_u32 {
                     biome.subsoil()
                 } else {
                     stone_or_ore(wx, world_y as f32, wz, h_u32)
@@ -1143,7 +1130,7 @@ fn trees_for_chunk(chunk_xz: glam::IVec2, seed: u64, sea_level: u32) -> Vec<Tree
     let temperature = fbm_2d((cx_center + s_x) * 0.0006, (cz_center + s_z) * 0.0006, 3);
     let humidity = fbm_2d((cx_center + s_x) * 0.0008 + 100.0,
                            (cz_center + s_z) * 0.0008 + 100.0, 3);
-    let biome = pick_biome(temperature, humidity, sea_level + 10, sea_level);
+    let biome = pick_biome(temperature, humidity, sea_level + 20, sea_level);
     let density = biome.tree_density();
     let n_candidates = (density * 5.0).round() as u32;
     if n_candidates == 0 { return Vec::new(); }
@@ -1166,8 +1153,8 @@ fn trees_for_chunk(chunk_xz: glam::IVec2, seed: u64, sea_level: u32) -> Vec<Tree
         let wx = chunk_xz.x * STORAGE_CHUNK_VOXELS as i32 + dx;
         let wz = chunk_xz.y * STORAGE_CHUNK_VOXELS as i32 + dz;
         let ts = sample_terrain(wx as f32, wz as f32, seed);
-        if ts.is_river || (ts.h as u32) <= sea_level + 1 { continue; }
-        if ts.h + 22 >= WORLD_VOXELS_Y as i32 { continue; }
+        if ts.is_river || (ts.h as u32) <= sea_level + 2 { continue; }
+        if ts.h + 44 >= WORLD_VOXELS_Y as i32 { continue; }
         let h_terrain = ts.h;
         let local_t = fbm_2d((wx as f32 + s_x) * 0.0006, (wz as f32 + s_z) * 0.0006, 3);
         let local_h = fbm_2d((wx as f32 + s_x) * 0.0008 + 100.0,
@@ -1203,51 +1190,54 @@ fn paint_tree(
     let base = glam::IVec3::new(t.base_x, t.base_y, t.base_z);
     let h = t.hash;
     match t.ttype {
+        // 2× scale — all trunk heights, branch lengths, canopy radii doubled.
+        // Thickness bumped from 0 (1-voxel line) to 1 (3-vox cross section)
+        // so trunks are noticeably chunky rather than spaghetti at 2× detail.
         // Pine: tall slender trunk, stacked conical leaf disks.
         2 => {
-            let trunk_h = 10 + (h % 6) as i32;
+            let trunk_h = 20 + ((h % 6) as i32) * 2;
             let trunk_top = base + glam::IVec3::new(0, trunk_h, 0);
-            paint_line(bricks, cmin, cmax, base, trunk_top, 0, MAT_WOOD_PINE);
+            paint_line(bricks, cmin, cmax, base, trunk_top, 1, MAT_WOOD_PINE);
             let layers: i32 = 6;
             for i in 0..layers {
                 let t_f = i as f32 / layers as f32;
                 let y = base.y + (trunk_h as f32 * (0.35 + t_f * 0.78)) as i32;
-                let r = ((1.0 - t_f).powf(0.85) * 3.5 + 1.0) as i32;
+                let r = ((1.0 - t_f).powf(0.85) * 7.0 + 2.0) as i32;
                 paint_sphere(bricks, cmin, cmax, glam::IVec3::new(base.x, y, base.z), r, MAT_LEAVES_PINE);
             }
         }
         // Birch: slim trunk + small leaf cluster.
         1 => {
-            let trunk_h = 8 + (h % 5) as i32;
+            let trunk_h = 16 + ((h % 5) as i32) * 2;
             let trunk_top = base + glam::IVec3::new(0, trunk_h, 0);
-            paint_line(bricks, cmin, cmax, base, trunk_top, 0, MAT_WOOD_BIRCH);
+            paint_line(bricks, cmin, cmax, base, trunk_top, 1, MAT_WOOD_BIRCH);
             let n = 2 + (h % 2) as i32;
             for b in 0..n {
                 let angle = (b as f32 / n as f32) * std::f32::consts::TAU
                     + branch_jitter(h, b as u32, 0) * 0.5;
-                let len = 2 + ((h.wrapping_mul(b as u32 + 1)) % 3) as i32;
+                let len = 4 + (((h.wrapping_mul(b as u32 + 1)) % 3) as i32) * 2;
                 let sy = base.y + (trunk_h as f32 * 0.7) as i32;
                 let end = glam::IVec3::new(
                     base.x + (angle.cos() * len as f32) as i32,
-                    sy + 1,
+                    sy + 2,
                     base.z + (angle.sin() * len as f32) as i32,
                 );
                 paint_line(bricks, cmin, cmax, glam::IVec3::new(base.x, sy, base.z), end, 0, MAT_WOOD_BIRCH);
-                paint_sphere(bricks, cmin, cmax, end, 2, MAT_LEAVES_BIRCH);
+                paint_sphere(bricks, cmin, cmax, end, 4, MAT_LEAVES_BIRCH);
             }
-            paint_sphere(bricks, cmin, cmax, trunk_top, 3, MAT_LEAVES_BIRCH);
+            paint_sphere(bricks, cmin, cmax, trunk_top, 6, MAT_LEAVES_BIRCH);
         }
         // Oak / autumn: wider canopy, a few branches.
         _ => {
             let leaf_mat = if t.ttype == 3 { MAT_LEAVES_AUTUMN } else { MAT_LEAVES };
-            let trunk_h = 8 + (h % 5) as i32;
+            let trunk_h = 16 + ((h % 5) as i32) * 2;
             let trunk_top = base + glam::IVec3::new(0, trunk_h, 0);
-            paint_line(bricks, cmin, cmax, base, trunk_top, 0, MAT_WOOD);
+            paint_line(bricks, cmin, cmax, base, trunk_top, 1, MAT_WOOD);
             let n = 3 + (h % 2) as i32;
             for b in 0..n {
                 let angle = (b as f32 / n as f32) * std::f32::consts::TAU
                     + branch_jitter(h, b as u32, 0) * 0.6;
-                let len = 3 + ((h.wrapping_mul(b as u32 + 7)) % 3) as i32;
+                let len = 6 + (((h.wrapping_mul(b as u32 + 7)) % 3) as i32) * 2;
                 let sy = base.y + (trunk_h as f32 * 0.65) as i32;
                 let end = glam::IVec3::new(
                     base.x + (angle.cos() * len as f32) as i32,
@@ -1255,9 +1245,9 @@ fn paint_tree(
                     base.z + (angle.sin() * len as f32) as i32,
                 );
                 paint_line(bricks, cmin, cmax, glam::IVec3::new(base.x, sy, base.z), end, 0, MAT_WOOD);
-                paint_sphere(bricks, cmin, cmax, end, 3, leaf_mat);
+                paint_sphere(bricks, cmin, cmax, end, 6, leaf_mat);
             }
-            paint_sphere(bricks, cmin, cmax, trunk_top, 4, leaf_mat);
+            paint_sphere(bricks, cmin, cmax, trunk_top, 8, leaf_mat);
         }
     }
 }
@@ -1344,8 +1334,8 @@ pub enum Biome {
 }
 
 pub fn pick_biome(temp: f32, humid: f32, h: u32, sea_level: u32) -> Biome {
-    if h > sea_level + 36 { return Biome::Mountain; }
-    if h <= sea_level + 1 { return Biome::Beach; }
+    if h > sea_level + 72 { return Biome::Mountain; }
+    if h <= sea_level + 2 { return Biome::Beach; }
     if temp < -0.20 { return Biome::Tundra; }
     if temp > 0.25 && humid < -0.05 { return Biome::Desert; }
     if temp > 0.15 && humid > 0.25 { return Biome::Jungle; }
@@ -1359,7 +1349,7 @@ impl Biome {
         match self {
             Biome::Tundra => MAT_SNOW,
             Biome::Desert | Biome::Beach | Biome::Savanna => MAT_SAND,
-            Biome::Mountain => if h > sea_level + 55 { MAT_SNOW } else { MAT_STONE },
+            Biome::Mountain => if h > sea_level + 110 { MAT_SNOW } else { MAT_STONE },
             _ => MAT_GRASS,
         }
     }
@@ -1386,12 +1376,12 @@ impl Biome {
     /// patch noise) bring it down to zero, dense patches scale by ~2x.
     pub fn tree_density(self) -> f32 {
         match self {
-            Biome::Jungle => 1.2,   // very dense
-            Biome::Forest => 0.55,  // dense
-            Biome::Tundra => 0.18,  // scattered pines
-            Biome::Plains => 0.08,  // mostly empty, occasional oak
-            Biome::Mountain => 0.07,
-            Biome::Savanna => 0.04, // very rare
+            Biome::Jungle => 0.30,
+            Biome::Forest => 0.14,
+            Biome::Tundra => 0.045,
+            Biome::Plains => 0.02,
+            Biome::Mountain => 0.018,
+            Biome::Savanna => 0.01,
             _ => 0.0,
         }
     }

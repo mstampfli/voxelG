@@ -139,7 +139,8 @@ impl Renderer {
                 label: Some("voxel device"),
                 required_features: wgpu::Features::empty(),
                 required_limits: wgpu::Limits {
-                    max_storage_buffer_binding_size: 256 << 20, // 256 MB headroom
+                    max_storage_buffer_binding_size: 1 << 30, // 1 GB (2× scale = 605 MB bricks)
+                    max_buffer_size: 1 << 30,
                     ..wgpu::Limits::default()
                 },
                 memory_hints: wgpu::MemoryHints::Performance,

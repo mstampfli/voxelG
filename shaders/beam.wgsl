@@ -31,15 +31,15 @@ fn pos_mod(a: i32, b: i32) -> i32 {
 @group(0) @binding(1) var<storage, read> chunk_mask: array<u32>;
 @group(0) @binding(2) var beam_out: texture_storage_2d<r32float, write>;
 
-const WORLD_VOXELS_X: i32 = 512;
-const WORLD_VOXELS_Y: i32 = 256;
-const WORLD_VOXELS_Z: i32 = 512;
-const WORLD_TILES_X: i32 = 32;
-const WORLD_TILES_Y: i32 = 16;
-const WORLD_TILES_Z: i32 = 32;
-const WORLD_CHUNKS_X: i32 = 8;
-const WORLD_CHUNKS_Y: i32 = 4;
-const WORLD_CHUNKS_Z: i32 = 8;
+const WORLD_VOXELS_X: i32 = 1024;
+const WORLD_VOXELS_Y: i32 = 512;
+const WORLD_VOXELS_Z: i32 = 1024;
+const WORLD_TILES_X: i32 = 64;
+const WORLD_TILES_Y: i32 = 32;
+const WORLD_TILES_Z: i32 = 64;
+const WORLD_CHUNKS_X: i32 = 16;
+const WORLD_CHUNKS_Y: i32 = 8;
+const WORLD_CHUNKS_Z: i32 = 16;
 
 fn world_chunk_idx(cx: i32, cy: i32, cz: i32) -> i32 {
     return cx + cy * WORLD_CHUNKS_X + cz * WORLD_CHUNKS_X * WORLD_CHUNKS_Y;
