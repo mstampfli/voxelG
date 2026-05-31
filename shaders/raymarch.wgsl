@@ -85,21 +85,21 @@ fn player_color_for(id: u32) -> vec3<f32> {
 
 const BRICK_DIM: i32 = 4;
 
-const WORLD_BRICKS_X: i32 = 128;
-const WORLD_BRICKS_Y: i32 = 64;
-const WORLD_BRICKS_Z: i32 = 128;
+const WORLD_BRICKS_X: i32 = 256;
+const WORLD_BRICKS_Y: i32 = 128;
+const WORLD_BRICKS_Z: i32 = 256;
 
-const WORLD_VOXELS_X: i32 = 512;
-const WORLD_VOXELS_Y: i32 = 256;
-const WORLD_VOXELS_Z: i32 = 512;
+const WORLD_VOXELS_X: i32 = 1024;
+const WORLD_VOXELS_Y: i32 = 512;
+const WORLD_VOXELS_Z: i32 = 1024;
 
-const WORLD_TILES_X: i32 = 32;
-const WORLD_TILES_Y: i32 = 16;
-const WORLD_TILES_Z: i32 = 32;
+const WORLD_TILES_X: i32 = 64;
+const WORLD_TILES_Y: i32 = 32;
+const WORLD_TILES_Z: i32 = 64;
 
-const WORLD_CHUNKS_X: i32 = 8;
-const WORLD_CHUNKS_Y: i32 = 4;
-const WORLD_CHUNKS_Z: i32 = 8;
+const WORLD_CHUNKS_X: i32 = 16;
+const WORLD_CHUNKS_Y: i32 = 8;
+const WORLD_CHUNKS_Z: i32 = 16;
 
 fn brick_voxel_idx(lx: i32, ly: i32, lz: i32) -> i32 {
     return lx + lz * 4 + ly * 16;
@@ -1416,8 +1416,8 @@ fn shade_glass(hit: Hit, origin: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
 // 200-250) so clouds sit inside the world Y = 192 — view rays past
 // mountains can actually reach the cloud band instead of stopping at the
 // world ceiling.
-const CLOUD_BASE: f32 = 145.0;
-const CLOUD_TOP:  f32 = 180.0;
+const CLOUD_BASE: f32 = 360.0;
+const CLOUD_TOP:  f32 = 420.0;
 
 fn render_clouds(origin: vec3<f32>, dir: vec3<f32>, t_terrain: f32, pix: vec2<f32>) -> vec4<f32> {
     // Slab intersection. A horizontal ray (|dir.y| ~ 0) gets nothing because
