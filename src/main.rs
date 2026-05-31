@@ -8,6 +8,7 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowId};
 
 mod camera;
+mod gpu_terrain;
 mod net;
 mod physics;
 mod raycast;
@@ -66,6 +67,10 @@ struct App {
     // crosshair, so the placed marker lands exactly under the crosshair the
     // player sees.
     pending_clicks: Vec<winit::event::MouseButton>,
+
+    // GPU chunk-noise generator. Created lazily once the renderer (and
+    // device + queue) exists.
+    gpu_terrain: Option<gpu_terrain::GpuTerrainGen>,
 }
 
 impl App {
@@ -94,6 +99,7 @@ impl App {
             last_net_send: Instant::now(),
             remote_players: std::collections::HashMap::new(),
             pending_clicks: Vec::new(),
+            gpu_terrain: None,
         }
     }
 
@@ -200,6 +206,9 @@ impl ApplicationHandler for App {
             .with_inner_size(winit::dpi::LogicalSize::new(1280, 720));
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         let renderer = Renderer::new(window.clone(), &self.world);
+        self.gpu_terrain = Some(gpu_terrain::GpuTerrainGen::new(
+            &renderer.device, &renderer.queue, self.world.seed,
+        ));
         self.window = Some(window);
         self.renderer = Some(renderer);
         self.grab(true);
@@ -301,10 +310,12 @@ impl ApplicationHandler for App {
                 if target_origin != self.world.world_origin_chunk {
                     self.world.shift_origin(target_origin);
                 }
-                // Amortise chunk gen — with rayon-parallel regen each frame
-                // can chew through 16 slots in roughly the same wall-time
-                // that 8 took serially.
-                self.world.process_regen_queue(16);
+                if let (Some(gpu), Some(r)) = (self.gpu_terrain.as_mut(), self.renderer.as_ref()) {
+                    gpu.tick(&r.device, &r.queue, &mut self.world);
+                }
+                // Lower CPU rayon worker cap (4 → 2) for stable frametime.
+                // GPU does most of the work; CPU helps catch up overflow.
+                self.world.process_regen_queue(2);
 
                 // ---- consume queued clicks ----
                 // At this point self.camera is in the EXACT state that's
@@ -370,10 +381,21 @@ impl ApplicationHandler for App {
                 let physics_changed = self.world.all_dirty || !self.world.dirty_bricks.is_empty();
                 let dirty_snap = self.world.dirty_bricks.clone();
                 self.frames_since_full += 1;
+                // Smart cache invalidation handles animations now (shader
+                // sets tile_animated bits, next-frame gate ORs them into
+                // dirty). The full-refresh threshold here just clears
+                // stale animated bits (every 30 frames ≈ 0.5s at 60FPS)
+                // so a tile that USED to show water but no longer does
+                // stops being re-traced forever.
                 let force_full = self.first_frame
-                    || self.frames_since_full >= 15
+                    || self.frames_since_full >= 30
                     || self.world.all_dirty
                     || camera_changed;
+                if force_full {
+                    if let Some(r) = self.renderer.as_ref() {
+                        r.clear_tile_animated();
+                    }
+                }
                 let any_dirty = force_full || physics_changed;
 
                 let (rw, rh) = self.renderer.as_ref().unwrap().size;
