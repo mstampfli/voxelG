@@ -88,6 +88,7 @@ pub struct Renderer {
     chunk_mask_buf: wgpu::Buffer,
     palette_buf: wgpu::Buffer,
     tile_dirty_buf: wgpu::Buffer,
+    tile_animated_buf: wgpu::Buffer,
     players_buf: wgpu::Buffer,
 
     output_tex: wgpu::Texture,
@@ -210,6 +211,16 @@ impl Renderer {
         let tile_dirty_words: u64 = ((3840u64 / 8 + 1) * (2160u64 / 8 + 1) + 31) / 32;
         let tile_dirty_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("tile_dirty"),
+            size: tile_dirty_words * 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        // Per-tile "this tile is animated" feedback. Shader atomicOrs a bit
+        // here when a pixel hits water/sky/glass/cloud. Read next frame by
+        // the temporal gate so animated tiles keep re-tracing while still
+        // ones stay cached. CPU clears periodically to drop stale bits.
+        let tile_animated_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("tile_animated"),
             size: tile_dirty_words * 4,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
@@ -338,6 +349,17 @@ impl Renderer {
                     },
                     count: None,
                 },
+                // tile_animated (atomic R/W feedback).
+                wgpu::BindGroupLayoutEntry {
+                    binding: 9,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -362,7 +384,7 @@ impl Renderer {
         let compute_bg = make_compute_bg(
             &device, &compute_bgl, &camera_buf, &bricks_buf,
             &tile_mask_buf, &chunk_mask_buf, &palette_buf, &output_view, &beam_view,
-            &tile_dirty_buf, &players_buf,
+            &tile_dirty_buf, &players_buf, &tile_animated_buf,
         );
 
         // -- beam pipeline (1/8-res coarse pre-pass) --
@@ -484,7 +506,7 @@ impl Renderer {
             size: (width, height),
             surface_size: (surface_w, surface_h),
             camera_buf, bricks_buf, tile_mask_buf, chunk_mask_buf, palette_buf,
-            tile_dirty_buf, players_buf,
+            tile_dirty_buf, tile_animated_buf, players_buf,
             output_tex, output_view, beam_tex, beam_view, sampler,
             beam_bgl, beam_pipeline, beam_bg,
             compute_bgl, compute_pipeline, compute_bg,
@@ -512,7 +534,7 @@ impl Renderer {
         self.compute_bg = make_compute_bg(
             &self.device, &self.compute_bgl, &self.camera_buf, &self.bricks_buf,
             &self.tile_mask_buf, &self.chunk_mask_buf, &self.palette_buf, &self.output_view, &self.beam_view,
-            &self.tile_dirty_buf, &self.players_buf,
+            &self.tile_dirty_buf, &self.players_buf, &self.tile_animated_buf,
         );
         self.beam_bg = make_beam_bg(
             &self.device, &self.beam_bgl, &self.camera_buf, &self.chunk_mask_buf, &self.beam_view,
@@ -560,6 +582,18 @@ impl Renderer {
     pub fn upload_tile_dirty(&self, mask: &[u32]) {
         if mask.is_empty() { return; }
         self.queue.write_buffer(&self.tile_dirty_buf, 0, bytemuck::cast_slice(mask));
+    }
+
+    /// Drop the smart-cache "this tile is animated" bits. Call periodically
+    /// so a tile that USED to show water/sky but no longer does stops
+    /// being re-traced every frame. After clearing, the next frame's
+    /// trace re-sets bits for whatever's currently animated.
+    pub fn clear_tile_animated(&self) {
+        // The buffer is tile_count/32 u32 words ≈ a few KB even at 4K; a
+        // zero-fill via write_buffer is the simplest approach.
+        let words: u64 = ((3840u64 / 8 + 1) * (2160u64 / 8 + 1) + 31) / 32;
+        let zeros = vec![0u32; words as usize];
+        self.queue.write_buffer(&self.tile_animated_buf, 0, bytemuck::cast_slice(&zeros));
     }
 
     pub fn upload_players(&self, positions: &[(glam::Vec3, u32)]) {
@@ -693,6 +727,7 @@ fn make_compute_bg(
     beam_view: &wgpu::TextureView,
     tile_dirty_buf: &wgpu::Buffer,
     players_buf: &wgpu::Buffer,
+    tile_animated_buf: &wgpu::Buffer,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("compute bg"),
@@ -707,6 +742,7 @@ fn make_compute_bg(
             wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(beam_view) },
             wgpu::BindGroupEntry { binding: 7, resource: tile_dirty_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 8, resource: players_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 9, resource: tile_animated_buf.as_entire_binding() },
         ],
     })
 }

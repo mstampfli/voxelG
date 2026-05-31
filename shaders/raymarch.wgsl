@@ -54,6 +54,11 @@ struct Brick {
 @group(0) @binding(5) var output_tex: texture_storage_2d<rgba8unorm, write>;
 @group(0) @binding(6) var beam_depth: texture_2d<f32>;
 @group(0) @binding(7) var<storage, read> tile_dirty: array<u32>;
+// Per-tile "this tile contained animated content last frame" feedback.
+// Shader sets a bit when a pixel hits water/sky; next frame the gate ORs
+// this against tile_dirty so animated tiles re-trace while still bricks
+// stay cached. CPU clears this buffer every ~30 frames to drop stale
+// bits (camera turned away from water, etc.).
 
 struct PlayersBuf {
     count: u32,
@@ -63,6 +68,7 @@ struct PlayersBuf {
     positions: array<vec4<f32>, 16>,
 };
 @group(0) @binding(8) var<storage, read> players: PlayersBuf;
+@group(0) @binding(9) var<storage, read_write> tile_animated: array<atomic<u32>>;
 
 fn ray_aabb_t(origin: vec3<f32>, inv_dir: vec3<f32>, mn: vec3<f32>, mx: vec3<f32>) -> f32 {
     let t0 = (mn - origin) * inv_dir;
@@ -287,7 +293,9 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let tile_idx = tile_x + tile_y * tiles_w;
     let word = tile_idx >> 5;
     let bit = tile_idx & 31;
-    if ((tile_dirty[word] & (1u << u32(bit))) == 0u) { return; }
+    let dirty_bit = (tile_dirty[word] >> u32(bit)) & 1u;
+    let anim_bit  = (atomicLoad(&tile_animated[word]) >> u32(bit)) & 1u;
+    if (dirty_bit == 0u && anim_bit == 0u) { return; }
 
     // Per-pixel + per-frame jitter, threaded through shading.
     let pix_jitter = ign(f32(gid.x), f32(gid.y), camera.time * 60.0);
@@ -377,6 +385,15 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     textureStore(output_tex, vec2<i32>(i32(gid.x), i32(gid.y)), vec4<f32>(col, 1.0));
+
+    // Smart cache feedback: if this pixel hit water/sky/glass (or the
+    // tile sees clouds), mark the tile as animated so next frame re-traces
+    // it even when the camera is still. Idempotent atomicOr so the 64
+    // pixels per tile racing on the same bit is fine.
+    let is_anim = !hit.hit || is_water_mat(hit.mat) || hit.mat == MAT_GLASS || clouds.a > 0.01;
+    if (is_anim) {
+        atomicOr(&tile_animated[word], 1u << u32(bit));
+    }
 }
 
 const MAT_GRASS:           u32 = 2u;
@@ -1668,9 +1685,13 @@ fn axis_select(v: vec3<f32>, ax: i32) -> f32 {
     return v.z;
 }
 
-// LOD: past this many voxels of distance, terminate the DDA at brick
-// granularity instead of per-voxel.
-const LOD_BRICK_T: f32 = 400.0;
+// LOD disabled. The previous "terminate at brick granularity past N
+// voxels" path filled in cave interiors with rock because a cave brick
+// has solid walls + air inside, and brick-granularity rendering can't
+// tell the difference. The safe LOD is brick_uniform_mat (the fast-skip
+// at the top of each iteration) — it fires only for FULLY-uniform bricks
+// regardless of distance, so caves stay visible.
+const LOD_BRICK_T: f32 = 1.0e9;
 
 fn trace(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
     var out: Hit;

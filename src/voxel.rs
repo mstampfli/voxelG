@@ -213,6 +213,14 @@ pub struct World {
     /// unload/regen — applied on top of fresh noise when a chunk reloads,
     /// and synced over the network so all clients agree on player builds.
     pub edits: std::collections::HashMap<(i32, i32, i32), u8>,
+    // ---- non-blocking chunk-gen worker pool ----
+    // Workers run on rayon::spawn. They push results into gen_result_rx.
+    // The main thread drains completed results each frame without ever
+    // blocking on a single chunk. This is what makes the frame rate hold
+    // up while many chunks stream in.
+    pub gen_result_tx: std::sync::mpsc::Sender<(u32, glam::IVec3, Vec<Brick>)>,
+    pub gen_result_rx: std::sync::mpsc::Receiver<(u32, glam::IVec3, Vec<Brick>)>,
+    pub gen_in_flight: usize,
 }
 
 impl World {
@@ -221,6 +229,7 @@ impl World {
     }
 
     pub fn with_seed(seed: u64) -> Self {
+        let (gen_result_tx, gen_result_rx) = std::sync::mpsc::channel();
         Self {
             bricks: vec![Brick::EMPTY; WORLD_BRICKS_TOTAL as usize],
             tile_mask: vec![0u64; WORLD_TILES_TOTAL as usize],
@@ -233,8 +242,11 @@ impl World {
             seed,
             world_origin_chunk: glam::IVec2::ZERO,
             slot_world_chunk: vec![None; WORLD_STORE_CHUNKS as usize],
-            regen_queue: std::collections::VecDeque::with_capacity(256),
+            regen_queue: std::collections::VecDeque::with_capacity(2048),
             edits: std::collections::HashMap::new(),
+            gen_result_tx,
+            gen_result_rx,
+            gen_in_flight: 0,
         }
     }
 
@@ -341,33 +353,47 @@ impl World {
     /// (pure function of world-chunk coord + seed), then the main thread
     /// merges results into the flat world array serially. No shared mutable
     /// state, no locks.
-    pub fn process_regen_queue(&mut self, budget: u32) {
-        use rayon::prelude::*;
+    /// Non-blocking chunk-gen pump.
+    /// - `max_inflight` caps the number of in-flight rayon::spawn workers.
+    ///   Higher = more concurrent generation, more memory; lower = stays
+    ///   lean but you wait longer for the visible window to fill.
+    /// - Main thread NEVER blocks on a single chunk. Each frame it drains
+    ///   whatever the worker pool has finished and tops up new requests.
+    pub fn process_regen_queue(&mut self, max_inflight: u32) {
         let seed = self.seed;
-        // Drain budget items from the queue first.
-        let mut batch: Vec<(u32, glam::IVec3)> = Vec::with_capacity(budget as usize);
-        for _ in 0..budget {
-            let Some(item) = self.regen_queue.pop_front() else { break; };
-            batch.push(item);
-        }
-        if batch.is_empty() { return; }
-        // Parallel: each worker generates its slot's bricks into a private
-        // Vec — pure function of (world_chunk, seed), no shared state.
-        let results: Vec<(u32, glam::IVec3, Vec<Brick>)> = batch
-            .par_iter()
-            .map(|&(slot, want)| {
-                let bricks = gen_slot_bricks(want, seed);
-                (slot, want, bricks)
-            })
-            .collect();
-        // Serial merge: stitch each scratch chunk into the flat world array.
-        let mut regenerated_chunks: Vec<glam::IVec3> = Vec::with_capacity(results.len());
-        for (slot, want, scratch) in results {
+
+        // ---- Step 1: drain completed gen results (cheap, non-blocking) ----
+        // Apply every result available this frame. apply_slot_bricks is
+        // ~tens of µs each, so even draining hundreds doesn't hitch.
+        let mut regenerated_chunks: Vec<glam::IVec3> = Vec::new();
+        loop {
+            let Ok((slot, want, scratch)) = self.gen_result_rx.try_recv() else { break; };
+            self.gen_in_flight = self.gen_in_flight.saturating_sub(1);
+            // Discard stale results — the slot may have been reassigned to
+            // a different world chunk while gen was running. Without this
+            // we'd see chunk-overlap corruption ("multiple worlds mixed").
+            if self.slot_world_chunk[slot as usize] != Some(want) { continue; }
             let cx = slot % WORLD_STORE_CX;
             let cy = (slot / WORLD_STORE_CX) % WORLD_STORE_CY;
             let cz = slot / (WORLD_STORE_CX * WORLD_STORE_CY);
             self.apply_slot_bricks(cx, cy, cz, &scratch);
             regenerated_chunks.push(want);
+        }
+
+        // GPU pump (in gpu_terrain::GpuTerrainGen) consumes the queue too;
+        // here we spawn a CAPPED number of CPU rayon workers alongside so
+        // both backends share the work. CPU helps catch up overflow when
+        // the player flies past many chunks faster than the GPU batch can
+        // chew through.
+        while self.gen_in_flight < max_inflight as usize {
+            let Some((slot, want)) = self.regen_queue.pop_front() else { break; };
+            if self.slot_world_chunk[slot as usize] != Some(want) { continue; }
+            let tx = self.gen_result_tx.clone();
+            rayon::spawn(move || {
+                let scratch = gen_slot_bricks(want, seed);
+                let _ = tx.send((slot, want, scratch));
+            });
+            self.gen_in_flight += 1;
         }
         if !regenerated_chunks.is_empty() && !self.edits.is_empty() {
             let cv = STORAGE_CHUNK_VOXELS as i32;
@@ -430,7 +456,7 @@ impl World {
 
     /// Apply a precomputed slot's bricks (from `gen_slot_bricks`) into the
     /// flat world array, refresh masks, mark bricks dirty.
-    fn apply_slot_bricks(&mut self, slot_cx: u32, slot_cy: u32, slot_cz: u32, scratch: &[Brick]) {
+    pub fn apply_slot_bricks(&mut self, slot_cx: u32, slot_cy: u32, slot_cz: u32, scratch: &[Brick]) {
         let base_bx = slot_cx * STORAGE_CHUNK_BRICKS;
         let base_by = slot_cy * STORAGE_CHUNK_BRICKS;
         let base_bz = slot_cz * STORAGE_CHUNK_BRICKS;
@@ -1061,10 +1087,19 @@ pub fn gen_slot_bricks(world_chunk: glam::IVec3, seed: u64) -> Vec<Brick> {
         }
     }
 
-    // ---------- TREE PASS ----------
-    // Trees with their *base* in this chunk or any of the 8 xz neighbours.
-    // Small trees (canopy radius ≤ 5 vox), so a 1-chunk scan covers them.
-    // We write straight into the brick scratch — no per-voxel allocation.
+    paint_trees_into_bricks(world_chunk, &mut bricks, seed);
+    return bricks;
+}
+
+/// Tree-only post-pass: paints all trees whose bases lie in `world_chunk`
+/// or any of its 8 xz-neighbour chunks into the provided scratch bricks.
+/// Used by both CPU gen and the GPU gen path (GPU only does the noise +
+/// material pass; trees stay CPU-side because they cross chunk borders).
+pub fn paint_trees_into_bricks(world_chunk: glam::IVec3, bricks: &mut [Brick], seed: u64) {
+    let sea_level: u32 = 180;
+    let world_x0 = world_chunk.x * STORAGE_CHUNK_VOXELS as i32;
+    let world_y0 = world_chunk.y * STORAGE_CHUNK_VOXELS as i32;
+    let world_z0 = world_chunk.z * STORAGE_CHUNK_VOXELS as i32;
     let chunk_min = (world_x0, world_y0, world_z0);
     let chunk_max = (
         world_x0 + STORAGE_CHUNK_VOXELS as i32,
@@ -1076,15 +1111,12 @@ pub fn gen_slot_bricks(world_chunk: glam::IVec3, seed: u64) -> Vec<Brick> {
             let src_chunk = glam::IVec2::new(world_chunk.x + ncx, world_chunk.z + ncz);
             let trees = trees_for_chunk(src_chunk, seed, sea_level);
             for tree in trees {
-                // Vertical overlap rejection.
                 let tree_top = tree.base_y + 22;
                 if tree.base_y > chunk_max.1 || tree_top < chunk_min.1 { continue; }
-                paint_tree(&tree, &mut bricks, chunk_min, chunk_max);
+                paint_tree(&tree, bricks, chunk_min, chunk_max);
             }
         }
     }
-
-    bricks
 }
 
 #[inline(always)]
