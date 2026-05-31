@@ -118,6 +118,23 @@ pub fn is_movable_mat(m: u8) -> bool {
     m == MAT_SAND || is_water_mat(m) || m == MAT_SMOKE
 }
 
+/// Worker-thread-friendly per-brick movable mask computation. One u64 per
+/// brick = bit-per-voxel "this voxel is sand/water/smoke & occupied".
+/// Offloading this 64-iter scan × 512 bricks × N chunks per burst from
+/// the main thread is the apply-side equivalent of moving paint_trees
+/// off-thread.
+pub fn compute_movable_masks(bricks: &[Brick]) -> Vec<u64> {
+    let mut out = Vec::with_capacity(bricks.len());
+    for b in bricks {
+        let mut m = 0u64;
+        for i in 0..64usize {
+            m |= (is_movable_mat(b.materials[i]) as u64) << i;
+        }
+        out.push(m & b.occupancy);
+    }
+    out
+}
+
 #[inline(always)]
 pub fn water_level_of(m: u8) -> u8 {
     if is_water_mat(m) { m - MAT_WATER_L1 + 1 } else { 0 }
@@ -223,8 +240,11 @@ pub struct World {
     // The main thread drains completed results each frame without ever
     // blocking on a single chunk. This is what makes the frame rate hold
     // up while many chunks stream in.
-    pub gen_result_tx: std::sync::mpsc::Sender<(u32, glam::IVec3, Vec<Brick>)>,
-    pub gen_result_rx: std::sync::mpsc::Receiver<(u32, glam::IVec3, Vec<Brick>)>,
+    /// Payload: (slot, want, bricks, movable_masks).
+    /// Worker precomputes movable_masks (the 64-iter per-voxel
+    /// is_movable_mat scan) so the main-thread apply step skips it.
+    pub gen_result_tx: std::sync::mpsc::Sender<(u32, glam::IVec3, Vec<Brick>, Vec<u64>)>,
+    pub gen_result_rx: std::sync::mpsc::Receiver<(u32, glam::IVec3, Vec<Brick>, Vec<u64>)>,
     pub gen_in_flight: usize,
 }
 
@@ -366,6 +386,25 @@ impl World {
     ///   lean but you wait longer for the visible window to fill.
     /// - Main thread NEVER blocks on a single chunk. Each frame it drains
     ///   whatever the worker pool has finished and tops up new requests.
+    /// Re-order `regen_queue` so the chunks closest to `camera_chunk` get
+    /// generated first. shift_origin pushes chunks in iteration order
+    /// (row-major) which means far edges of the streaming window often
+    /// get loaded before the chunk right under the player. Sorting before
+    /// every pump fixes that — nearest chunks always come off the queue
+    /// first.
+    pub fn prioritize_queue(&mut self, camera_chunk: glam::IVec2) {
+        if self.regen_queue.is_empty() { return; }
+        let mut q: Vec<(u32, glam::IVec3)> = self.regen_queue.drain(..).collect();
+        q.sort_by_key(|(_, want)| {
+            let dx = want.x - camera_chunk.x;
+            let dz = want.z - camera_chunk.y;
+            // i32 squared distance — max chunk delta is ~24, so dx*dx ≤ 576,
+            // safe under i32 max even cubed.
+            dx * dx + dz * dz
+        });
+        self.regen_queue.extend(q);
+    }
+
     pub fn process_regen_queue(&mut self, max_inflight: u32) {
         let seed = self.seed;
 
@@ -374,16 +413,13 @@ impl World {
         // ~tens of µs each, so even draining hundreds doesn't hitch.
         let mut regenerated_chunks: Vec<glam::IVec3> = Vec::new();
         loop {
-            let Ok((slot, want, scratch)) = self.gen_result_rx.try_recv() else { break; };
+            let Ok((slot, want, scratch, movable)) = self.gen_result_rx.try_recv() else { break; };
             self.gen_in_flight = self.gen_in_flight.saturating_sub(1);
-            // Discard stale results — the slot may have been reassigned to
-            // a different world chunk while gen was running. Without this
-            // we'd see chunk-overlap corruption ("multiple worlds mixed").
             if self.slot_world_chunk[slot as usize] != Some(want) { continue; }
             let cx = slot % WORLD_STORE_CX;
             let cy = (slot / WORLD_STORE_CX) % WORLD_STORE_CY;
             let cz = slot / (WORLD_STORE_CX * WORLD_STORE_CY);
-            self.apply_slot_bricks(cx, cy, cz, &scratch);
+            self.apply_slot_bricks_with_movable(cx, cy, cz, &scratch, &movable);
             regenerated_chunks.push(want);
         }
 
@@ -398,7 +434,8 @@ impl World {
             let tx = self.gen_result_tx.clone();
             rayon::spawn(move || {
                 let scratch = gen_slot_bricks(want, seed);
-                let _ = tx.send((slot, want, scratch));
+                let movable = compute_movable_masks(&scratch);
+                let _ = tx.send((slot, want, scratch, movable));
             });
             self.gen_in_flight += 1;
         }
@@ -461,9 +498,25 @@ impl World {
         }
     }
 
-    /// Apply a precomputed slot's bricks (from `gen_slot_bricks`) into the
-    /// flat world array, refresh masks, mark bricks dirty.
+    /// Apply a precomputed slot's bricks. Computes movable_masks inline
+    /// (legacy convenience path). Hot paths should use
+    /// `apply_slot_bricks_with_movable` and pass a precomputed mask
+    /// generated on the worker thread.
     pub fn apply_slot_bricks(&mut self, slot_cx: u32, slot_cy: u32, slot_cz: u32, scratch: &[Brick]) {
+        let movable = compute_movable_masks(scratch);
+        self.apply_slot_bricks_with_movable(slot_cx, slot_cy, slot_cz, scratch, &movable);
+    }
+
+    /// Same as `apply_slot_bricks` but with precomputed per-brick
+    /// movable_mask (one u64 per scratch entry). Main thread does only
+    /// the cheap memcpy + bit-ops; the 64-iter per-voxel scan stays on
+    /// the worker.
+    pub fn apply_slot_bricks_with_movable(
+        &mut self,
+        slot_cx: u32, slot_cy: u32, slot_cz: u32,
+        scratch: &[Brick],
+        movable: &[u64],
+    ) {
         let base_bx = slot_cx * STORAGE_CHUNK_BRICKS;
         let base_by = slot_cy * STORAGE_CHUNK_BRICKS;
         let base_bz = slot_cz * STORAGE_CHUNK_BRICKS;
@@ -478,13 +531,7 @@ impl World {
                     let bz = base_bz + dz;
                     let bi = brick_idx(bx, by, bz);
                     self.bricks[bi as usize] = scratch[scratch_idx];
-                    // Recompute movable_mask.
-                    let b = &self.bricks[bi as usize];
-                    let mut m = 0u64;
-                    for i in 0..64usize {
-                        m |= (is_movable_mat(b.materials[i]) as u64) << i;
-                    }
-                    let new_movable = m & b.occupancy;
+                    let new_movable = movable[scratch_idx];
                     let was_movable = self.movable_mask[bi as usize] != 0;
                     self.movable_mask[bi as usize] = new_movable;
                     let is_movable = new_movable != 0;
