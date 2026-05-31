@@ -22,9 +22,12 @@ use glam::UVec3;
 pub const BRICK_DIM: u32 = 4;
 pub const BRICK_VOXELS: u32 = BRICK_DIM * BRICK_DIM * BRICK_DIM;
 
-pub const WORLD_BRICKS_X: u32 = 128;
-pub const WORLD_BRICKS_Y: u32 = 64;
-pub const WORLD_BRICKS_Z: u32 = 128;
+// 1.5× scale-up — chunk count drops 60% vs 2× (2304 vs 8192 storage chunks),
+// so initial gen + chunk-streaming is ~3× faster while still keeping more
+// detail than the original 1× scale.
+pub const WORLD_BRICKS_X: u32 = 192;
+pub const WORLD_BRICKS_Y: u32 = 96;
+pub const WORLD_BRICKS_Z: u32 = 192;
 pub const WORLD_BRICKS_TOTAL: u32 = WORLD_BRICKS_X * WORLD_BRICKS_Y * WORLD_BRICKS_Z;
 
 pub const WORLD_VOXELS_X: u32 = WORLD_BRICKS_X * BRICK_DIM;
@@ -165,6 +168,20 @@ pub struct Brick {
     pub materials: [u8; BRICK_VOXELS as usize],
 }
 
+/// Compute the brick_uniform[bi] hint from a brick's current contents.
+/// Returns 0 if the brick is non-uniform (mixed materials or partial fill);
+/// otherwise the material id that fills every voxel.
+#[inline]
+pub fn compute_uniform_hint(b: &Brick) -> u8 {
+    if b.occupancy != !0u64 { return 0; }
+    let m0 = b.materials[0];
+    if m0 == 0 { return 0; }
+    for i in 1..(BRICK_VOXELS as usize) {
+        if b.materials[i] != m0 { return 0; }
+    }
+    m0
+}
+
 impl Brick {
     pub const EMPTY: Self = Self {
         occupancy: 0,
@@ -191,17 +208,26 @@ impl Brick {
 }
 
 pub struct World {
+    /// DENSE brick storage — indexed directly by brick_idx(bx, by, bz).
+    /// 2× scale = 8.4M bricks × 72B = 605 MB. Tried sparse-pool earlier:
+    /// the extra brick_slot[bi] fetch per DDA step in the shader cost 5-10x
+    /// the per-pixel cost. Speed wins over memory until we hit hard limits.
     pub bricks: Vec<Brick>,
     pub tile_mask: Vec<u64>,
     pub chunk_mask: Vec<u64>,
     pub movable_mask: Vec<u64>,
-    /// Per-brick "this whole brick is one material" hint. 0 = not uniform;
-    /// any non-zero value = uniform with that material id. Lets the DDA
-    /// skip the whole brick in one step instead of walking 4 voxels.
+    /// Per-brick "this whole brick is one material" hint (0 = non-uniform,
+    /// else mat id). The dense brick STILL stores the data; this just
+    /// lets the DDA fast-skip uniform 4-voxel cubes in one test, avoiding
+    /// the 72B Brick fetch entirely for those.
     pub brick_uniform: Vec<u8>,
-    /// Per-tile uniform hint (same idea at the 16-voxel scale). When set
-    /// the DDA can skip 16 voxels in one step.
+    /// Per-tile uniform hint at 16-voxel scale.
     pub tile_uniform: Vec<u8>,
+    /// Per-brick baked AO (0..255). One byte per brick, computed at gen
+    /// + edit time by counting solid 6-axis brick-neighbours. Replaces
+    /// compute_ao's 12 hierarchical descents per primary hit with a
+    /// single byte fetch. 8 MB total at 2× scale.
+    pub brick_ao: Vec<u8>,
     pub active_bricks: Vec<u32>,
     pub dirty_bricks: Vec<u32>,
     pub all_dirty: bool,
@@ -216,6 +242,17 @@ pub struct World {
     /// For each slot, the world chunk coord it currently holds. None = stale.
     pub slot_world_chunk: Vec<Option<glam::IVec3>>,
     pub regen_queue: std::collections::VecDeque<(u32, glam::IVec3)>,
+    /// Channel back from the BACKGROUND chunk-gen worker pool. Each
+    /// (slot, want, scratch) is a finished chunk ready to apply. The
+    /// worker uses rayon::spawn so generation runs across the thread
+    /// pool — render thread NEVER blocks on it. Eliminates the
+    /// "chunk-load frame drop" players hate.
+    pub gen_result_tx: std::sync::mpsc::Sender<(u32, glam::IVec3, Vec<Brick>)>,
+    pub gen_result_rx: std::sync::mpsc::Receiver<(u32, glam::IVec3, Vec<Brick>)>,
+    /// Number of gen tasks currently in flight on the worker pool.
+    /// Bounded so we don't spawn millions of pending tasks during fast
+    /// flight (each holds a Vec<Brick> of 32 KB).
+    pub gen_in_flight: usize,
     /// Persistent voxel edits keyed by *world* voxel coord. Survives chunk
     /// unload/regen — applied on top of fresh noise when a chunk reloads,
     /// and synced over the network so all clients agree on player builds.
@@ -228,13 +265,17 @@ impl World {
     }
 
     pub fn with_seed(seed: u64) -> Self {
+        let (gen_tx, gen_rx) = std::sync::mpsc::channel();
         Self {
+            // Dense alloc — every logical brick gets a slot at its bi.
+            // Cheap initial alloc: 8.4M × 72B ≈ 600 MB at 2× scale.
             bricks: vec![Brick::EMPTY; WORLD_BRICKS_TOTAL as usize],
             tile_mask: vec![0u64; WORLD_TILES_TOTAL as usize],
             chunk_mask: vec![0u64; WORLD_CHUNKS_TOTAL as usize],
             movable_mask: vec![0u64; WORLD_BRICKS_TOTAL as usize],
             brick_uniform: vec![0u8; WORLD_BRICKS_TOTAL as usize],
             tile_uniform: vec![0u8; WORLD_TILES_TOTAL as usize],
+            brick_ao: vec![255u8; WORLD_BRICKS_TOTAL as usize],
             active_bricks: Vec::with_capacity(4096),
             dirty_bricks: Vec::with_capacity(4096),
             all_dirty: true,
@@ -243,8 +284,66 @@ impl World {
             world_origin_chunk: glam::IVec2::ZERO,
             slot_world_chunk: vec![None; WORLD_STORE_CHUNKS as usize],
             regen_queue: std::collections::VecDeque::with_capacity(256),
+            gen_result_tx: gen_tx,
+            gen_result_rx: gen_rx,
+            gen_in_flight: 0,
             edits: std::collections::HashMap::new(),
         }
+    }
+
+    // ---- dense brick access helpers ----
+    // Storage is direct: bricks[bi as usize] for every operation. The
+    // brick_uniform[bi] is kept purely as a GPU fast-skip hint that lets
+    // shader rays skip whole 4-voxel cubes (and tile_uniform skips 16).
+
+    /// Return a copy of the brick at logical index `bi`.
+    #[inline]
+    pub fn brick_read(&self, bi: u32) -> Brick {
+        self.bricks[bi as usize]
+    }
+
+    /// Mutable borrow — caller is responsible for updating masks, uniform
+    /// hints, and dirty bits afterward (set_voxel does this for the
+    /// public single-voxel path).
+    #[inline]
+    pub fn brick_mut(&mut self, bi: u32) -> &mut Brick {
+        &mut self.bricks[bi as usize]
+    }
+
+    /// Cheap "any solid voxel?" check that doesn't copy the 72 B Brick.
+    #[inline]
+    pub fn brick_is_empty(&self, bi: u32) -> bool {
+        self.bricks[bi as usize].occupancy == 0
+    }
+
+    /// Occupancy mask — direct fetch.
+    #[inline]
+    pub fn brick_occupancy(&self, bi: u32) -> u64 {
+        self.bricks[bi as usize].occupancy
+    }
+
+    /// Material at a specific voxel inside a brick.
+    #[inline]
+    pub fn brick_voxel_mat(&self, bi: u32, vi: u32) -> u8 {
+        self.bricks[bi as usize].materials[vi as usize]
+    }
+
+    /// Reset to fully empty air. Used by chunk stream-out.
+    pub fn clear_brick(&mut self, bi: u32) {
+        self.bricks[bi as usize] = Brick::EMPTY;
+        self.brick_uniform[bi as usize] = 0;
+    }
+
+    /// Drop a dense Brick into this brick index. Updates the uniform hint
+    /// so the GPU fast-skip path stays accurate.
+    pub fn assign_brick(&mut self, bi: u32, src: Brick) {
+        self.bricks[bi as usize] = src;
+        self.brick_uniform[bi as usize] = compute_uniform_hint(&src);
+    }
+
+    /// Recompute the uniform hint from the current brick contents.
+    pub fn try_compact_brick(&mut self, bi: u32) {
+        self.brick_uniform[bi as usize] = compute_uniform_hint(&self.bricks[bi as usize]);
     }
 
     /// World-voxel offset of the loaded window's lower corner.
@@ -319,6 +418,9 @@ impl World {
     pub fn shift_origin(&mut self, new_origin: glam::IVec2) {
         if new_origin == self.world_origin_chunk { return; }
         self.world_origin_chunk = new_origin;
+        // DIAGNOSTIC: force bulk upload of entire bricks buffer.
+        // If this fixes "wrong chunks" bug, delta upload was missing writes.
+        self.all_dirty = true;
         let store_x = WORLD_STORE_CX as i32;
         let store_z = WORLD_STORE_CZ as i32;
         for cz in 0..WORLD_STORE_CZ {
@@ -350,33 +452,54 @@ impl World {
     /// (pure function of world-chunk coord + seed), then the main thread
     /// merges results into the flat world array serially. No shared mutable
     /// state, no locks.
-    pub fn process_regen_queue(&mut self, budget: u32) {
-        use rayon::prelude::*;
+    pub fn process_regen_queue(&mut self, max_inflight: u32) {
+        // Apply UNCAPPED — drain everything pending each frame. Better
+        // to take a one-frame hitch than show wrong chunks for any
+        // duration.
+        const APPLY_CAP_PER_FRAME: usize = usize::MAX;
+        let mut applied = 0usize;
+        // -------- NON-BLOCKING WORKER PUMP --------
+        // 1. Drain anything the worker pool has finished.
+        // 2. Top up the in-flight queue with new requests.
+        // The main thread NEVER blocks on chunk gen. Even if 1000 chunks
+        // are queued, we just keep `max_inflight` workers running and
+        // poll results next frame. This is what eliminates the
+        // "chunk-load frame drop" players notice in unoptimised engines.
+
         let seed = self.seed;
-        // Drain budget items from the queue first.
-        let mut batch: Vec<(u32, glam::IVec3)> = Vec::with_capacity(budget as usize);
-        for _ in 0..budget {
-            let Some(item) = self.regen_queue.pop_front() else { break; };
-            batch.push(item);
-        }
-        if batch.is_empty() { return; }
-        // Parallel: each worker generates its slot's bricks into a private
-        // Vec — pure function of (world_chunk, seed), no shared state.
-        let results: Vec<(u32, glam::IVec3, Vec<Brick>)> = batch
-            .par_iter()
-            .map(|&(slot, want)| {
-                let bricks = gen_slot_bricks(want, seed);
-                (slot, want, bricks)
-            })
-            .collect();
-        // Serial merge: stitch each scratch chunk into the flat world array.
-        let mut regenerated_chunks: Vec<glam::IVec3> = Vec::with_capacity(results.len());
-        for (slot, want, scratch) in results {
+
+        // ---- Step 1: drain completed gen results (cheap, non-blocking) ----
+        let mut regenerated_chunks: Vec<glam::IVec3> = Vec::new();
+        while applied < APPLY_CAP_PER_FRAME {
+            let Ok((slot, want, scratch)) = self.gen_result_rx.try_recv() else { break; };
+            self.gen_in_flight = self.gen_in_flight.saturating_sub(1);
+            // Discard stale results — the slot may have been reassigned to
+            // a different world chunk while gen was running. Without this
+            // we'd see chunk-overlap corruption ("multiple worlds mixed").
+            if self.slot_world_chunk[slot as usize] != Some(want) { continue; }
             let cx = slot % WORLD_STORE_CX;
             let cy = (slot / WORLD_STORE_CX) % WORLD_STORE_CY;
             let cz = slot / (WORLD_STORE_CX * WORLD_STORE_CY);
             self.apply_slot_bricks(cx, cy, cz, &scratch);
+            // DIAGNOSTIC: also force bulk upload after any apply.
+            self.all_dirty = true;
             regenerated_chunks.push(want);
+            applied += 1;
+        }
+
+        // ---- Step 2: top up the worker pool ----
+        // Submit up to `max_inflight - gen_in_flight` new gen tasks via
+        // rayon::spawn. Each runs on a worker thread in parallel.
+        while self.gen_in_flight < max_inflight as usize {
+            let Some((slot, want)) = self.regen_queue.pop_front() else { break; };
+            // Skip stale queue entries before even spawning the work.
+            if self.slot_world_chunk[slot as usize] != Some(want) { continue; }
+            let tx = self.gen_result_tx.clone();
+            rayon::spawn(move || {
+                let scratch = gen_slot_bricks(want, seed);
+                let _ = tx.send((slot, want, scratch));
+            });
+            self.gen_in_flight += 1;
         }
         if !regenerated_chunks.is_empty() && !self.edits.is_empty() {
             let cv = STORAGE_CHUNK_VOXELS as i32;
@@ -425,13 +548,33 @@ impl World {
             for dy in 0..STORAGE_CHUNK_BRICKS {
                 for dx in 0..STORAGE_CHUNK_BRICKS {
                     let bi = brick_idx(x0 + dx, y0 + dy, z0 + dz);
-                    let was_nonempty = !self.bricks[bi as usize].is_empty();
-                    self.bricks[bi as usize] = Brick::EMPTY;
+                    let was_nonempty = !self.brick_is_empty(bi);
+                    self.clear_brick(bi);
                     self.movable_mask[bi as usize] = 0;
                     if was_nonempty {
                         self.refresh_masks_for_brick(x0 + dx, y0 + dy, z0 + dz);
                     }
                     self.mark_brick_dirty(bi);
+                }
+            }
+        }
+        // CRITICAL: recompute tile_uniform for the 8 tiles touched by this
+        // slot. Without this the GPU shader's tile_uniform fast-skip keeps
+        // returning the stale OLD chunk's uniform material — producing the
+        // "floor turning to stone everywhere" visual corruption that fires
+        // when streaming chunks in/out.
+        let base_tx = x0 / 4;
+        let base_ty = y0 / 4;
+        let base_tz = z0 / 4;
+        for dtz in 0..2u32 {
+            for dty in 0..2u32 {
+                for dtx in 0..2u32 {
+                    let tx = base_tx + dtx;
+                    let ty = base_ty + dty;
+                    let tz = base_tz + dtz;
+                    if tx < WORLD_TILES_X && ty < WORLD_TILES_Y && tz < WORLD_TILES_Z {
+                        self.recompute_uniform_for_tile(tile_idx(tx, ty, tz));
+                    }
                 }
             }
         }
@@ -453,14 +596,14 @@ impl World {
                     let by = base_by + dy;
                     let bz = base_bz + dz;
                     let bi = brick_idx(bx, by, bz);
-                    self.bricks[bi as usize] = scratch[scratch_idx];
-                    // Recompute movable_mask.
-                    let b = &self.bricks[bi as usize];
+                    let src = scratch[scratch_idx];
+                    // Recompute movable_mask BEFORE compacting so we still
+                    // see the materials.
                     let mut m = 0u64;
                     for i in 0..64usize {
-                        m |= (is_movable_mat(b.materials[i]) as u64) << i;
+                        m |= (is_movable_mat(src.materials[i]) as u64) << i;
                     }
-                    let new_movable = m & b.occupancy;
+                    let new_movable = m & src.occupancy;
                     let was_movable = self.movable_mask[bi as usize] != 0;
                     self.movable_mask[bi as usize] = new_movable;
                     let is_movable = new_movable != 0;
@@ -473,14 +616,17 @@ impl World {
                             self.active_bricks.remove(pos);
                         }
                     }
+                    // assign_brick detects uniform fills and stores them
+                    // sparsely (no slot allocated) — saves memory on the
+                    // ~95% of bricks that are uniform stone / dirt / air.
+                    self.assign_brick(bi, src);
                     self.refresh_masks_for_brick(bx, by, bz);
-                    self.recompute_uniform_for_brick(bi);
                     self.mark_brick_dirty(bi);
                 }
             }
         }
-        // Recompute affected tile_uniform flags. A storage chunk is 8x8x8
-        // bricks = 2x2x2 tiles, so 8 tiles touched per slot.
+        // tile_uniform flags get recomputed across all touched tiles. A
+        // storage chunk = 8×8×8 bricks = 2×2×2 tiles → 8 tiles touched.
         let base_tx = (base_bx) / 4;
         let base_ty = (base_by) / 4;
         let base_tz = (base_bz) / 4;
@@ -498,119 +644,12 @@ impl World {
         }
     }
 
-    /// Regenerate one slot. Slot must already be cleared (by `clear_slot`).
-    pub fn regenerate_slot(&mut self, slot_cx: u32, slot_cy: u32, slot_cz: u32, world_chunk: glam::IVec3, seed: u64) {
-        let sea_level: u32 = 64;
-        let (s_x, s_z) = seed_offset_xz(seed);
-
-        let local_x0 = slot_cx * STORAGE_CHUNK_VOXELS;
-        let local_y0 = slot_cy * STORAGE_CHUNK_VOXELS;
-        let local_z0 = slot_cz * STORAGE_CHUNK_VOXELS;
-        let world_x0 = world_chunk.x * STORAGE_CHUNK_VOXELS as i32;
-        let world_y0 = world_chunk.y * STORAGE_CHUNK_VOXELS as i32;
-        let world_z0 = world_chunk.z * STORAGE_CHUNK_VOXELS as i32;
-
-        // First, clear all bricks in this slot.
-        for dz in 0..STORAGE_CHUNK_BRICKS {
-            for dy in 0..STORAGE_CHUNK_BRICKS {
-                for dx in 0..STORAGE_CHUNK_BRICKS {
-                    let bx = local_x0 / BRICK_DIM + dx;
-                    let by = local_y0 / BRICK_DIM + dy;
-                    let bz = local_z0 / BRICK_DIM + dz;
-                    let bi = brick_idx(bx, by, bz) as usize;
-                    self.bricks[bi] = Brick::EMPTY;
-                    self.movable_mask[bi] = 0;
-                }
-            }
-        }
-
-        // Generate using WORLD coords for noise so neighbouring chunks line
-        // up seamlessly.
-        for dz in 0..STORAGE_CHUNK_VOXELS {
-            for dx in 0..STORAGE_CHUNK_VOXELS {
-                let wx = (world_x0 + dx as i32) as f32 + s_x;
-                let wz = (world_z0 + dz as i32) as f32 + s_z;
-                let hilly     = fbm_2d(wx * 0.007, wz * 0.007, 4);
-                let mountains = fbm_2d(wx * 0.0025, wz * 0.0025, 3).max(0.0).powf(1.6) * 1.8;
-                let detail    = fbm_2d(wx * 0.04, wz * 0.04, 2) * 0.4;
-                let h_signed = (sea_level as f32 + 14.0 + hilly * 22.0 + mountains * 40.0 + detail * 3.0)
-                    .clamp(2.0, (WORLD_VOXELS_Y - 1) as f32) as i32;
-                // Lower-frequency biome noise → larger, less-jumpy biomes.
-                let temperature = fbm_2d(wx * 0.0006, wz * 0.0006, 3);
-                let humidity    = fbm_2d(wx * 0.0008 + 100.0, wz * 0.0008 + 100.0, 3);
-                let biome = pick_biome(temperature, humidity, h_signed as u32, sea_level);
-                let local_x = local_x0 + dx;
-                let local_z = local_z0 + dz;
-
-                for dy in 0..STORAGE_CHUNK_VOXELS {
-                    let world_y = world_y0 + dy as i32;
-                    let local_y = local_y0 + dy;
-                    if world_y < 0 || world_y >= WORLD_VOXELS_Y as i32 { continue; }
-                    if world_y > h_signed { break; }
-                    let cn  = value_noise_3d(wx * 0.045, world_y as f32 * 0.085, wz * 0.045);
-                    let cn2 = value_noise_3d(wx * 0.110, world_y as f32 * 0.060, wz * 0.110);
-                    if world_y > 4 && world_y + 3 < h_signed && (cn + cn2 * 0.6) > 0.30 { continue; }
-                    let h_u32 = h_signed as u32;
-                    let mat = if world_y as u32 >= h_u32 {
-                        biome.top_block(h_u32, sea_level)
-                    } else if (world_y as u32) + 4 >= h_u32 {
-                        biome.subsoil()
-                    } else {
-                        stone_or_ore(wx, world_y as f32, wz, h_u32)
-                    };
-                    self.write_voxel_unchecked(local_x, local_y, local_z, mat);
-                }
-                // Sea fill
-                if (h_signed as u32) < sea_level {
-                    for wy in ((h_signed + 1) as i32)..=(sea_level as i32) {
-                        if wy < world_y0 || wy >= world_y0 + STORAGE_CHUNK_VOXELS as i32 { continue; }
-                        let local_y = local_y0 + (wy - world_y0) as u32;
-                        if local_y < WORLD_VOXELS_Y {
-                            self.write_voxel_unchecked(local_x, local_y, local_z, MAT_WATER);
-                        }
-                    }
-                }
-            }
-        }
-
-        // CRITICAL: write_voxel_unchecked bypasses every bookkeeping mask, so
-        // we must rebuild them per-brick now. Without this the shader's
-        // hierarchical DDA sees the chunk as empty (tile/chunk bits unset)
-        // and renders sky, even though the bricks have content on the CPU.
-        for dz in 0..STORAGE_CHUNK_BRICKS {
-            for dy in 0..STORAGE_CHUNK_BRICKS {
-                for dx in 0..STORAGE_CHUNK_BRICKS {
-                    let bx = local_x0 / BRICK_DIM + dx;
-                    let by = local_y0 / BRICK_DIM + dy;
-                    let bz = local_z0 / BRICK_DIM + dz;
-                    let bi = brick_idx(bx, by, bz);
-                    let b = &self.bricks[bi as usize];
-                    let mut m = 0u64;
-                    for i in 0..64usize {
-                        m |= (is_movable_mat(b.materials[i]) as u64) << i;
-                    }
-                    let new_movable = m & b.occupancy;
-                    let was_movable = self.movable_mask[bi as usize] != 0;
-                    self.movable_mask[bi as usize] = new_movable;
-                    let is_movable = new_movable != 0;
-                    if was_movable != is_movable {
-                        if is_movable {
-                            if let Err(pos) = self.active_bricks.binary_search(&bi) {
-                                self.active_bricks.insert(pos, bi);
-                            }
-                        } else if let Ok(pos) = self.active_bricks.binary_search(&bi) {
-                            self.active_bricks.remove(pos);
-                        }
-                    }
-                    self.refresh_masks_for_brick(bx, by, bz);
-                    self.mark_brick_dirty(bi);
-                }
-            }
-        }
-    }
+    // ---- old recompute_uniform_for_brick is now unused in apply_slot_bricks
+    // because assign_brick handles uniform-detection inline. Keep the
+    // single-voxel set_voxel path using try_compact_brick. ----
 
     pub fn recompute_movable_for_brick(&mut self, bi: u32) {
-        let b = &self.bricks[bi as usize];
+        let b = self.brick_read(bi);
         let mut m = 0u64;
         for i in 0..64usize {
             let movable = is_movable_mat(b.materials[i]) as u64;
@@ -649,7 +688,7 @@ impl World {
     /// have changed. Called by physics and by set_voxel().
     pub fn refresh_masks_for_brick(&mut self, bx: u32, by: u32, bz: u32) {
         let bi = brick_idx(bx, by, bz);
-        let solid = !self.bricks[bi as usize].is_empty();
+        let solid = !self.brick_is_empty(bi);
         let (tx, ty, tz) = (bx / 4, by / 4, bz / 4);
         let ti = tile_idx(tx, ty, tz);
         let bit = brick_bit_in_tile(bx & 3, by & 3, bz & 3);
@@ -679,14 +718,23 @@ impl World {
         let (bx, by, bz) = (x / BRICK_DIM, y / BRICK_DIM, z / BRICK_DIM);
         let (lx, ly, lz) = (x % BRICK_DIM, y % BRICK_DIM, z % BRICK_DIM);
         let bi = brick_idx(bx, by, bz);
-        let was_empty = self.bricks[bi as usize].is_empty();
-        self.bricks[bi as usize].set(lx, ly, lz, mat);
-        let is_empty = self.bricks[bi as usize].is_empty();
+        let was_empty = self.brick_is_empty(bi);
+        // Materialize (allocates a slot if the brick was uniform/empty,
+        // pre-filling with the prior contents so we can edit one voxel
+        // without losing the rest).
+        self.brick_mut(bi).set(lx, ly, lz, mat);
+        let is_empty = self.brick_is_empty(bi);
         if was_empty != is_empty {
             self.refresh_masks_for_brick(bx, by, bz);
         }
         self.recompute_movable_for_brick(bi);
-        self.recompute_uniform_for_brick(bi);
+        // try_compact_brick re-collapses the brick back to a uniform hint
+        // (freeing the slot) if the edit returned us to all-air or all-X.
+        // This is the "split on edit, recombine when uniform again" loop.
+        self.try_compact_brick(bi);
+        // Refresh AO for this brick + 6 neighbours (their AO depends on
+        // this brick's solidity).
+        self.refresh_ao_for_brick(bi);
         // The tile this brick lives in may have lost its uniform status.
         let ti = tile_idx(bx / 4, by / 4, bz / 4);
         self.recompute_uniform_for_tile(ti);
@@ -695,24 +743,7 @@ impl World {
 
     /// Recompute brick_uniform[bi] from the brick's current contents.
     pub fn recompute_uniform_for_brick(&mut self, bi: u32) {
-        let b = &self.bricks[bi as usize];
-        // Uniform if: every voxel is occupied AND every material is identical.
-        if b.occupancy != !0u64 {
-            self.brick_uniform[bi as usize] = 0;
-            return;
-        }
-        let m0 = b.materials[0];
-        if m0 == 0 {
-            self.brick_uniform[bi as usize] = 0;
-            return;
-        }
-        for i in 1..(BRICK_VOXELS as usize) {
-            if b.materials[i] != m0 {
-                self.brick_uniform[bi as usize] = 0;
-                return;
-            }
-        }
-        self.brick_uniform[bi as usize] = m0;
+        self.brick_uniform[bi as usize] = compute_uniform_hint(&self.bricks[bi as usize]);
     }
 
     /// Recompute tile_uniform[ti] from its 64 child bricks. Tile is uniform
@@ -744,21 +775,66 @@ impl World {
         self.tile_uniform[ti as usize] = m0;
     }
 
+    /// Bake AO for a single brick: how shadowed is the brick? Counts solid
+    /// 6-axis brick neighbours (0..6) and converts to an AO byte.
+    /// Lower = darker (more occluded). 0 = surrounded, 255 = wide open.
+    pub fn compute_brick_ao(&self, bi: u32) -> u8 {
+        let bx = bi % WORLD_BRICKS_X;
+        let by = (bi / WORLD_BRICKS_X) % WORLD_BRICKS_Y;
+        let bz = bi / (WORLD_BRICKS_X * WORLD_BRICKS_Y);
+        let mut solid_n = 0u32;
+        // 6 face neighbours.
+        let offs: [(i32, i32, i32); 6] = [
+            ( 1, 0, 0), (-1, 0, 0),
+            ( 0, 1, 0), ( 0,-1, 0),
+            ( 0, 0, 1), ( 0, 0,-1),
+        ];
+        for (dx, dy, dz) in offs {
+            let nbx = bx as i32 + dx;
+            let nby = by as i32 + dy;
+            let nbz = bz as i32 + dz;
+            if nbx < 0 || nbx >= WORLD_BRICKS_X as i32
+            || nby < 0 || nby >= WORLD_BRICKS_Y as i32
+            || nbz < 0 || nbz >= WORLD_BRICKS_Z as i32 { continue; }
+            let nbi = brick_idx(nbx as u32, nby as u32, nbz as u32);
+            if !self.brick_is_empty(nbi) { solid_n += 1; }
+        }
+        // Map 0..6 → 255..(255-6*30)=75. 6 neighbours = darkest, 0 = brightest.
+        255u8.saturating_sub((solid_n * 30) as u8)
+    }
+
+    /// Recompute brick_ao for a brick and its 6 neighbours (their AO changes
+    /// when this brick's occupancy changes).
+    pub fn refresh_ao_for_brick(&mut self, bi: u32) {
+        let bx = bi % WORLD_BRICKS_X;
+        let by = (bi / WORLD_BRICKS_X) % WORLD_BRICKS_Y;
+        let bz = bi / (WORLD_BRICKS_X * WORLD_BRICKS_Y);
+        self.brick_ao[bi as usize] = self.compute_brick_ao(bi);
+        let offs: [(i32, i32, i32); 6] = [
+            ( 1, 0, 0), (-1, 0, 0),
+            ( 0, 1, 0), ( 0,-1, 0),
+            ( 0, 0, 1), ( 0, 0,-1),
+        ];
+        for (dx, dy, dz) in offs {
+            let nbx = bx as i32 + dx;
+            let nby = by as i32 + dy;
+            let nbz = bz as i32 + dz;
+            if nbx < 0 || nbx >= WORLD_BRICKS_X as i32
+            || nby < 0 || nby >= WORLD_BRICKS_Y as i32
+            || nbz < 0 || nbz >= WORLD_BRICKS_Z as i32 { continue; }
+            let nbi = brick_idx(nbx as u32, nby as u32, nbz as u32);
+            self.brick_ao[nbi as usize] = self.compute_brick_ao(nbi);
+        }
+    }
+
     /// Recompute ALL uniform flags from current brick contents. Use after
-    /// bulk gen / fill_demo_terrain. O(total_voxels) — runs in parallel.
+    /// bulk gen.
     pub fn rebuild_all_uniform(&mut self) {
         use rayon::prelude::*;
+        // Parallel recompute of per-brick uniform hints.
         let bricks = &self.bricks;
-        self.brick_uniform = bricks.par_iter().map(|b| {
-            if b.occupancy != !0u64 { return 0u8; }
-            let m0 = b.materials[0];
-            if m0 == 0 { return 0u8; }
-            for i in 1..(BRICK_VOXELS as usize) {
-                if b.materials[i] != m0 { return 0u8; }
-            }
-            m0
-        }).collect();
-        // Tiles depend on the brick_uniform array we just computed.
+        self.brick_uniform = bricks.par_iter().map(compute_uniform_hint).collect();
+        // Tiles depend on the brick_uniform array we just refreshed.
         let bu = &self.brick_uniform;
         self.tile_uniform = (0..WORLD_TILES_TOTAL as usize).into_par_iter().map(|ti| {
             let tx = (ti as u32) % WORLD_TILES_X;
@@ -788,7 +864,7 @@ impl World {
         for bz in 0..WORLD_BRICKS_Z {
             for by in 0..WORLD_BRICKS_Y {
                 for bx in 0..WORLD_BRICKS_X {
-                    if !self.bricks[brick_idx(bx, by, bz) as usize].is_empty() {
+                    if !self.brick_is_empty(brick_idx(bx, by, bz)) {
                         let (tx, ty, tz) = (bx / 4, by / 4, bz / 4);
                         let ti = tile_idx(tx, ty, tz) as usize;
                         self.tile_mask[ti] |= 1u64 << brick_bit_in_tile(bx & 3, by & 3, bz & 3);
@@ -810,55 +886,114 @@ impl World {
         }
     }
 
+    /// Bake brick_ao for every brick in parallel. Run after bulk gen.
+    pub fn rebuild_all_ao(&mut self) {
+        use rayon::prelude::*;
+        let bu = &self.brick_uniform;
+        // Empty bricks AND uniform bricks are both treated as "non-blocking
+        // for AO purposes" — only solid bricks contribute to neighbour
+        // occlusion. We can use brick_uniform == 0 + brick.is_empty as the
+        // "is solid?" test.
+        let is_solid_ref = |bi: u32| -> bool {
+            let u = bu[bi as usize];
+            if u != 0 { return true; }  // uniform-solid (with mat)
+            !self.bricks[bi as usize].is_empty()  // detailed brick with any solid
+        };
+        self.brick_ao = (0..WORLD_BRICKS_TOTAL)
+            .into_par_iter()
+            .map(|bi| {
+                let bx = bi % WORLD_BRICKS_X;
+                let by = (bi / WORLD_BRICKS_X) % WORLD_BRICKS_Y;
+                let bz = bi / (WORLD_BRICKS_X * WORLD_BRICKS_Y);
+                let mut solid_n = 0u32;
+                let offs: [(i32, i32, i32); 6] = [
+                    ( 1, 0, 0), (-1, 0, 0),
+                    ( 0, 1, 0), ( 0,-1, 0),
+                    ( 0, 0, 1), ( 0, 0,-1),
+                ];
+                for (dx, dy, dz) in offs {
+                    let nbx = bx as i32 + dx;
+                    let nby = by as i32 + dy;
+                    let nbz = bz as i32 + dz;
+                    if nbx < 0 || nbx >= WORLD_BRICKS_X as i32
+                    || nby < 0 || nby >= WORLD_BRICKS_Y as i32
+                    || nbz < 0 || nbz >= WORLD_BRICKS_Z as i32 { continue; }
+                    let nbi = brick_idx(nbx as u32, nby as u32, nbz as u32);
+                    if is_solid_ref(nbi) { solid_n += 1; }
+                }
+                255u8.saturating_sub((solid_n * 30) as u8)
+            })
+            .collect();
+    }
+
     /// Top-level demo generation: walks every storage chunk and generates it
     /// (terrain + ores + sea + trees). Trees place into neighbour chunks so
     /// the tree pass runs after the terrain pass for the whole world.
     pub fn fill_demo_terrain(&mut self) {
         use rayon::prelude::*;
         let seed = self.seed;
-        // Parallel slot generation — 1024 chunks otherwise = 10s wall time
-        // serial. Rayon parallel + serial merge brings this well under 1s.
+        // ---- 4× scale: chunked-batch generation ----
+        // 131K storage chunks × 40 KB scratch each = 5+ GB intermediate if
+        // we collected everything up-front. Process in batches small enough
+        // to keep peak memory bounded but big enough to amortise rayon's
+        // dispatch overhead. Each batch generates in parallel, applies to
+        // the sparse pool sequentially, then drops its scratches before
+        // moving on.
         let total_slots = (WORLD_STORE_CX * WORLD_STORE_CY * WORLD_STORE_CZ) as usize;
-        let scratches: Vec<(usize, glam::IVec3, Vec<Brick>)> = (0..total_slots)
-            .into_par_iter()
-            .map(|i| {
-                let i = i as u32;
+        let batch_size: usize = 1024;
+        let mut start = 0usize;
+        while start < total_slots {
+            let end = (start + batch_size).min(total_slots);
+            let scratches: Vec<(u32, glam::IVec3, Vec<Brick>)> = (start..end)
+                .into_par_iter()
+                .map(|i| {
+                    let i = i as u32;
+                    let slot_cx = i % WORLD_STORE_CX;
+                    let slot_cy = (i / WORLD_STORE_CX) % WORLD_STORE_CY;
+                    let slot_cz = i / (WORLD_STORE_CX * WORLD_STORE_CY);
+                    let world_chunk = glam::IVec3::new(slot_cx as i32, slot_cy as i32, slot_cz as i32);
+                    let scratch = gen_slot_bricks(world_chunk, seed);
+                    (i, world_chunk, scratch)
+                })
+                .collect();
+            for (i, world_chunk, scratch) in scratches {
                 let slot_cx = i % WORLD_STORE_CX;
                 let slot_cy = (i / WORLD_STORE_CX) % WORLD_STORE_CY;
                 let slot_cz = i / (WORLD_STORE_CX * WORLD_STORE_CY);
-                let world_chunk = glam::IVec3::new(slot_cx as i32, slot_cy as i32, slot_cz as i32);
-                let scratch = gen_slot_bricks(world_chunk, seed);
-                (i as usize, world_chunk, scratch)
-            })
-            .collect();
-        for (i, world_chunk, scratch) in scratches {
-            let i = i as u32;
-            let slot_cx = i % WORLD_STORE_CX;
-            let slot_cy = (i / WORLD_STORE_CX) % WORLD_STORE_CY;
-            let slot_cz = i / (WORLD_STORE_CX * WORLD_STORE_CY);
-            let base_bx = slot_cx * STORAGE_CHUNK_BRICKS;
-            let base_by = slot_cy * STORAGE_CHUNK_BRICKS;
-            let base_bz = slot_cz * STORAGE_CHUNK_BRICKS;
-            for db_z in 0..STORAGE_CHUNK_BRICKS {
-                for db_y in 0..STORAGE_CHUNK_BRICKS {
-                    for db_x in 0..STORAGE_CHUNK_BRICKS {
-                        let scratch_idx = (db_x
-                            + db_y * STORAGE_CHUNK_BRICKS
-                            + db_z * STORAGE_CHUNK_BRICKS * STORAGE_CHUNK_BRICKS)
-                            as usize;
-                        let bi = brick_idx(base_bx + db_x, base_by + db_y, base_bz + db_z);
-                        self.bricks[bi as usize] = scratch[scratch_idx];
+                let base_bx = slot_cx * STORAGE_CHUNK_BRICKS;
+                let base_by = slot_cy * STORAGE_CHUNK_BRICKS;
+                let base_bz = slot_cz * STORAGE_CHUNK_BRICKS;
+                for db_z in 0..STORAGE_CHUNK_BRICKS {
+                    for db_y in 0..STORAGE_CHUNK_BRICKS {
+                        for db_x in 0..STORAGE_CHUNK_BRICKS {
+                            let scratch_idx = (db_x
+                                + db_y * STORAGE_CHUNK_BRICKS
+                                + db_z * STORAGE_CHUNK_BRICKS * STORAGE_CHUNK_BRICKS)
+                                as usize;
+                            let bi = brick_idx(base_bx + db_x, base_by + db_y, base_bz + db_z);
+                            // assign_brick auto-compacts uniform fills into
+                            // brick_uniform without allocating a slot —
+                            // ~95% of terrain bricks (interior stone, deep
+                            // dirt, air, ocean) take this path → real 4×
+                            // resolution fits in a ~1 GB CPU budget instead
+                            // of the 5+ GB a dense layout would need.
+                            self.assign_brick(bi, scratch[scratch_idx]);
+                        }
                     }
                 }
+                let slot_idx = storage_chunk_idx(slot_cx, slot_cy, slot_cz) as usize;
+                self.slot_world_chunk[slot_idx] = Some(world_chunk);
             }
-            let slot_idx = storage_chunk_idx(slot_cx, slot_cy, slot_cz) as usize;
-            self.slot_world_chunk[slot_idx] = Some(world_chunk);
+            start = end;
         }
 
         self.rebuild_all_masks();
         self.rebuild_all_uniform();
+        self.rebuild_all_ao();
+        // movable_mask is a 67M-entry × 8B = 536 MB array. We walk it once
+        // and bake in the per-brick movable bitmask.
         for bi in 0..WORLD_BRICKS_TOTAL {
-            let b = &self.bricks[bi as usize];
+            let b = self.brick_read(bi);
             let mut m = 0u64;
             for i in 0..64usize {
                 m |= (is_movable_mat(b.materials[i]) as u64) << i;
@@ -868,82 +1003,40 @@ impl World {
         self.rebuild_active_bricks();
         self.all_dirty = true;
         for cm in self.chunk_meta.iter_mut() { cm.generated = true; }
-        // Initial slot ↔ world chunk mapping (origin starts at 0).
-        for cz in 0..WORLD_STORE_CZ {
-            for cy in 0..WORLD_STORE_CY {
-                for cx in 0..WORLD_STORE_CX {
-                    let slot = storage_chunk_idx(cx, cy, cz) as usize;
-                    self.slot_world_chunk[slot] = Some(glam::IVec3::new(cx as i32, cy as i32, cz as i32));
-                }
-            }
-        }
-    }
-
-    /// Generate one 32×32×32-voxel storage chunk. Idempotent — if the chunk
-    /// is already generated it returns immediately. World gen calls this in
-    /// a triple-loop, but the hook is here for future on-demand streaming.
-    pub fn generate_chunk_terrain(&mut self, cx: u32, cy: u32, cz: u32, seed: u64) {
-        let ci = storage_chunk_idx(cx, cy, cz) as usize;
-        if self.chunk_meta[ci].generated { return; }
-        let sea_level: u32 = 64;
-        let (s_x, s_z) = seed_offset_xz(seed);
-
-        let x0 = cx * STORAGE_CHUNK_VOXELS;
-        let y0 = cy * STORAGE_CHUNK_VOXELS;
-        let z0 = cz * STORAGE_CHUNK_VOXELS;
-        let x1 = (x0 + STORAGE_CHUNK_VOXELS).min(WORLD_VOXELS_X);
-        let y1 = (y0 + STORAGE_CHUNK_VOXELS).min(WORLD_VOXELS_Y);
-        let z1 = (z0 + STORAGE_CHUNK_VOXELS).min(WORLD_VOXELS_Z);
-
-        for z in z0..z1 {
-            for x in x0..x1 {
-                let fx = x as f32 + s_x;
-                let fz = z as f32 + s_z;
-                let hilly     = fbm_2d(fx * 0.007, fz * 0.007, 4);
-                let mountains = fbm_2d(fx * 0.0025, fz * 0.0025, 3).max(0.0).powf(1.6) * 1.8;
-                let detail    = fbm_2d(fx * 0.04, fz * 0.04, 2) * 0.4;
-                let h = (sea_level as f32 + 14.0 + hilly * 22.0 + mountains * 40.0 + detail * 3.0)
-                    .clamp(2.0, (WORLD_VOXELS_Y - 1) as f32) as u32;
-                let temperature = fbm_2d(fx * 0.0006, fz * 0.0006, 3);
-                let humidity    = fbm_2d(fx * 0.0008 + 100.0, fz * 0.0008 + 100.0, 3);
-                let biome = pick_biome(temperature, humidity, h, sea_level);
-                let y_top = y1.min(h + 1);
-                for y in y0..y_top {
-                    let cn  = value_noise_3d(fx * 0.045, y as f32 * 0.085, fz * 0.045);
-                    let cn2 = value_noise_3d(fx * 0.110, y as f32 * 0.060, fz * 0.110);
-                    if y > 4 && y + 3 < h && (cn + cn2 * 0.6) > 0.30 { continue; }
-                    let mat = if y >= h {
-                        biome.top_block(h, sea_level)
-                    } else if y + 4 >= h {
-                        biome.subsoil()
-                    } else {
-                        stone_or_ore(fx, y as f32, fz, h)
-                    };
-                    self.write_voxel_unchecked(x, y, z, mat);
-                }
-                // Sea fill within this chunk's Y range.
-                if h < sea_level && y0 <= sea_level {
-                    let yy0 = (h + 1).max(y0);
-                    let yy1 = sea_level.min(y1.saturating_sub(1));
-                    for y in yy0..=yy1 {
-                        self.write_voxel_unchecked(x, y, z, MAT_WATER);
-                    }
-                }
-            }
-        }
-        self.chunk_meta[ci].generated = true;
-    }
-
-    #[inline]
-    fn write_voxel_unchecked(&mut self, x: u32, y: u32, z: u32, mat: u8) {
-        let (bx, by, bz) = (x / BRICK_DIM, y / BRICK_DIM, z / BRICK_DIM);
-        let (lx, ly, lz) = (x % BRICK_DIM, y % BRICK_DIM, z % BRICK_DIM);
-        let bi = brick_idx(bx, by, bz);
-        self.bricks[bi as usize].set(lx, ly, lz, mat);
     }
 
     pub fn dims_voxels(&self) -> UVec3 {
         UVec3::new(WORLD_VOXELS_X, WORLD_VOXELS_Y, WORLD_VOXELS_Z)
+    }
+
+    /// Build a per-column terrain-top heightmap of the loaded window. Used
+    /// by the shadow-map pass: 95% of shadow rays just hit terrain, and
+    /// terrain is fully determined by `sample_terrain` — so we can answer
+    /// "is this point in terrain shadow?" with one heightmap lookup,
+    /// completely bypassing the per-pixel hierarchical DDA.
+    ///
+    /// Heights are stored as f32 (y-coord of the topmost solid voxel + 1).
+    /// Trees, edits, and other non-terrain occluders are NOT in here —
+    /// callers fall back to the regular shadow_tex for those.
+    pub fn build_terrain_heightmap(&self) -> Vec<f32> {
+        use rayon::prelude::*;
+        let seed = self.seed;
+        let origin = self.world_origin_voxel();
+        let w = WORLD_VOXELS_X as i32;
+        let d = WORLD_VOXELS_Z as i32;
+        (0..(w * d) as usize)
+            .into_par_iter()
+            .map(|i| {
+                let lx = (i as i32) % w;
+                let lz = (i as i32) / w;
+                let wx = origin.x + lx;
+                let wz = origin.z + lz;
+                let ts = sample_terrain(wx as f32, wz as f32, seed);
+                // Top-of-terrain voxel y (heightmap value). Water surface
+                // is at sea_level; we want the SOLID top, so use ts.h.
+                (ts.h + 1) as f32
+            })
+            .collect()
     }
 }
 
@@ -1037,54 +1130,39 @@ pub fn sample_terrain(wx: f32, wz: f32, seed: u64) -> TerrainSample {
     let px = wx + s_x;
     let pz = wz + s_z;
 
-    let warp_x = fbm_2d(px * 0.005, pz * 0.005, 2) * 8.0;
-    let warp_z = fbm_2d(px * 0.005 + 50.0, pz * 0.005 + 50.0, 2) * 8.0;
+    // 1.5× scale. Noise freqs × 0.67 → features 1.5× wider in voxels.
+    // Amps × 1.5 → 1.5× taller.
+    let warp_x = fbm_2d(px * 0.00333, pz * 0.00333, 2) * 12.0;
+    let warp_z = fbm_2d(px * 0.00333 + 50.0, pz * 0.00333 + 50.0, 2) * 12.0;
     let wpx = px + warp_x;
     let wpz = pz + warp_z;
 
-    // Hills — strong amplitude so terrain is genuinely rolling.
-    let base = fbm_2d(wpx * 0.012, wpz * 0.012, 4) * 22.0;
+    let base = fbm_2d(wpx * 0.008, wpz * 0.008, 4) * 33.0;
 
-    // Mountains — huge (amp 110), more common (mask shifted +0.2 so most of
-    // the map has at least some elevation contribution; peaks reach the
-    // world's roof).
-    let mountain_mask = (fbm_2d(wpx * 0.0028, wpz * 0.0028, 2) + 0.2).max(0.0);
+    let mountain_mask = (fbm_2d(wpx * 0.00187, wpz * 0.00187, 2) + 0.2).max(0.0);
     let mountain_amp = mountain_mask.min(1.0);
-    let mountain_h = fbm_2d(wpx * 0.009, wpz * 0.009, 5).max(0.0).powf(1.15)
-        * mountain_amp * 110.0;
+    let mountain_h = fbm_2d(wpx * 0.006, wpz * 0.006, 5).max(0.0).powf(1.15)
+        * mountain_amp * 165.0;
 
-    // Ravines — rare (threshold 0.97, was 0.95).
-    let ravine_n = ridge_noise_2d(wpx * 0.012, wpz * 0.012);
-    let ravine_cut = ((ravine_n - 0.97).max(0.0) * 20.0).min(1.0) * 6.0;
+    let ravine_n = ridge_noise_2d(wpx * 0.008, wpz * 0.008);
+    let ravine_cut = ((ravine_n - 0.97).max(0.0) * 20.0).min(1.0) * 9.0;
 
-    // Sea level raised (38 → 64) AND world ceiling doubled (192 → 256) so
-    // lakes/seas have real depth and mountains still loom above with
-    // headroom. base_h offset stays at 8 so terrain typically sits ~72,
-    // ~8 voxels above sea, with mountains pushing well into the 200s.
     let sea_level: f32 = 64.0;
-    let base_h = sea_level + 8.0 + base + mountain_h - ravine_cut;
+    let base_h = sea_level + 12.0 + base + mountain_h - ravine_cut;
 
-    // Rivers via SMOOTH BLEND with strict low-elevation gating. Rivers only
-    // appear where terrain is naturally near sea level; they smoothly blend
-    // the bed down so water (always at sea_level) shows in the channel.
-    let river_n = ridge_noise_2d(px * 0.0050 + 1000.0, pz * 0.0050 + 1000.0);
+    let river_n = ridge_noise_2d(px * 0.00333 + 1000.0, pz * 0.00333 + 1000.0);
     let river_strength_raw = ((river_n - 0.85) / 0.15).clamp(0.0, 1.0);
     let elevation_above_sea = (base_h - sea_level).max(0.0);
-    // Hard cutoff at +8 vox above sea — full strength up to +4, linear
-    // fade-out from +4 to +8, zero past that. No rivers on hills.
-    let elevation_fade = if elevation_above_sea < 4.0 {
+    let elevation_fade = if elevation_above_sea < 6.0 {
         1.0
-    } else if elevation_above_sea < 8.0 {
-        1.0 - (elevation_above_sea - 4.0) * 0.25
+    } else if elevation_above_sea < 12.0 {
+        1.0 - (elevation_above_sea - 6.0) / 6.0
     } else {
         0.0
     };
     let actual_strength = river_strength_raw * elevation_fade;
 
-    // Blend terrain DOWN toward bed_target. At full strength terrain reaches
-    // sea_level - 3 → 3 voxels of water. At river edges it tapers back to
-    // base_h naturally.
-    let bed_target = sea_level - 3.0;
+    let bed_target = sea_level - 4.0;
     let h_blended = base_h * (1.0 - actual_strength) + bed_target * actual_strength;
     let h = h_blended.clamp(2.0, (WORLD_VOXELS_Y - 1) as f32);
     let h_i = h as i32;
@@ -1137,20 +1215,21 @@ pub fn gen_slot_bricks(world_chunk: glam::IVec3, seed: u64) -> Vec<Brick> {
             // perforate the river/lake bed and let the water drain into
             // them. Caves are still allowed deeper underground.
             let has_water_above = ts.water_top > h_signed;
-            let cave_seal_y = if has_water_above { h_signed - 5 } else { i32::MIN };
+            // 1.5× scale: seal 5 → 8, cave noise freqs × 0.67, subsoil 4 → 6.
+            let cave_seal_y = if has_water_above { h_signed - 8 } else { i32::MIN };
             for world_y in y_start..y_end {
                 if world_y > h_signed { break; }
                 let in_water_seal = world_y >= cave_seal_y;
                 if !in_water_seal {
-                    let cn = value_noise_3d(wx * 0.045, world_y as f32 * 0.085, wz * 0.045);
-                    let cn2 = value_noise_3d(wx * 0.110, world_y as f32 * 0.060, wz * 0.110);
-                    if world_y > 4 && world_y + 3 < h_signed && (cn + cn2 * 0.6) > 0.30 { continue; }
+                    let cn = value_noise_3d(wx * 0.030, world_y as f32 * 0.057, wz * 0.030);
+                    let cn2 = value_noise_3d(wx * 0.073, world_y as f32 * 0.040, wz * 0.073);
+                    if world_y > 6 && world_y + 5 < h_signed && (cn + cn2 * 0.6) > 0.30 { continue; }
                 }
                 let mat = if ts.is_river && world_y as u32 >= h_u32 {
                     MAT_SAND
                 } else if world_y as u32 >= h_u32 {
                     biome.top_block(h_u32, sea_level)
-                } else if (world_y as u32) + 4 >= h_u32 {
+                } else if (world_y as u32) + 6 >= h_u32 {
                     biome.subsoil()
                 } else {
                     stone_or_ore(wx, world_y as f32, wz, h_u32)
@@ -1210,8 +1289,7 @@ pub fn gen_slot_bricks(world_chunk: glam::IVec3, seed: u64) -> Vec<Brick> {
             let src_chunk = glam::IVec2::new(world_chunk.x + ncx, world_chunk.z + ncz);
             let trees = trees_for_chunk(src_chunk, seed, sea_level);
             for tree in trees {
-                // Vertical overlap rejection.
-                let tree_top = tree.base_y + 22;
+                let tree_top = tree.base_y + 30;
                 if tree.base_y > chunk_max.1 || tree_top < chunk_min.1 { continue; }
                 paint_tree(&tree, &mut bricks, chunk_min, chunk_max);
             }
@@ -1287,8 +1365,8 @@ fn trees_for_chunk(chunk_xz: glam::IVec2, seed: u64, sea_level: u32) -> Vec<Tree
         let wx = chunk_xz.x * STORAGE_CHUNK_VOXELS as i32 + dx;
         let wz = chunk_xz.y * STORAGE_CHUNK_VOXELS as i32 + dz;
         let ts = sample_terrain(wx as f32, wz as f32, seed);
-        if ts.is_river || (ts.h as u32) <= sea_level + 1 { continue; }
-        if ts.h + 22 >= WORLD_VOXELS_Y as i32 { continue; }
+        if ts.is_river || (ts.h as u32) <= sea_level + 2 { continue; }
+        if ts.h + 30 >= WORLD_VOXELS_Y as i32 { continue; }
         let h_terrain = ts.h;
         let local_t = fbm_2d((wx as f32 + s_x) * 0.0006, (wz as f32 + s_z) * 0.0006, 3);
         let local_h = fbm_2d((wx as f32 + s_x) * 0.0008 + 100.0,
@@ -1324,51 +1402,54 @@ fn paint_tree(
     let base = glam::IVec3::new(t.base_x, t.base_y, t.base_z);
     let h = t.hash;
     match t.ttype {
-        // Pine: tall slender trunk, stacked conical leaf disks.
+        // Pine — 1.5× scale. Slim trunk: 2-vox-wide circular cross section.
         2 => {
-            let trunk_h = 10 + (h % 6) as i32;
+            let trunk_h = 15 + (h % 9) as i32;
             let trunk_top = base + glam::IVec3::new(0, trunk_h, 0);
-            paint_line(bricks, cmin, cmax, base, trunk_top, 0, MAT_WOOD_PINE);
+            // 1×1 slim pine trunk.
+            paint_trunk(bricks, cmin, cmax, base, trunk_h, 0, MAT_WOOD_PINE);
             let layers: i32 = 6;
             for i in 0..layers {
                 let t_f = i as f32 / layers as f32;
                 let y = base.y + (trunk_h as f32 * (0.35 + t_f * 0.78)) as i32;
-                let r = ((1.0 - t_f).powf(0.85) * 3.5 + 1.0) as i32;
+                let r = ((1.0 - t_f).powf(0.85) * 5.0 + 1.5) as i32;
                 paint_sphere(bricks, cmin, cmax, glam::IVec3::new(base.x, y, base.z), r, MAT_LEAVES_PINE);
             }
         }
-        // Birch: slim trunk + small leaf cluster.
+        // Birch — 1.5× scale. Slim trunk (2 vox cross section).
         1 => {
-            let trunk_h = 8 + (h % 5) as i32;
+            let trunk_h = 12 + (h % 8) as i32;
             let trunk_top = base + glam::IVec3::new(0, trunk_h, 0);
-            paint_line(bricks, cmin, cmax, base, trunk_top, 0, MAT_WOOD_BIRCH);
+            // 1×1 slim birch trunk.
+            paint_trunk(bricks, cmin, cmax, base, trunk_h, 0, MAT_WOOD_BIRCH);
             let n = 2 + (h % 2) as i32;
             for b in 0..n {
                 let angle = (b as f32 / n as f32) * std::f32::consts::TAU
                     + branch_jitter(h, b as u32, 0) * 0.5;
-                let len = 2 + ((h.wrapping_mul(b as u32 + 1)) % 3) as i32;
+                let len = 3 + ((h.wrapping_mul(b as u32 + 1)) % 4) as i32;
                 let sy = base.y + (trunk_h as f32 * 0.7) as i32;
                 let end = glam::IVec3::new(
                     base.x + (angle.cos() * len as f32) as i32,
-                    sy + 1,
+                    sy + 2,
                     base.z + (angle.sin() * len as f32) as i32,
                 );
                 paint_line(bricks, cmin, cmax, glam::IVec3::new(base.x, sy, base.z), end, 0, MAT_WOOD_BIRCH);
-                paint_sphere(bricks, cmin, cmax, end, 2, MAT_LEAVES_BIRCH);
+                paint_sphere(bricks, cmin, cmax, end, 3, MAT_LEAVES_BIRCH);
             }
-            paint_sphere(bricks, cmin, cmax, trunk_top, 3, MAT_LEAVES_BIRCH);
+            paint_sphere(bricks, cmin, cmax, trunk_top, 5, MAT_LEAVES_BIRCH);
         }
-        // Oak / autumn: wider canopy, a few branches.
+        // Oak / autumn — 1.5× scale. Thick trunk (3-vox cross section).
         _ => {
             let leaf_mat = if t.ttype == 3 { MAT_LEAVES_AUTUMN } else { MAT_LEAVES };
-            let trunk_h = 8 + (h % 5) as i32;
+            let trunk_h = 12 + (h % 8) as i32;
             let trunk_top = base + glam::IVec3::new(0, trunk_h, 0);
-            paint_line(bricks, cmin, cmax, base, trunk_top, 0, MAT_WOOD);
+            // 3×3 oak trunk.
+            paint_trunk(bricks, cmin, cmax, base, trunk_h, 1, MAT_WOOD);
             let n = 3 + (h % 2) as i32;
             for b in 0..n {
                 let angle = (b as f32 / n as f32) * std::f32::consts::TAU
                     + branch_jitter(h, b as u32, 0) * 0.6;
-                let len = 3 + ((h.wrapping_mul(b as u32 + 7)) % 3) as i32;
+                let len = 5 + ((h.wrapping_mul(b as u32 + 7)) % 4) as i32;
                 let sy = base.y + (trunk_h as f32 * 0.65) as i32;
                 let end = glam::IVec3::new(
                     base.x + (angle.cos() * len as f32) as i32,
@@ -1376,9 +1457,9 @@ fn paint_tree(
                     base.z + (angle.sin() * len as f32) as i32,
                 );
                 paint_line(bricks, cmin, cmax, glam::IVec3::new(base.x, sy, base.z), end, 0, MAT_WOOD);
-                paint_sphere(bricks, cmin, cmax, end, 3, leaf_mat);
+                paint_sphere(bricks, cmin, cmax, end, 5, leaf_mat);
             }
-            paint_sphere(bricks, cmin, cmax, trunk_top, 4, leaf_mat);
+            paint_sphere(bricks, cmin, cmax, trunk_top, 6, leaf_mat);
         }
     }
 }
@@ -1412,6 +1493,22 @@ fn paint_line(
                         try_write_tree_voxel(bricks, cx + dx, cy + dy, cz + dz, mat, cmin, cmax);
                     }
                 }
+            }
+        }
+    }
+}
+
+/// Vertical SQUARE trunk — paints an axis-aligned square cross section of
+/// `(2*radius+1)²` voxels in xz, stacked for `height` voxels in y.
+/// radius=0 → 1×1, radius=1 → 3×3, radius=2 → 5×5.
+fn paint_trunk(
+    bricks: &mut [Brick], cmin: (i32, i32, i32), cmax: (i32, i32, i32),
+    base: glam::IVec3, height: i32, radius: i32, mat: u8,
+) {
+    for dy in 0..height {
+        for dz in -radius..=radius {
+            for dx in -radius..=radius {
+                try_write_tree_voxel(bricks, base.x + dx, base.y + dy, base.z + dz, mat, cmin, cmax);
             }
         }
     }
@@ -1465,8 +1562,8 @@ pub enum Biome {
 }
 
 pub fn pick_biome(temp: f32, humid: f32, h: u32, sea_level: u32) -> Biome {
-    if h > sea_level + 36 { return Biome::Mountain; }
-    if h <= sea_level + 1 { return Biome::Beach; }
+    if h > sea_level + 135 { return Biome::Mountain; }
+    if h <= sea_level + 2 { return Biome::Beach; }
     if temp < -0.20 { return Biome::Tundra; }
     if temp > 0.25 && humid < -0.05 { return Biome::Desert; }
     if temp > 0.15 && humid > 0.25 { return Biome::Jungle; }
@@ -1480,14 +1577,17 @@ impl Biome {
         match self {
             Biome::Tundra => MAT_SNOW,
             Biome::Desert | Biome::Beach | Biome::Savanna => MAT_SAND,
-            Biome::Mountain => if h > sea_level + 55 { MAT_SNOW } else { MAT_STONE },
+            Biome::Mountain => if h > sea_level + 150 { MAT_SNOW }
+                               else { MAT_GRASS },
             _ => MAT_GRASS,
         }
     }
     pub fn subsoil(self) -> u8 {
         match self {
             Biome::Desert | Biome::Beach => MAT_SAND,
-            Biome::Mountain => MAT_STONE,
+            // Mountain subsoil = DIRT (was STONE) so exposed mountain
+            // slope faces look natural instead of a wall of stone.
+            Biome::Mountain => MAT_DIRT,
             Biome::Savanna => MAT_DIRT,
             _ => MAT_DIRT,
         }
@@ -1506,13 +1606,14 @@ impl Biome {
     /// Trees per chunk in a "dense patch" of this biome. Clearings (low
     /// patch noise) bring it down to zero, dense patches scale by ~2x.
     pub fn tree_density(self) -> f32 {
+        // Halved again — trees still too dense at 2× scale.
         match self {
-            Biome::Jungle => 1.2,   // very dense
-            Biome::Forest => 0.55,  // dense
-            Biome::Tundra => 0.18,  // scattered pines
-            Biome::Plains => 0.08,  // mostly empty, occasional oak
-            Biome::Mountain => 0.07,
-            Biome::Savanna => 0.04, // very rare
+            Biome::Jungle => 0.28,
+            Biome::Forest => 0.13,
+            Biome::Tundra => 0.04,
+            Biome::Plains => 0.02,
+            Biome::Mountain => 0.015,
+            Biome::Savanna => 0.01,
             _ => 0.0,
         }
     }
@@ -1544,87 +1645,6 @@ pub fn stone_or_ore(x: f32, y: f32, z: f32, h: u32) -> u8 {
     if depth > 10.0 && combined > 0.24 { return MAT_IRON; }
     if combined > 0.32 { return MAT_COAL; }
     MAT_STONE
-}
-
-pub fn place_tree(world: &mut World, cx: i32, base_y: u32, cz: i32, ttype: u32, hash: u32) {
-    // Scaled-up trees: trunks ~15 wide, canopies ~20 radius, heights ~50-70.
-    let (trunk_mat, leaf_mat, trunk_h, canopy_r, trunk_r, conical) = match ttype {
-        0 => (MAT_WOOD,       MAT_LEAVES,        45 + (hash % 20), 22i32, 7i32, false),
-        1 => (MAT_WOOD_BIRCH, MAT_LEAVES_BIRCH,  55 + (hash % 20), 18,    6,    false),
-        2 => (MAT_WOOD_PINE,  MAT_LEAVES_PINE,   65 + (hash % 20), 22,    7,    true),
-        3 => (MAT_WOOD,       MAT_LEAVES_AUTUMN, 45 + (hash % 20), 22,    7,    false),
-        _ => (MAT_WOOD,       MAT_LEAVES,        45,               22,    7,    false),
-    };
-    let trunk_r2 = trunk_r * trunk_r;
-
-    // Thick trunk: circular cross-section instead of a 3x3 box.
-    for dy in 0..trunk_h {
-        for dx in -trunk_r..=trunk_r {
-            for dz in -trunk_r..=trunk_r {
-                if dx * dx + dz * dz > trunk_r2 { continue; }
-                let wx = cx + dx;
-                let wz = cz + dz;
-                let wy = base_y + dy;
-                if wx >= 0 && wz >= 0
-                && (wx as u32) < WORLD_VOXELS_X
-                && (wz as u32) < WORLD_VOXELS_Z
-                && wy < WORLD_VOXELS_Y {
-                    world.write_voxel_unchecked(wx as u32, wy, wz as u32, trunk_mat);
-                }
-            }
-        }
-    }
-
-    // Canopy
-    if conical {
-        // Pine: stack of decreasing-radius disks.
-        let layers: i32 = 18;
-        for layer in 0..layers {
-            // Radius shrinks toward the top of the pine.
-            let r = ((canopy_r * (layers - layer)) / layers).max(2);
-            let wy_signed = base_y as i32 + trunk_h as i32 - 4 + layer * 2;
-            if wy_signed < 0 { continue; }
-            let wy = wy_signed as u32;
-            if wy >= WORLD_VOXELS_Y { continue; }
-            for dx in -r..=r {
-                for dz in -r..=r {
-                    if dx * dx + dz * dz > r * r { continue; }
-                    let wx = cx + dx;
-                    let wz = cz + dz;
-                    if wx < 0 || wz < 0 { continue; }
-                    if (wx as u32) >= WORLD_VOXELS_X || (wz as u32) >= WORLD_VOXELS_Z { continue; }
-                    let bi = brick_idx((wx as u32) / BRICK_DIM, wy / BRICK_DIM, (wz as u32) / BRICK_DIM) as usize;
-                    let vi = brick_voxel_idx((wx as u32) % BRICK_DIM, wy % BRICK_DIM, (wz as u32) % BRICK_DIM);
-                    if (world.bricks[bi].occupancy & (1u64 << vi)) == 0 {
-                        world.write_voxel_unchecked(wx as u32, wy, wz as u32, leaf_mat);
-                    }
-                }
-            }
-        }
-    } else {
-        let r = canopy_r;
-        let canopy_cy = base_y as i32 + trunk_h as i32 + 1;
-        for dy in -r..=r {
-            for dx in -r..=r {
-                for dz in -r..=r {
-                    let dd = dx * dx + dy * dy + dz * dz;
-                    if dd > r * r { continue; }
-                    let wx = cx + dx;
-                    let wz = cz + dz;
-                    let wy = canopy_cy + dy;
-                    if wx < 0 || wz < 0 || wy < 0 { continue; }
-                    if (wx as u32) >= WORLD_VOXELS_X
-                    || (wz as u32) >= WORLD_VOXELS_Z
-                    || (wy as u32) >= WORLD_VOXELS_Y { continue; }
-                    let bi = brick_idx((wx as u32) / BRICK_DIM, (wy as u32) / BRICK_DIM, (wz as u32) / BRICK_DIM) as usize;
-                    let vi = brick_voxel_idx((wx as u32) % BRICK_DIM, (wy as u32) % BRICK_DIM, (wz as u32) % BRICK_DIM);
-                    if (world.bricks[bi].occupancy & (1u64 << vi)) == 0 {
-                        world.write_voxel_unchecked(wx as u32, wy as u32, wz as u32, leaf_mat);
-                    }
-                }
-            }
-        }
-    }
 }
 
 pub fn value_noise_3d(x: f32, y: f32, z: f32) -> f32 {

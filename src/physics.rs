@@ -90,7 +90,7 @@ fn settle_sand(world: &mut World, touched: &mut Vec<u32>) {
     }
 }
 
-fn sand_mask(b: &Brick) -> u64 {
+fn sand_mask(b: Brick) -> u64 {
     let mut m = 0u64;
     for i in 0..64usize {
         m |= ((b.materials[i] == MAT_SAND) as u64) << i;
@@ -103,15 +103,16 @@ fn step_brick_sand_fall(world: &mut World, bx: u32, by: u32, bz: u32) {
     if world.movable_mask[bi as usize] == 0 { return; }
 
     // Multi-pass intra-fall so a 4-deep stack of floaters collapses fully
-    // in one tick.
+    // in one tick. Active bricks always have a materialized slot.
     for _ in 0..3 {
-        let occ = world.bricks[bi as usize].occupancy;
-        let sand = sand_mask(&world.bricks[bi as usize]);
+        let snap = world.brick_read(bi);
+        let occ = snap.occupancy;
+        let sand = sand_mask(snap);
         if sand == 0 { break; }
         let empty = !occ;
         let falling = sand & (empty << 16);
         if falling == 0 { break; }
-        let b = &mut world.bricks[bi as usize];
+        let b = world.brick_mut(bi);
         b.occupancy ^= falling | (falling >> 16);
         let mut bits = falling;
         while bits != 0 {
@@ -126,12 +127,13 @@ fn step_brick_sand_fall(world: &mut World, bx: u32, by: u32, bz: u32) {
 
     // Cross-brick fall.
     if by == 0 { return; }
-    let cur_occ = world.bricks[bi as usize].occupancy;
-    let sand = sand_mask(&world.bricks[bi as usize]);
+    let snap = world.brick_read(bi);
+    let cur_occ = snap.occupancy;
+    let sand = sand_mask(snap);
     let bottom_sand = sand & BOTTOM_LAYER;
     if bottom_sand == 0 { return; }
     let below_bi = brick_idx(bx, by - 1, bz);
-    let below_occ = world.bricks[below_bi as usize].occupancy;
+    let below_occ = world.brick_occupancy(below_bi);
     let below_top_empty = !below_occ & TOP_LAYER;
     let cross = bottom_sand & (below_top_empty >> 48);
     if cross == 0 { return; }
@@ -145,17 +147,22 @@ fn step_brick_sand_fall(world: &mut World, bx: u32, by: u32, bz: u32) {
         bits &= bits - 1;
     }
 
-    let b = &mut world.bricks[bi as usize];
-    b.occupancy ^= cross;
-    for k in 0..count { b.materials[moves[k] as usize] = MAT_AIR; }
-    let cur_now_empty = b.occupancy == 0;
+    let cur_now_empty;
+    {
+        let b = world.brick_mut(bi);
+        b.occupancy ^= cross;
+        for k in 0..count { b.materials[moves[k] as usize] = MAT_AIR; }
+        cur_now_empty = b.occupancy == 0;
+    }
     world.movable_mask[bi as usize] &= !cross;
 
     let was_empty = below_occ == 0;
     let was_movable = world.movable_mask[below_bi as usize] != 0;
-    let b2 = &mut world.bricks[below_bi as usize];
-    b2.occupancy |= cross << 48;
-    for k in 0..count { b2.materials[(moves[k] + 48) as usize] = MAT_SAND; }
+    {
+        let b2 = world.brick_mut(below_bi);
+        b2.occupancy |= cross << 48;
+        for k in 0..count { b2.materials[(moves[k] + 48) as usize] = MAT_SAND; }
+    }
     world.movable_mask[below_bi as usize] |= cross << 48;
     if !was_movable {
         if let Err(pos) = world.active_bricks.binary_search(&below_bi) {
@@ -190,8 +197,9 @@ fn step_brick_water(world: &mut World, bi: u32, touched: &mut Vec<u32>) {
     let bx = bi % WORLD_BRICKS_X;
     let by = (bi / WORLD_BRICKS_X) % WORLD_BRICKS_Y;
     let bz = bi / (WORLD_BRICKS_X * WORLD_BRICKS_Y);
-    let snap_occ = world.bricks[bi as usize].occupancy;
-    let snap_mats: [u8; 64] = world.bricks[bi as usize].materials;
+    let snap_brick = world.brick_read(bi);
+    let snap_occ = snap_brick.occupancy;
+    let snap_mats: [u8; 64] = snap_brick.materials;
     let snap_movable = world.movable_mask[bi as usize];
 
     let mut new_occ = snap_occ;
@@ -250,12 +258,13 @@ fn step_brick_water(world: &mut World, bi: u32, touched: &mut Vec<u32>) {
                     let below_bi = brick_idx(bx, by - 1, bz);
                     let below_i_in = (lx + lz * 4 + 3 * 16) as usize;
                     let below_bit = 1u64 << below_i_in;
-                    let nb_occ = world.bricks[below_bi as usize].occupancy;
+                    let nb = world.brick_read(below_bi);
+                    let nb_occ = nb.occupancy;
                     let nb_solid = (nb_occ & below_bit) != 0
-                        && !is_water_mat(world.bricks[below_bi as usize].materials[below_i_in]);
+                        && !is_water_mat(nb.materials[below_i_in]);
                     if nb_solid { continue; }
                     let below_level = if (nb_occ & below_bit) != 0 {
-                        water_level_of(world.bricks[below_bi as usize].materials[below_i_in]) as i32
+                        water_level_of(nb.materials[below_i_in]) as i32
                     } else { 0 };
                     let space = MAX_WATER_LEVEL as i32 - below_level;
                     let transfer = level.min(space);
@@ -329,9 +338,10 @@ fn step_brick_water(world: &mut World, bi: u32, touched: &mut Vec<u32>) {
                     let above_bi = brick_idx(bx, by + 1, bz);
                     let above_i_in = (lx + lz * 4) as usize;
                     let above_bit = 1u64 << above_i_in;
-                    let nb_occ = world.bricks[above_bi as usize].occupancy;
+                    let nb_above = world.brick_read(above_bi);
+                    let nb_occ = nb_above.occupancy;
                     let nb_mat = if (nb_occ & above_bit) != 0 {
-                        world.bricks[above_bi as usize].materials[above_i_in]
+                        nb_above.materials[above_i_in]
                     } else { MAT_AIR };
                     if !is_water_mat(nb_mat) { continue; }
                     let above_level = water_level_of(nb_mat) as i32;
@@ -403,9 +413,10 @@ fn step_brick_water(world: &mut World, bi: u32, touched: &mut Vec<u32>) {
                 let target = (nb_lx + nb_lz * 4 + ly * 16) as usize;
                 let tbit = 1u64 << target;
                 let nb_bi = brick_idx(nbx, by, nbz);
-                let nb_occ = world.bricks[nb_bi as usize].occupancy;
+                let nb_lat = world.brick_read(nb_bi);
+                let nb_occ = nb_lat.occupancy;
                 let occupied = (nb_occ & tbit) != 0;
-                let t_mat = if occupied { world.bricks[nb_bi as usize].materials[target] } else { MAT_AIR };
+                let t_mat = if occupied { nb_lat.materials[target] } else { MAT_AIR };
                 if occupied && !is_water_mat(t_mat) { continue; }
                 let t_level = if occupied { water_level_of(t_mat) as i32 } else { 0 };
                 if remaining > t_level + 1 {
@@ -431,7 +442,7 @@ fn step_brick_water(world: &mut World, bi: u32, touched: &mut Vec<u32>) {
         let was_empty = snap_occ == 0;
         let now_empty = new_occ == 0;
         {
-            let b = &mut world.bricks[bi as usize];
+            let b = world.brick_mut(bi);
             b.occupancy = new_occ;
             b.materials = new_mats;
         }
@@ -445,6 +456,7 @@ fn step_brick_water(world: &mut World, bi: u32, touched: &mut Vec<u32>) {
         if was_empty != now_empty {
             world.refresh_masks_for_brick(bx, by, bz);
         }
+        world.try_compact_brick(bi);
         world.mark_brick_dirty(bi);
         touched.push(bi);
     }
@@ -457,9 +469,10 @@ fn step_brick_smoke(world: &mut World, bi: u32, frame: u64, touched: &mut Vec<u3
     let by = (bi / WORLD_BRICKS_X) % WORLD_BRICKS_Y;
     let bz = bi / (WORLD_BRICKS_X * WORLD_BRICKS_Y);
 
-    let snap_occ = world.bricks[bi as usize].occupancy;
+    let snap_brick = world.brick_read(bi);
+    let snap_occ = snap_brick.occupancy;
     let mut new_occ = snap_occ;
-    let mut new_mats = world.bricks[bi as usize].materials;
+    let mut new_mats = snap_brick.materials;
     let mut new_movable = world.movable_mask[bi as usize];
     let mut any_change = false;
 
@@ -510,12 +523,12 @@ fn step_brick_smoke(world: &mut World, bi: u32, frame: u64, touched: &mut Vec<u3
             let up_bi = brick_idx(bx, by + 1, bz);
             let up_i_in = (lx + lz * 4) as usize;
             let up_bit = 1u64 << up_i_in;
-            let up_occ = world.bricks[up_bi as usize].occupancy;
+            let up_occ = world.brick_occupancy(up_bi);
             if (up_occ & up_bit) == 0 {
                 let nb_was_movable = world.movable_mask[up_bi as usize] != 0;
                 let nb_was_empty = up_occ == 0;
                 {
-                    let nb = &mut world.bricks[up_bi as usize];
+                    let nb = world.brick_mut(up_bi);
                     nb.occupancy |= up_bit;
                     nb.materials[up_i_in] = MAT_SMOKE;
                 }
@@ -562,7 +575,7 @@ fn step_brick_smoke(world: &mut World, bi: u32, frame: u64, touched: &mut Vec<u3
         let was_empty = snap_occ == 0;
         let now_empty = new_occ == 0;
         {
-            let b = &mut world.bricks[bi as usize];
+            let b = world.brick_mut(bi);
             b.occupancy = new_occ;
             b.materials = new_mats;
         }
@@ -575,6 +588,7 @@ fn step_brick_smoke(world: &mut World, bi: u32, frame: u64, touched: &mut Vec<u3
         if was_empty != now_empty {
             world.refresh_masks_for_brick(bx, by, bz);
         }
+        world.try_compact_brick(bi);
         world.mark_brick_dirty(bi);
         touched.push(bi);
     }
@@ -591,10 +605,10 @@ fn cross_apply_water(
     touched: &mut Vec<u32>,
 ) {
     let nb_bit = 1u64 << nb_vi;
-    let nb_was_empty = world.bricks[nb_bi as usize].occupancy == 0;
+    let nb_was_empty = world.brick_occupancy(nb_bi) == 0;
     let nb_was_movable = world.movable_mask[nb_bi as usize] != 0;
     {
-        let b = &mut world.bricks[nb_bi as usize];
+        let b = world.brick_mut(nb_bi);
         if new_level == 0 {
             b.occupancy &= !nb_bit;
             b.materials[nb_vi] = MAT_AIR;
@@ -613,13 +627,14 @@ fn cross_apply_water(
             world.active_bricks.insert(pos, nb_bi);
         }
     }
-    let nb_now_empty = world.bricks[nb_bi as usize].occupancy == 0;
+    let nb_now_empty = world.brick_occupancy(nb_bi) == 0;
     if nb_was_empty != nb_now_empty {
         let nbx = nb_bi % WORLD_BRICKS_X;
         let nby = (nb_bi / WORLD_BRICKS_X) % WORLD_BRICKS_Y;
         let nbz = nb_bi / (WORLD_BRICKS_X * WORLD_BRICKS_Y);
         world.refresh_masks_for_brick(nbx, nby, nbz);
     }
+    world.try_compact_brick(nb_bi);
     world.mark_brick_dirty(nb_bi);
     touched.push(nb_bi);
 }

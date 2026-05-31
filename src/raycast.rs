@@ -71,14 +71,14 @@ pub fn raycast(camera_world: Vec3, dir: Vec3, world: &World, world_origin: IVec3
         let bx = sx / BRICK_DIM;
         let by = sy / BRICK_DIM;
         let bz = sz / BRICK_DIM;
-        let bi = brick_idx(bx, by, bz) as usize;
-        let b = &world.bricks[bi];
-        if b.occupancy == 0 { return false; }
+        let bi = brick_idx(bx, by, bz);
+        let occ = world.brick_occupancy(bi);
+        if occ == 0 { return false; }
         let lx = sx % BRICK_DIM;
         let ly = sy % BRICK_DIM;
         let lz = sz % BRICK_DIM;
         let vi = brick_voxel_idx(lx, ly, lz);
-        (b.occupancy & (1u64 << vi)) != 0
+        (occ & (1u64 << vi)) != 0
     };
 
     let argmin_step = |t_max: &mut [f32; 3], voxel: &mut [i32; 3]| -> i32 {

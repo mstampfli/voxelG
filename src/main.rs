@@ -304,7 +304,13 @@ impl ApplicationHandler for App {
                 // Amortise chunk gen — with rayon-parallel regen each frame
                 // can chew through 16 slots in roughly the same wall-time
                 // that 8 took serially.
-                self.world.process_regen_queue(16);
+                // process_regen_queue is now NON-BLOCKING. The number is
+                // the max concurrent in-flight gen tasks on the rayon
+                // pool (each task runs gen_slot_bricks for one storage
+                // chunk). Main thread keeps rendering at 60+ fps even
+                // when 1000+ chunks are pending — they stream in as they
+                // finish, no frame drops.
+                self.world.process_regen_queue(64);
 
                 // ---- consume queued clicks ----
                 // At this point self.camera is in the EXACT state that's
@@ -370,10 +376,14 @@ impl ApplicationHandler for App {
                 let physics_changed = self.world.all_dirty || !self.world.dirty_bricks.is_empty();
                 let dirty_snap = self.world.dirty_bricks.clone();
                 self.frames_since_full += 1;
-                let force_full = self.first_frame
-                    || self.frames_since_full >= 15
-                    || self.world.all_dirty
-                    || camera_changed;
+                // FORCE FULL EVERY FRAME — diagnostic. The temporal-differential
+                // path was suspected of leaving stale "wrong chunk" pixels when
+                // bricks streamed in without their world-space tiles being
+                // marked dirty. We have 3500+ FPS headroom so just re-trace
+                // everything every frame.
+                let force_full = true;
+                let _ = self.first_frame;
+                let _ = camera_changed;
                 let any_dirty = force_full || physics_changed;
 
                 let (rw, rh) = self.renderer.as_ref().unwrap().size;
@@ -395,7 +405,23 @@ impl ApplicationHandler for App {
                 }
 
                 let renderer = self.renderer.as_mut().unwrap();
-                renderer.upload_world(&mut self.world);
+                // Critical: skip the upload entirely when the world is
+                // unchanged. upload_world currently pushes ~150-350 MB
+                // (whole brick pool + slot table + masks); doing that
+                // every frame saturates PCIe before rendering even starts.
+                // Camera-only moves don't need a world re-upload.
+                if physics_changed {
+                    renderer.upload_world(&mut self.world);
+                }
+                // Re-upload heightmap when origin shifts (shadow-walk
+                // reads it for terrain shadow tests).
+                static mut LAST_ORIGIN: (i32, i32) = (i32::MIN, i32::MIN);
+                let cur = (self.world.world_origin_chunk.x, self.world.world_origin_chunk.y);
+                let origin_shifted = unsafe { LAST_ORIGIN != cur };
+                if origin_shifted {
+                    unsafe { LAST_ORIGIN = cur; }
+                    renderer.upload_heightmap(&self.world);
+                }
                 let t = (now - self.start_time).as_secs_f32();
                 let world_origin_voxel = glam::IVec3::new(
                     self.world.world_origin_chunk.x * voxel::STORAGE_CHUNK_VOXELS as i32,
@@ -412,7 +438,7 @@ impl ApplicationHandler for App {
                 if any_dirty {
                     renderer.upload_tile_dirty(&self.tile_dirty_mask);
                 }
-                match renderer.render(any_dirty) {
+                match renderer.render(any_dirty, physics_changed, world_origin_voxel) {
                     Ok(()) => {}
                     Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
                         let (w, h) = renderer.size;

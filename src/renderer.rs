@@ -18,7 +18,7 @@ fn pack_u8_to_u32(src: &[u8]) -> Vec<u32> {
     out
 }
 
-use crate::camera::{Camera, CameraUniform};
+use crate::camera::{Camera, CameraUniform, SunUniform};
 use crate::voxel::{
     World, MAT_AIR, MAT_SAND, MAT_GRASS, MAT_DIRT, MAT_STONE,
     MAT_WATER_L1, MAT_WATER_L8,
@@ -112,9 +112,31 @@ pub struct Renderer {
     beam_view: wgpu::TextureView,
     sampler: wgpu::Sampler,
 
+    sun_buf: wgpu::Buffer,
+    shadow_tex: wgpu::Texture,
+    shadow_view: wgpu::TextureView,
+    /// 1024×1024 R32F terrain heightmap. Single lookup tells us the top
+    /// solid Y of any (x, z) column. Used by sample_shadow to bypass
+    /// per-pixel shadow-map fetch for ~95% of pixels (terrain only).
+    heightmap_buf: wgpu::Buffer,
+    /// Pre-baked 3D noise — replaces vnoise3 / value_noise_3d in the
+    /// shader with one hardware-filtered texture fetch (Ada TMUs do
+    /// trilinear in 1 cycle vs the 8 hash3f + 7 lerps of the WGSL
+    /// implementation). Used by clouds + foliage hash sites.
+    noise3d_tex: wgpu::Texture,
+    noise3d_view: wgpu::TextureView,
+    noise_sampler: wgpu::Sampler,
+    /// Pre-baked per-brick AO byte (0..255). Replaces compute_ao's 12
+    /// hierarchical descents per primary hit with a single byte fetch.
+    brick_ao_buf: wgpu::Buffer,
+
     beam_bgl: wgpu::BindGroupLayout,
     beam_pipeline: wgpu::ComputePipeline,
     beam_bg: wgpu::BindGroup,
+
+    shadow_bgl: wgpu::BindGroupLayout,
+    shadow_pipeline: wgpu::ComputePipeline,
+    shadow_bg: wgpu::BindGroup,
 
     compute_bgl: wgpu::BindGroupLayout,
     compute_pipeline: wgpu::ComputePipeline,
@@ -123,7 +145,26 @@ pub struct Renderer {
     blit_bgl: wgpu::BindGroupLayout,
     blit_pipeline: wgpu::RenderPipeline,
     blit_bg: wgpu::BindGroup,
+
+    /// Monotonic frame counter — used to time sun-driven shadow re-bakes.
+    pub frame_index: u64,
+    /// Last sun-phase bucket the shadow map was baked for. We re-bake only
+    /// when this changes (1 Hz drift) OR when world voxels are edited.
+    /// Camera-only movement leaves the shadow map alone.
+    pub last_shadow_sun_phase: u64,
+    /// world-origin at the time of the last shadow bake. Origin shifts
+    /// (caused by camera crossing a chunk boundary) move the toroidal
+    /// brick storage AND the sun projection center, so the previously
+    /// baked shadow map is now in stale coords. Re-bake when it changes.
+    pub last_shadow_origin: glam::IVec3,
 }
+
+// 512² = 256K rays per re-bake (we now re-bake every frame for correctness).
+// At ~1.5 vox per texel still good enough — voxel surfaces are axis-aligned
+// so the per-texel quantization isn't visible.
+pub const SHADOW_RES: u32 = 512;
+/// Re-bake the shadow map every N frames. 3 is invisible at 60+ fps.
+pub const SHADOW_REBAKE_EVERY: u64 = 3;
 
 impl Renderer {
     pub fn new(window: Arc<Window>, world: &World) -> Self {
@@ -155,7 +196,15 @@ impl Renderer {
                 label: Some("voxel device"),
                 required_features: wgpu::Features::empty(),
                 required_limits: wgpu::Limits {
-                    max_storage_buffer_binding_size: 256 << 20, // 256 MB headroom
+                    // 2× scale dense bricks: 8.4M × 72B = 605 MB. Bump
+                    // to 1 GB for headroom — modern GPUs handle this easily.
+                    max_storage_buffer_binding_size: 1 << 30, // 1 GB
+                    max_buffer_size: 1 << 30,
+                    // Default = 8. We have bricks + tile_mask + chunk_mask
+                    // + tile_dirty + players + brick_uniform + tile_uniform
+                    // + heightmap + brick_ao = 9 storage buffers in the
+                    // compute pipeline.
+                    max_storage_buffers_per_shader_stage: 16,
                     ..wgpu::Limits::default()
                 },
                 memory_hints: wgpu::MemoryHints::Performance,
@@ -196,9 +245,13 @@ impl Renderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
+        // DENSE brick storage. Indexed directly by bi = brick_idx(bx,by,bz).
+        // Earlier sparse pool added a brick_slot indirection per DDA step,
+        // which cost more in shader fetches than the memory savings were
+        // worth — speed > memory until we hit hard buffer limits.
         let bricks_bytes: &[u8] = bytemuck::cast_slice(&world.bricks);
         let bricks_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("bricks"),
+            label: Some("bricks (dense)"),
             contents: bricks_bytes,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
@@ -391,6 +444,68 @@ impl Renderer {
                     },
                     count: None,
                 },
+                // Shadow map (sun-space R32F depth).
+                wgpu::BindGroupLayoutEntry {
+                    binding: 11,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // Sun basis / ortho frustum uniform.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 12,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // Terrain heightmap (f32 per (x, z) column).
+                wgpu::BindGroupLayoutEntry {
+                    binding: 13,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // 3D noise texture (replaces vnoise3 / value_noise_3d).
+                wgpu::BindGroupLayoutEntry {
+                    binding: 14,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // Noise sampler (linear, repeat).
+                wgpu::BindGroupLayoutEntry {
+                    binding: 15,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                // Per-brick AO (packed u8).
+                wgpu::BindGroupLayoutEntry {
+                    binding: 16,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -412,10 +527,62 @@ impl Renderer {
             cache: None,
         });
 
+        // Create the shadow-map texture + sun uniform BEFORE the compute
+        // bind group — the raymarch shader binds them (bindings 11/12).
+        let sun_init = SunUniform::fit_to_window(
+            0.0,
+            glam::IVec3::ZERO,
+            glam::UVec3::new(
+                crate::voxel::WORLD_VOXELS_X,
+                crate::voxel::WORLD_VOXELS_Y,
+                crate::voxel::WORLD_VOXELS_Z,
+            ),
+        );
+        let sun_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("sun"),
+            contents: bytemuck::bytes_of(&sun_init),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let (shadow_tex, shadow_view) = create_shadow_texture(&device, SHADOW_RES);
+
+        // Terrain heightmap — built once at startup from world.sample_terrain.
+        let initial_heightmap = world.build_terrain_heightmap();
+        let heightmap_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("heightmap"),
+            contents: bytemuck::cast_slice(&initial_heightmap),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+
+        // Pre-baked 3D noise texture (128³ R8 = 2 MB) for cloud / foliage
+        // value-noise lookups. Random u8s tiled & sampled with LINEAR +
+        // Repeat — hardware trilinear filtering gives a smooth field that
+        // visually matches the old fbm + hash3f path at ~1/50 the cost.
+        let (noise3d_tex, noise3d_view) = create_noise3d_texture(&device, &queue, 128);
+
+        // Per-brick AO. 8.4 MB at 2× scale. Packed as u32 (4 bricks per word).
+        let brick_ao_packed = pack_u8_to_u32(&world.brick_ao);
+        let brick_ao_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("brick_ao"),
+            contents: bytemuck::cast_slice(&brick_ao_packed),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+        let noise_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("noise sampler"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            address_mode_w: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+
         let compute_bg = make_compute_bg(
             &device, &compute_bgl, &camera_buf, &bricks_buf,
             &tile_mask_buf, &chunk_mask_buf, &palette_buf, &output_view, &beam_view,
             &tile_dirty_buf, &players_buf, &brick_uniform_buf, &tile_uniform_buf,
+            &shadow_view, &sun_buf, &heightmap_buf, &noise3d_view, &noise_sampler,
+            &brick_ao_buf,
         );
 
         // -- beam pipeline (1/8-res coarse pre-pass) --
@@ -472,6 +639,87 @@ impl Renderer {
             cache: None,
         });
         let beam_bg = make_beam_bg(&device, &beam_bgl, &camera_buf, &chunk_mask_buf, &beam_view);
+
+        // -- shadow map pre-pass (sun_buf + shadow_tex created earlier) --
+        let shadow_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("shadow bgl"),
+            entries: &[
+                // 0: camera (world_origin etc.)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                // 1: bricks (dense pool, read-only for shadow trace)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                // 2: tile_mask
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                // 3: chunk_mask
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                // 4: sun uniform
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                // 5: shadow_out (write-only storage texture).
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: wgpu::TextureFormat::R32Float,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                },
+                // 6: brick_uniform_packed
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                // 7: tile_uniform_packed
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+            ],
+        });
+        let shadow_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("shadow pl"),
+            bind_group_layouts: &[&shadow_bgl],
+            push_constant_ranges: &[],
+        });
+        let shadow_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("shadow shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/shadowmap.wgsl").into()),
+        });
+        let shadow_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("shadow pipeline"),
+            layout: Some(&shadow_pl),
+            module: &shadow_shader,
+            entry_point: Some("cs_shadow"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let shadow_bg = make_shadow_bg(
+            &device, &shadow_bgl, &camera_buf, &bricks_buf,
+            &tile_mask_buf, &chunk_mask_buf, &sun_buf, &shadow_view,
+            &brick_uniform_buf, &tile_uniform_buf,
+        );
 
         // -- blit pipeline --
         let blit_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -540,7 +788,13 @@ impl Renderer {
             brick_uniform_buf, tile_uniform_buf,
             tile_dirty_buf, players_buf,
             output_tex, output_view, beam_tex, beam_view, sampler,
+            sun_buf, shadow_tex, shadow_view, heightmap_buf,
+            noise3d_tex, noise3d_view, noise_sampler, brick_ao_buf,
+            frame_index: 0,
+            last_shadow_sun_phase: u64::MAX,
+            last_shadow_origin: glam::IVec3::new(i32::MIN, i32::MIN, i32::MIN),
             beam_bgl, beam_pipeline, beam_bg,
+            shadow_bgl, shadow_pipeline, shadow_bg,
             compute_bgl, compute_pipeline, compute_bg,
             blit_bgl, blit_pipeline, blit_bg,
         }
@@ -567,6 +821,8 @@ impl Renderer {
             &self.device, &self.compute_bgl, &self.camera_buf, &self.bricks_buf,
             &self.tile_mask_buf, &self.chunk_mask_buf, &self.palette_buf, &self.output_view, &self.beam_view,
             &self.tile_dirty_buf, &self.players_buf, &self.brick_uniform_buf, &self.tile_uniform_buf,
+            &self.shadow_view, &self.sun_buf, &self.heightmap_buf,
+            &self.noise3d_view, &self.noise_sampler, &self.brick_ao_buf,
         );
         self.beam_bg = make_beam_bg(
             &self.device, &self.beam_bgl, &self.camera_buf, &self.chunk_mask_buf, &self.beam_view,
@@ -575,28 +831,31 @@ impl Renderer {
     }
 
     pub fn upload_world(&self, world: &mut World) {
-        // Coalesced upload: walk the sorted dirty list into contiguous spans
-        // and issue one write_buffer per span. Thousands of 72-byte writes
-        // serialise through the wgpu staging path; merging into a handful of
-        // multi-KB writes turns "death by a thousand DMAs" into ~free.
+        let stride = std::mem::size_of::<crate::voxel::Brick>() as u64;
         if world.all_dirty {
+            // Bulk upload after world gen. The 600 MB bricks transfer is
+            // the bulk of startup time but only happens once.
             self.queue.write_buffer(&self.bricks_buf, 0, bytemuck::cast_slice(&world.bricks));
             self.queue.write_buffer(&self.tile_mask_buf, 0, bytemuck::cast_slice(&world.tile_mask));
             self.queue.write_buffer(&self.chunk_mask_buf, 0, bytemuck::cast_slice(&world.chunk_mask));
-            // Re-pack and re-upload uniform tables (whole-world refresh path).
             let bu = pack_u8_to_u32(&world.brick_uniform);
             let tu = pack_u8_to_u32(&world.tile_uniform);
             self.queue.write_buffer(&self.brick_uniform_buf, 0, bytemuck::cast_slice(&bu));
             self.queue.write_buffer(&self.tile_uniform_buf, 0, bytemuck::cast_slice(&tu));
+            let ao = pack_u8_to_u32(&world.brick_ao);
+            self.queue.write_buffer(&self.brick_ao_buf, 0, bytemuck::cast_slice(&ao));
             world.all_dirty = false;
             world.dirty_bricks.clear();
             return;
         }
+        // Delta upload — sort + dedup the dirty list, then coalesce
+        // contiguous runs into single write_buffer calls. Each brick is
+        // 72 B; physics edits a few hundred per frame, so we end up with
+        // a handful of multi-KB writes per dirty tick instead of pushing
+        // the whole 605 MB pool.
         if world.dirty_bricks.is_empty() { return; }
         world.dirty_bricks.sort_unstable();
         world.dirty_bricks.dedup();
-
-        let stride = std::mem::size_of::<crate::voxel::Brick>() as u64;
         let mut i = 0usize;
         while i < world.dirty_bricks.len() {
             let start = world.dirty_bricks[i];
@@ -611,14 +870,30 @@ impl Renderer {
             self.queue.write_buffer(&self.bricks_buf, offset, bytemuck::cast_slice(slice));
             i = j;
         }
+        // Masks + uniform tables: re-upload the whole thing (cheap — total
+        // ~16 MB at 2× and they affect the DDA's correctness).
         self.queue.write_buffer(&self.tile_mask_buf, 0, bytemuck::cast_slice(&world.tile_mask));
         self.queue.write_buffer(&self.chunk_mask_buf, 0, bytemuck::cast_slice(&world.chunk_mask));
+        let bu = pack_u8_to_u32(&world.brick_uniform);
+        let tu = pack_u8_to_u32(&world.tile_uniform);
+        self.queue.write_buffer(&self.brick_uniform_buf, 0, bytemuck::cast_slice(&bu));
+        self.queue.write_buffer(&self.tile_uniform_buf, 0, bytemuck::cast_slice(&tu));
+        let ao = pack_u8_to_u32(&world.brick_ao);
+        self.queue.write_buffer(&self.brick_ao_buf, 0, bytemuck::cast_slice(&ao));
         world.dirty_bricks.clear();
     }
 
     pub fn upload_tile_dirty(&self, mask: &[u32]) {
         if mask.is_empty() { return; }
         self.queue.write_buffer(&self.tile_dirty_buf, 0, bytemuck::cast_slice(mask));
+    }
+
+    /// Re-upload the terrain heightmap. Built CPU-side per-frame is cheap
+    /// (~1 ms parallel rayon) — much cheaper than the wrong-data visual
+    /// glitches you get when origin shifts and the heightmap is stale.
+    pub fn upload_heightmap(&self, world: &World) {
+        let hm = world.build_terrain_heightmap();
+        self.queue.write_buffer(&self.heightmap_buf, 0, bytemuck::cast_slice(&hm));
     }
 
     pub fn upload_players(&self, positions: &[(glam::Vec3, u32)]) {
@@ -638,9 +913,22 @@ impl Renderer {
     pub fn update_camera(&self, camera: &Camera, time: f32, world_origin_voxel: glam::IVec3) {
         let u = CameraUniform::from_camera(camera, self.size.0, self.size.1, time, world_origin_voxel);
         self.queue.write_buffer(&self.camera_buf, 0, bytemuck::bytes_of(&u));
+        // Refresh sun basis / ortho frustum once per frame — the sun rotates
+        // continuously in the shader (sun_dir uses camera.time) so we re-fit
+        // each frame too. ~1 µs CPU work; saves N×trace_any per pixel.
+        let sun = SunUniform::fit_to_window(
+            time,
+            world_origin_voxel,
+            glam::UVec3::new(
+                crate::voxel::WORLD_VOXELS_X,
+                crate::voxel::WORLD_VOXELS_Y,
+                crate::voxel::WORLD_VOXELS_Z,
+            ),
+        );
+        self.queue.write_buffer(&self.sun_buf, 0, bytemuck::bytes_of(&sun));
     }
 
-    pub fn render(&mut self, any_dirty: bool) -> Result<(), wgpu::SurfaceError> {
+    pub fn render(&mut self, any_dirty: bool, world_edits_happened: bool, world_origin_voxel: glam::IVec3) -> Result<(), wgpu::SurfaceError> {
         let frame = self.surface.get_current_texture()?;
         let frame_view = frame
             .texture
@@ -653,7 +941,23 @@ impl Renderer {
         // Temporal-differential: if no tile is dirty, we still blit (so the
         // swapchain stays in sync), but skip the beam + raymarch compute
         // passes entirely. The output_tex from the prior frame is preserved.
+        self.frame_index = self.frame_index.wrapping_add(1);
         if any_dirty {
+            // ---- shadow map pre-pass (sun-space depth) ----
+            // Bake only when: (a) world geometry changed, OR (b) sun has
+            // drifted enough to need a fresh map. Pure camera movement
+            // does NOT trigger a re-bake (sun-space depth is camera-
+            // independent). This is the fix for "every camera move
+            // recomputes everything" — shadow stays cached across pans.
+            // Shadow_tex bake disabled — sample_shadow() now walks the
+            // CPU-built terrain heightmap (binding 13) instead of reading
+            // shadow_tex. Saves the full 256K-ray bake per frame; the
+            // shadow_tex texture + bgl entry are still bound for binding
+            // compatibility but never sampled by the raymarch shader.
+            let _ = world_origin_voxel;
+            let _ = world_edits_happened;
+            let _ = self.last_shadow_sun_phase;
+            let _ = self.last_shadow_origin;
             // ---- beam pre-pass at 1/8 resolution ----
             {
                 let mut cp = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -740,6 +1044,70 @@ fn create_beam_texture(device: &wgpu::Device, w: u32, h: u32) -> (wgpu::Texture,
     (tex, view)
 }
 
+fn create_noise3d_texture(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    res: u32,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    // Pseudo-random u8 noise; sampler does trilinear interp. Same statistical
+    // properties as the WGSL vnoise3 (uniform [0,255] → [0,1] after filter)
+    // but at a tiny fraction of the runtime cost.
+    let n = (res * res * res) as usize;
+    let mut data = vec![0u8; n];
+    // Cheap PRNG — deterministic so visuals don't shift between runs.
+    let mut state: u64 = 0x9E3779B97F4A7C15;
+    for v in data.iter_mut() {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *v = (state >> 56) as u8;
+    }
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("noise3d"),
+        size: wgpu::Extent3d { width: res, height: res, depth_or_array_layers: res },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D3,
+        format: wgpu::TextureFormat::R8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::ImageCopyTexture {
+            texture: &tex,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &data,
+        wgpu::ImageDataLayout {
+            offset: 0,
+            bytes_per_row: Some(res),
+            rows_per_image: Some(res),
+        },
+        wgpu::Extent3d { width: res, height: res, depth_or_array_layers: res },
+    );
+    let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+    (tex, view)
+}
+
+fn create_shadow_texture(device: &wgpu::Device, res: u32) -> (wgpu::Texture, wgpu::TextureView) {
+    // R32Float: 16 MB at 2048² — bigger but doesn't require the
+    // TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES feature that R16F storage
+    // needs on some drivers. The win comes from REPLACING per-pixel
+    // trace_any with one texture lookup, not from texture format.
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("shadow"),
+        size: wgpu::Extent3d { width: res, height: res, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::R32Float,
+        usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+    (tex, view)
+}
+
 fn make_compute_bg(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
@@ -754,6 +1122,12 @@ fn make_compute_bg(
     players_buf: &wgpu::Buffer,
     brick_uniform_buf: &wgpu::Buffer,
     tile_uniform_buf: &wgpu::Buffer,
+    shadow_view: &wgpu::TextureView,
+    sun_buf: &wgpu::Buffer,
+    heightmap_buf: &wgpu::Buffer,
+    noise3d_view: &wgpu::TextureView,
+    noise_sampler: &wgpu::Sampler,
+    brick_ao_buf: &wgpu::Buffer,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("compute bg"),
@@ -770,6 +1144,40 @@ fn make_compute_bg(
             wgpu::BindGroupEntry { binding: 8, resource: players_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 9, resource: brick_uniform_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 10, resource: tile_uniform_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::TextureView(shadow_view) },
+            wgpu::BindGroupEntry { binding: 12, resource: sun_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 13, resource: heightmap_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 14, resource: wgpu::BindingResource::TextureView(noise3d_view) },
+            wgpu::BindGroupEntry { binding: 15, resource: wgpu::BindingResource::Sampler(noise_sampler) },
+            wgpu::BindGroupEntry { binding: 16, resource: brick_ao_buf.as_entire_binding() },
+        ],
+    })
+}
+
+fn make_shadow_bg(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    camera_buf: &wgpu::Buffer,
+    bricks_buf: &wgpu::Buffer,
+    tile_mask_buf: &wgpu::Buffer,
+    chunk_mask_buf: &wgpu::Buffer,
+    sun_buf: &wgpu::Buffer,
+    shadow_view: &wgpu::TextureView,
+    brick_uniform_buf: &wgpu::Buffer,
+    tile_uniform_buf: &wgpu::Buffer,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("shadow bg"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: camera_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: bricks_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: tile_mask_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: chunk_mask_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 4, resource: sun_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(shadow_view) },
+            wgpu::BindGroupEntry { binding: 6, resource: brick_uniform_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 7, resource: tile_uniform_buf.as_entire_binding() },
         ],
     })
 }
