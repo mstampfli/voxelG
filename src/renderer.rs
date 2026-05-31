@@ -553,29 +553,39 @@ impl Renderer {
             self.queue.write_buffer(&self.chunk_mask_buf, 0, bytemuck::cast_slice(&world.chunk_mask));
             world.all_dirty = false;
             world.dirty_bricks.clear();
+            world.dirty_tiles.clear();
+            world.dirty_chunks.clear();
             return;
         }
-        if world.dirty_bricks.is_empty() { return; }
-        world.dirty_bricks.sort_unstable();
-        world.dirty_bricks.dedup();
-
-        let stride = std::mem::size_of::<crate::voxel::Brick>() as u64;
-        let mut i = 0usize;
-        while i < world.dirty_bricks.len() {
-            let start = world.dirty_bricks[i];
-            let mut end = start;
-            let mut j = i + 1;
-            while j < world.dirty_bricks.len() && world.dirty_bricks[j] == end + 1 {
-                end = world.dirty_bricks[j];
-                j += 1;
-            }
-            let offset = start as u64 * stride;
-            let slice = &world.bricks[start as usize ..= end as usize];
-            self.queue.write_buffer(&self.bricks_buf, offset, bytemuck::cast_slice(slice));
-            i = j;
+        if world.dirty_bricks.is_empty() && world.dirty_tiles.is_empty() && world.dirty_chunks.is_empty() {
+            return;
         }
-        self.queue.write_buffer(&self.tile_mask_buf, 0, bytemuck::cast_slice(&world.tile_mask));
-        self.queue.write_buffer(&self.chunk_mask_buf, 0, bytemuck::cast_slice(&world.chunk_mask));
+
+        // ---- bricks delta ----
+        let stride = std::mem::size_of::<crate::voxel::Brick>() as u64;
+        if !world.dirty_bricks.is_empty() {
+            world.dirty_bricks.sort_unstable();
+            world.dirty_bricks.dedup();
+            let mut i = 0usize;
+            while i < world.dirty_bricks.len() {
+                let start = world.dirty_bricks[i];
+                let mut end = start;
+                let mut j = i + 1;
+                while j < world.dirty_bricks.len() && world.dirty_bricks[j] == end + 1 {
+                    end = world.dirty_bricks[j];
+                    j += 1;
+                }
+                let offset = start as u64 * stride;
+                let slice = &world.bricks[start as usize ..= end as usize];
+                self.queue.write_buffer(&self.bricks_buf, offset, bytemuck::cast_slice(slice));
+                i = j;
+            }
+        }
+        // ---- tile_mask / chunk_mask delta ----
+        // Used to be a 2 MB full-buffer reupload every dirty frame.
+        // Now: only the (sorted, dedup'd) entries actually touched.
+        delta_upload_u64(&self.queue, &self.tile_mask_buf, &world.tile_mask, &mut world.dirty_tiles);
+        delta_upload_u64(&self.queue, &self.chunk_mask_buf, &world.chunk_mask, &mut world.dirty_chunks);
         world.dirty_bricks.clear();
     }
 
@@ -681,6 +691,31 @@ impl Renderer {
         frame.present();
         Ok(())
     }
+}
+
+/// Sort + dedup + coalesce-and-upload only the dirty entries of a u64
+/// host buffer to its GPU counterpart. Replaces the 2 MB full-tile_mask
+/// reupload that was firing every dirty frame.
+fn delta_upload_u64(queue: &wgpu::Queue, buf: &wgpu::Buffer, src: &[u64], dirty: &mut Vec<u32>) {
+    if dirty.is_empty() { return; }
+    dirty.sort_unstable();
+    dirty.dedup();
+    let stride = std::mem::size_of::<u64>() as u64;
+    let mut i = 0usize;
+    while i < dirty.len() {
+        let start = dirty[i];
+        let mut end = start;
+        let mut j = i + 1;
+        while j < dirty.len() && dirty[j] == end + 1 {
+            end = dirty[j];
+            j += 1;
+        }
+        let offset = start as u64 * stride;
+        let slice = &src[start as usize ..= end as usize];
+        queue.write_buffer(buf, offset, bytemuck::cast_slice(slice));
+        i = j;
+    }
+    dirty.clear();
 }
 
 fn create_output_texture(device: &wgpu::Device, w: u32, h: u32) -> (wgpu::Texture, wgpu::TextureView) {

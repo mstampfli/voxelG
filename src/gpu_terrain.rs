@@ -14,7 +14,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use crate::voxel::{self, paint_trees_into_bricks, Brick, World, STORAGE_CHUNK_BRICKS};
+use crate::voxel::{self, paint_trees_into_bricks_cached, Brick, World, STORAGE_CHUNK_BRICKS, TreeSpec};
 
 // Fixed-size batching. Adaptive was a bad idea — ping-pong'd between
 // extremes and tanked the average. Hand-tuned middle ground:
@@ -204,15 +204,34 @@ impl GpuTerrainGen {
             // so they're re-submitted to the GPU next frame.
             let bricks_per_chunk = BRICKS_PER_CHUNK;
             let send_count = inf.requests.len().min(APPLY_CAP_PER_FRAME);
+            // Main thread: just memcpy the readback bytes into owned Vecs
+            // (cheap, ~36 KB each). Move them onto a rayon thread which
+            // does the expensive paint_trees pass and forwards results to
+            // world.gen_result_tx for apply on the main thread.
+            // This is what kills the per-frame apply-burst hitch: the
+            // ~1-2 ms × N chunks paint work is no longer on the frame
+            // path.
+            let mut owned: Vec<(u32, glam::IVec3, Vec<Brick>)> = Vec::with_capacity(send_count);
             for i in 0..send_count {
                 let (slot, want) = inf.requests[i];
                 let off = i * bricks_per_chunk * BRICK_BYTES;
                 let chunk_bytes = &data[off..off + bricks_per_chunk * BRICK_BYTES];
                 let bricks: &[Brick] = bytemuck::cast_slice(chunk_bytes);
-                let mut scratch: Vec<Brick> = bricks.to_vec();
-                paint_trees_into_bricks(want, &mut scratch, self.seed);
-                let _ = world.gen_result_tx.send((slot, want, scratch));
+                owned.push((slot, want, bricks.to_vec()));
             }
+            let tx = world.gen_result_tx.clone();
+            let seed = self.seed;
+            rayon::spawn(move || {
+                let mut tree_cache: std::collections::HashMap<glam::IVec2, Vec<TreeSpec>> =
+                    std::collections::HashMap::with_capacity(64);
+                for (slot, want, mut scratch) in owned {
+                    paint_trees_into_bricks_cached(want, &mut scratch, seed, &mut tree_cache);
+                    // Persist for next visit. Tiny disk write (36 KB),
+                    // doesn't block the channel send below.
+                    crate::disk_cache::save(seed, want, &scratch);
+                    let _ = tx.send((slot, want, scratch));
+                }
+            });
             // Anything we didn't send gets re-queued. push_front preserves
             // priority — we want the unfinished work next.
             for i in (send_count..inf.requests.len()).rev() {
@@ -236,6 +255,13 @@ impl GpuTerrainGen {
         while requests.len() < BATCH_SIZE {
             let Some((slot, want)) = world.regen_queue.pop_front() else { break; };
             if world.slot_world_chunk[slot as usize] != Some(want) { continue; }
+            // Disk cache hit? Skip GPU + tree paint entirely — just send
+            // the saved scratch through the existing channel. CPU apply
+            // still runs on the main thread (cheap, ~0.1 ms / chunk).
+            if let Some(bricks) = crate::disk_cache::try_load(self.seed, want) {
+                let _ = world.gen_result_tx.send((slot, want, bricks));
+                continue;
+            }
             requests.push((slot, want));
             req_buf.push(GenRequest {
                 world_cx: want.x,
