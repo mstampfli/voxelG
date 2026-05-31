@@ -16,12 +16,9 @@ use std::sync::{Arc, Mutex};
 
 use crate::voxel::{self, paint_trees_into_bricks_cached, Brick, World, STORAGE_CHUNK_BRICKS, TreeSpec};
 
-// Fixed-size batching. Adaptive was a bad idea — ping-pong'd between
-// extremes and tanked the average. Hand-tuned middle ground:
-//   batch=24 dispatches → ~1.5ms GPU gen per frame
-//   apply_cap=8 → CPU never bursts more than 8 chunks of apply work
-//   rayon CPU workers stay at 2 in main.rs
-// Throughput ≈ (24 GPU + 8*2 CPU) per frame ≈ 8000 chunks/sec at 200 FPS.
+// Back to the stable middle ground after a 48/16 bump tanked framerate
+// even with movable on the worker. Bigger GPU dispatch contended with
+// the main raymarch even when the CPU burst was bounded.
 const BATCH_SIZE: usize = 24;
 const APPLY_CAP_PER_FRAME: usize = 8;
 const BRICKS_PER_CHUNK: usize =
@@ -226,10 +223,11 @@ impl GpuTerrainGen {
                     std::collections::HashMap::with_capacity(64);
                 for (slot, want, mut scratch) in owned {
                     paint_trees_into_bricks_cached(want, &mut scratch, seed, &mut tree_cache);
-                    // Persist for next visit. Tiny disk write (36 KB),
-                    // doesn't block the channel send below.
                     crate::disk_cache::save(seed, want, &scratch);
-                    let _ = tx.send((slot, want, scratch));
+                    // Precompute movable so the main-thread apply skips
+                    // its per-voxel scan.
+                    let movable = voxel::compute_movable_masks(&scratch);
+                    let _ = tx.send((slot, want, scratch, movable));
                 }
             });
             // Anything we didn't send gets re-queued. push_front preserves
@@ -255,11 +253,13 @@ impl GpuTerrainGen {
         while requests.len() < BATCH_SIZE {
             let Some((slot, want)) = world.regen_queue.pop_front() else { break; };
             if world.slot_world_chunk[slot as usize] != Some(want) { continue; }
-            // Disk cache hit? Skip GPU + tree paint entirely — just send
-            // the saved scratch through the existing channel. CPU apply
-            // still runs on the main thread (cheap, ~0.1 ms / chunk).
+            // Disk cache hit? Skip GPU + tree paint. Compute movable
+            // inline (cheap, ~150 µs); a rayon::spawn-per-hit would have
+            // its own scheduling overhead that dominates when many
+            // cached chunks come in at once.
             if let Some(bricks) = crate::disk_cache::try_load(self.seed, want) {
-                let _ = world.gen_result_tx.send((slot, want, bricks));
+                let movable = voxel::compute_movable_masks(&bricks);
+                let _ = world.gen_result_tx.send((slot, want, bricks, movable));
                 continue;
             }
             requests.push((slot, want));

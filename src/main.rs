@@ -311,6 +311,14 @@ impl ApplicationHandler for App {
                 if target_origin != self.world.world_origin_chunk {
                     self.world.shift_origin(target_origin);
                 }
+                // Sort regen_queue by distance from camera chunk so the
+                // chunks the player can SEE load first. Cheap (O(n log n)
+                // on at most a few thousand entries).
+                let cam_chunk = glam::IVec2::new(
+                    (self.camera.pos.x / voxel::STORAGE_CHUNK_VOXELS as f32).floor() as i32,
+                    (self.camera.pos.z / voxel::STORAGE_CHUNK_VOXELS as f32).floor() as i32,
+                );
+                self.world.prioritize_queue(cam_chunk);
                 if let (Some(gpu), Some(r)) = (self.gpu_terrain.as_mut(), self.renderer.as_ref()) {
                     gpu.tick(&r.device, &r.queue, &mut self.world);
                 }

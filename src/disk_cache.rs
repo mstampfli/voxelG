@@ -28,7 +28,19 @@ pub fn cache_root(seed: u64) -> PathBuf {
 }
 
 fn chunk_path(seed: u64, chunk: glam::IVec3) -> PathBuf {
+    // Subdirectory split. NTFS gets slow past ~10 K files per directory
+    // (we hit 117 K files / 4 GB in flat layout — disk cache lookups
+    // became their own perf problem). 8-bit hash of the chunk coord
+    // spreads across 256 dirs (~450 files each at the same volume).
+    let mut h: u32 = chunk.x as u32;
+    h = h.wrapping_mul(0x9E3779B1)
+         ^ ((chunk.y as u32).wrapping_mul(0x85EBCA77))
+         ^ ((chunk.z as u32).wrapping_mul(0xC2B2AE3D));
+    h = h.wrapping_mul(0xD2B74407);
+    h ^= h >> 16;
+    let bucket = (h & 0xFF) as u8;
     let mut p = cache_root(seed);
+    p.push(format!("{:02x}", bucket));
     p.push(format!("{}_{}_{}.brk", chunk.x, chunk.y, chunk.z));
     p
 }
