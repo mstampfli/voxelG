@@ -8,6 +8,7 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowId};
 
 mod camera;
+mod disk_cache;
 mod gpu_terrain;
 mod net;
 mod physics;

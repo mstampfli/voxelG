@@ -213,6 +213,11 @@ pub struct World {
     /// unload/regen — applied on top of fresh noise when a chunk reloads,
     /// and synced over the network so all clients agree on player builds.
     pub edits: std::collections::HashMap<(i32, i32, i32), u8>,
+    /// Mask deltas — populated by refresh_masks_for_brick. Lets the
+    /// renderer upload ONLY the changed tile_mask / chunk_mask entries
+    /// instead of the full 2 MB tile_mask every dirty frame.
+    pub dirty_tiles: Vec<u32>,
+    pub dirty_chunks: Vec<u32>,
     // ---- non-blocking chunk-gen worker pool ----
     // Workers run on rayon::spawn. They push results into gen_result_rx.
     // The main thread drains completed results each frame without ever
@@ -244,6 +249,8 @@ impl World {
             slot_world_chunk: vec![None; WORLD_STORE_CHUNKS as usize],
             regen_queue: std::collections::VecDeque::with_capacity(2048),
             edits: std::collections::HashMap::new(),
+            dirty_tiles: Vec::with_capacity(2048),
+            dirty_chunks: Vec::with_capacity(256),
             gen_result_tx,
             gen_result_rx,
             gen_in_flight: 0,
@@ -659,6 +666,9 @@ impl World {
             self.tile_mask[ti as usize] &= !(1u64 << bit);
         }
         let now = self.tile_mask[ti as usize];
+        if prev != now {
+            self.dirty_tiles.push(ti);
+        }
         if (prev == 0) != (now == 0) {
             let (cx, cy, cz) = (tx / 4, ty / 4, tz / 4);
             let ci = chunk_idx(cx, cy, cz);
@@ -668,6 +678,7 @@ impl World {
             } else {
                 self.chunk_mask[ci as usize] |= 1u64 << cbit;
             }
+            self.dirty_chunks.push(ci);
         }
     }
 
@@ -1096,6 +1107,21 @@ pub fn gen_slot_bricks(world_chunk: glam::IVec3, seed: u64) -> Vec<Brick> {
 /// Used by both CPU gen and the GPU gen path (GPU only does the noise +
 /// material pass; trees stay CPU-side because they cross chunk borders).
 pub fn paint_trees_into_bricks(world_chunk: glam::IVec3, bricks: &mut [Brick], seed: u64) {
+    let mut cache: std::collections::HashMap<glam::IVec2, Vec<TreeSpec>> =
+        std::collections::HashMap::with_capacity(9);
+    paint_trees_into_bricks_cached(world_chunk, bricks, seed, &mut cache);
+}
+
+/// Same as `paint_trees_into_bricks` but reuses an externally-owned cache
+/// of `trees_for_chunk` results. When a batch of chunks gets painted in
+/// sequence, consecutive chunks share 6 of their 9 neighbours so this
+/// dedups the (expensive — ~21 fbm calls per candidate tree) work.
+pub fn paint_trees_into_bricks_cached(
+    world_chunk: glam::IVec3,
+    bricks: &mut [Brick],
+    seed: u64,
+    cache: &mut std::collections::HashMap<glam::IVec2, Vec<TreeSpec>>,
+) {
     let sea_level: u32 = 180;
     let world_x0 = world_chunk.x * STORAGE_CHUNK_VOXELS as i32;
     let world_y0 = world_chunk.y * STORAGE_CHUNK_VOXELS as i32;
@@ -1109,11 +1135,13 @@ pub fn paint_trees_into_bricks(world_chunk: glam::IVec3, bricks: &mut [Brick], s
     for ncz in -1..=1i32 {
         for ncx in -1..=1i32 {
             let src_chunk = glam::IVec2::new(world_chunk.x + ncx, world_chunk.z + ncz);
-            let trees = trees_for_chunk(src_chunk, seed, sea_level);
-            for tree in trees {
+            let trees = cache
+                .entry(src_chunk)
+                .or_insert_with(|| trees_for_chunk(src_chunk, seed, sea_level));
+            for tree in trees.iter() {
                 let tree_top = tree.base_y + 22;
                 if tree.base_y > chunk_max.1 || tree_top < chunk_min.1 { continue; }
-                paint_tree(&tree, bricks, chunk_min, chunk_max);
+                paint_tree(tree, bricks, chunk_min, chunk_max);
             }
         }
     }
@@ -1144,7 +1172,7 @@ fn try_write_tree_voxel(
 }
 
 #[derive(Clone, Copy)]
-struct TreeSpec {
+pub struct TreeSpec {
     base_x: i32,
     base_y: i32,
     base_z: i32,
@@ -1153,7 +1181,7 @@ struct TreeSpec {
 }
 
 /// Deterministic tree positions for a given (xz) chunk.
-fn trees_for_chunk(chunk_xz: glam::IVec2, seed: u64, sea_level: u32) -> Vec<TreeSpec> {
+pub fn trees_for_chunk(chunk_xz: glam::IVec2, seed: u64, sea_level: u32) -> Vec<TreeSpec> {
     let (s_x, s_z) = seed_offset_xz(seed);
     // Climate at chunk centre — coarse enough that whole forests stay in
     // the same biome.

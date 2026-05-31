@@ -153,6 +153,19 @@ fn brick_voxel_material(bi: i32, vi: i32) -> u32 {
     return (bricks[bi].materials[word] >> u32(byte * 8)) & 0xFFu;
 }
 
+// Cached versions — take an already-fetched Brick struct so the inner
+// per-voxel DDA loop avoids re-fetching the 72-byte Brick from global
+// storage at every step. (dubiousconst282-style intra-brick walk.)
+fn brick_voxel_solid_cached(b: Brick, vi: i32) -> bool {
+    if (vi < 32) { return (b.occ_lo & (1u << u32(vi))) != 0u; }
+    return (b.occ_hi & (1u << u32(vi - 32))) != 0u;
+}
+fn brick_voxel_material_cached(b: Brick, vi: i32) -> u32 {
+    let word = vi / 4;
+    let byte = vi - word * 4;
+    return (b.materials[word] >> u32(byte * 8)) & 0xFFu;
+}
+
 // LOD support: representative material of an entire brick — used at far
 // distance where we terminate the DDA at brick granularity instead of
 // per-voxel. Picks the topmost solid voxel so distant terrain reads as its
@@ -386,11 +399,20 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     textureStore(output_tex, vec2<i32>(i32(gid.x), i32(gid.y)), vec4<f32>(col, 1.0));
 
-    // Smart cache feedback: if this pixel hit water/sky/glass (or the
-    // tile sees clouds), mark the tile as animated so next frame re-traces
-    // it even when the camera is still. Idempotent atomicOr so the 64
-    // pixels per tile racing on the same bit is fine.
-    let is_anim = !hit.hit || is_water_mat(hit.mat) || hit.mat == MAT_GLASS || clouds.a > 0.01;
+    // Smart cache feedback: anything that animates per-frame needs to
+    // mark its tile so next frame re-traces it even when the camera is
+    // still. Includes:
+    //   - water (wave animation in shade_water_top)
+    //   - sky (sun moves)
+    //   - glass (refraction depends on view)
+    //   - foliage (leaves/grass/flowers sway with wind_offset)
+    //   - clouds (volumetric, scrolling)
+    // Idempotent atomicOr → 64 racing threads per tile is fine.
+    let is_anim = !hit.hit
+        || is_water_mat(hit.mat)
+        || hit.mat == MAT_GLASS
+        || is_foliage_mat(hit.mat)
+        || clouds.a > 0.01;
     if (is_anim) {
         atomicOr(&tile_animated[word], 1u << u32(bit));
     }
@@ -1799,65 +1821,89 @@ fn trace(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
             continue;
         }
 
-        let local = slot_v - bp * BRICK_DIM;
-        let vi = brick_voxel_idx(local.x, local.y, local.z);
-        if (brick_voxel_solid(bi, vi)) {
-            let m = brick_voxel_material(bi, vi);
-            if (is_foliage_mat(m)) {
-                let fh = foliage_subvoxel(voxel, origin, dir, m);
-                if (fh.hit) {
+        // ---- INTRA-BRICK DDA (dubiousconst282-lite) ----
+        // Cache ONLY the 8-byte occupancy bitmask (not the full 72-byte
+        // Brick — caching the whole struct turned out to cost more in
+        // register pressure than it saved in fetches). Material lookup
+        // still hits global memory but only fires on a hit (rare in a
+        // typical ray). Hierarchy walk fires once per brick, not per
+        // voxel — the actual win.
+        let occ_lo = bricks[bi].occ_lo;
+        let occ_hi = bricks[bi].occ_hi;
+        let bp_keep = bp;
+        for (var inner: i32 = 0; inner < 12; inner = inner + 1) {
+            let sv_i = world_to_slot_voxel(voxel);
+            let local_i = sv_i - bp_keep * BRICK_DIM;
+            let vi_i = brick_voxel_idx(local_i.x, local_i.y, local_i.z);
+            let occ_word = select(occ_hi, occ_lo, vi_i < 32);
+            let occ_bit = u32(select(vi_i - 32, vi_i, vi_i < 32));
+            if ((occ_word & (1u << occ_bit)) != 0u) {
+                let m = brick_voxel_material(bi, vi_i);
+                if (is_foliage_mat(m)) {
+                    let fh = foliage_subvoxel(voxel, origin, dir, m);
+                    if (fh.hit) {
+                        out.hit = true;
+                        out.mat = m;
+                        out.normal = fh.normal;
+                        out.voxel = voxel;
+                        out.last_axis = -1;
+                        out.t_hit = fh.t_hit;
+                        g_foliage_tint = fh.color_tint;
+                        return out;
+                    }
+                } else {
+                    var n = vec3<f32>(0.0);
+                    var t_hit: f32;
+                    if (last_axis == 0) {
+                        n.x = -f32(step.x);
+                        t_hit = t_max.x - t_delta.x;
+                    } else if (last_axis == 1) {
+                        n.y = -f32(step.y);
+                        t_hit = t_max.y - t_delta.y;
+                    } else if (last_axis == 2) {
+                        n.z = -f32(step.z);
+                        t_hit = t_max.z - t_delta.z;
+                    } else {
+                        t_hit = t_enter;
+                        if      (tmin3.x >= tmin3.y && tmin3.x >= tmin3.z) { n.x = -f32(step.x); }
+                        else if (tmin3.y >= tmin3.z)                       { n.y = -f32(step.y); }
+                        else                                               { n.z = -f32(step.z); }
+                    }
                     out.hit = true;
                     out.mat = m;
-                    out.normal = fh.normal;
+                    out.normal = n;
                     out.voxel = voxel;
-                    out.last_axis = -1;
-                    out.t_hit = fh.t_hit;
-                    g_foliage_tint = fh.color_tint;
+                    out.last_axis = last_axis_after_entry(last_axis, tmin3);
+                    out.t_hit = t_hit;
                     return out;
                 }
-            } else {
-                var n = vec3<f32>(0.0);
-                var t_hit: f32;
-                if (last_axis == 0) {
-                    n.x = -f32(step.x);
-                    t_hit = t_max.x - t_delta.x;
-                } else if (last_axis == 1) {
-                    n.y = -f32(step.y);
-                    t_hit = t_max.y - t_delta.y;
-                } else if (last_axis == 2) {
-                    n.z = -f32(step.z);
-                    t_hit = t_max.z - t_delta.z;
-                } else {
-                    t_hit = t_enter;
-                    if      (tmin3.x >= tmin3.y && tmin3.x >= tmin3.z) { n.x = -f32(step.x); }
-                    else if (tmin3.y >= tmin3.z)                      { n.y = -f32(step.y); }
-                    else                                              { n.z = -f32(step.z); }
-                }
-                out.hit = true;
-                out.mat = m;
-                out.normal = n;
-                out.voxel = voxel;
-                out.last_axis = last_axis_after_entry(last_axis, tmin3);
-                out.t_hit = t_hit;
-                return out;
             }
-        }
 
-        if (t_max.x < t_max.y && t_max.x < t_max.z) {
-            t_cur = t_max.x;
-            voxel.x = voxel.x + step.x;
-            t_max.x = t_max.x + t_delta.x;
-            last_axis = 0;
-        } else if (t_max.y < t_max.z) {
-            t_cur = t_max.y;
-            voxel.y = voxel.y + step.y;
-            t_max.y = t_max.y + t_delta.y;
-            last_axis = 1;
-        } else {
-            t_cur = t_max.z;
-            voxel.z = voxel.z + step.z;
-            t_max.z = t_max.z + t_delta.z;
-            last_axis = 2;
+            // DDA step.
+            if (t_max.x < t_max.y && t_max.x < t_max.z) {
+                t_cur = t_max.x;
+                voxel.x = voxel.x + step.x;
+                t_max.x = t_max.x + t_delta.x;
+                last_axis = 0;
+            } else if (t_max.y < t_max.z) {
+                t_cur = t_max.y;
+                voxel.y = voxel.y + step.y;
+                t_max.y = t_max.y + t_delta.y;
+                last_axis = 1;
+            } else {
+                t_cur = t_max.z;
+                voxel.z = voxel.z + step.z;
+                t_max.z = t_max.z + t_delta.z;
+                last_axis = 2;
+            }
+            // If we stepped out of this brick, break to the outer loop so
+            // the hierarchy walk picks up the next one.
+            let sv_n = world_to_slot_voxel(voxel);
+            if ((sv_n.x >> 2u) != bp_keep.x
+             || (sv_n.y >> 2u) != bp_keep.y
+             || (sv_n.z >> 2u) != bp_keep.z) {
+                break;
+            }
         }
     }
     return out;
