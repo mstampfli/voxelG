@@ -29,6 +29,17 @@ use crate::voxel::{
 /// at ~1800 fps; presentation is additionally vsync-paced by the swapchain.
 const FRAME_CAP_HZ: f64 = 144.0;
 
+/// Recenter the streaming window only once the camera has drifted at least this
+/// many chunks off-centre. A deadband stops the window thrashing (and
+/// regenerating an edge column) when the player walks back and forth across a
+/// single chunk boundary (checklist: prefetch with hysteresis).
+const STREAM_HYSTERESIS: i32 = 2;
+
+/// Max finished chunks installed per frame. Caps how many bricks get marked
+/// dirty (and uploaded) per frame so a chunk cross streams in over a handful of
+/// frames instead of one big hitch (checklist: per-frame upload budget).
+const CHUNK_INSTALL_BUDGET: u32 = 6;
+
 #[derive(Default)]
 struct Keys {
     forward: bool,
@@ -295,12 +306,17 @@ impl App {
         let u = (self.keys.up as i32 - self.keys.down as i32) as f32;
         self.camera.translate_local(dt, f * speed, r * speed, u * speed);
 
-        // Streaming: keep the loaded window centred on the camera.
+        // Streaming: keep the loaded window centred on the camera, but with a
+        // hysteresis deadband so boundary oscillation doesn't thrash regen.
+        let cur_origin = self.world.world_origin_chunk;
         let target_origin = voxel::World::target_origin_chunk(self.camera.pos);
-        if target_origin != self.world.world_origin_chunk {
+        let drift = target_origin - cur_origin;
+        if drift.x.abs() >= STREAM_HYSTERESIS || drift.y.abs() >= STREAM_HYSTERESIS {
             self.world.shift_origin(target_origin);
         }
-        self.world.process_regen_queue(16);
+        // Install async-generated chunks under a per-frame budget. Generation
+        // itself runs on the worker pool, so the frame never blocks on noise.
+        self.world.install_finished_chunks(CHUNK_INSTALL_BUDGET);
 
         // Raycast queued clicks against the now-settled camera.
         self.consume_clicks();

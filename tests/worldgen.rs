@@ -67,9 +67,9 @@ fn edits_survive_chunk_streaming_roundtrip() {
         voxel::WORLD_STORE_CZ as i32,
     );
     world.shift_origin(far);
-    world.process_regen_queue(voxel::WORLD_STORE_CHUNKS);
+    world.process_pending_gen_blocking();
     world.shift_origin(glam::IVec2::ZERO);
-    world.process_regen_queue(voxel::WORLD_STORE_CHUNKS);
+    world.process_pending_gen_blocking();
 
     for &(x, y, z) in &edits {
         assert_eq!(

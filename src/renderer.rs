@@ -23,9 +23,46 @@ fn pack_u8_to_u32(src: &[u8]) -> Vec<u32> {
     out
 }
 
+/// Coalesce a SORTED, DEDUPED slice of element indices into contiguous runs and
+/// invoke `f(start, end_inclusive)` once per run. Turns thousands of tiny DMAs
+/// into a handful of multi-KB writes.
+fn upload_spans(sorted: &[u32], mut f: impl FnMut(u32, u32)) {
+    let mut i = 0usize;
+    while i < sorted.len() {
+        let start = sorted[i];
+        let mut end = start;
+        let mut j = i + 1;
+        while j < sorted.len() && sorted[j] == end + 1 {
+            end = sorted[j];
+            j += 1;
+        }
+        f(start, end);
+        i = j;
+    }
+}
+
+/// Upload the given packed-u32 word indices (sorted, deduped) of a byte table
+/// (1 byte per element, packed 4 per word) by re-packing each contiguous word
+/// run from `bytes` and writing it at the matching word offset.
+fn upload_packed_word_spans(
+    words: &[u32],
+    bytes: &[u8],
+    queue: &wgpu::Queue,
+    buf: &wgpu::Buffer,
+) {
+    upload_spans(words, |w_start, w_end| {
+        let b0 = (w_start as usize) * 4;
+        let b1 = (((w_end as usize) + 1) * 4).min(bytes.len());
+        let packed = pack_u8_to_u32(&bytes[b0..b1]);
+        queue.write_buffer(buf, w_start as u64 * 4, bytemuck::cast_slice(&packed));
+    });
+}
+
 use crate::camera::{Camera, CameraUniform};
 use crate::voxel::{
-    World, MAT_AIR, MAT_SAND, MAT_GRASS, MAT_DIRT, MAT_STONE,
+    Brick, World, WORLD_BRICKS_X, WORLD_BRICKS_Y, WORLD_TILES_X, WORLD_TILES_Y,
+    tile_idx, chunk_idx,
+    MAT_AIR, MAT_SAND, MAT_GRASS, MAT_DIRT, MAT_STONE,
     MAT_WATER_L1, MAT_WATER_L8,
     MAT_WOOD, MAT_LEAVES, MAT_SNOW, MAT_LAVA, MAT_ICE, MAT_GLASS,
     MAT_COAL, MAT_IRON, MAT_GOLD, MAT_DIAMOND,
@@ -128,6 +165,13 @@ pub struct Renderer {
     blit_bgl: wgpu::BindGroupLayout,
     blit_pipeline: wgpu::RenderPipeline,
     blit_bg: wgpu::BindGroup,
+
+    // Reused per-frame scratch for incremental mask/uniform uploads — derived
+    // from the dirty-brick list so no extra dirty tracking is needed and no
+    // allocation happens on the upload hot path.
+    dirty_tiles_scratch: Vec<u32>,
+    dirty_chunks_scratch: Vec<u32>,
+    dirty_words_scratch: Vec<u32>,
 }
 
 impl Renderer {
@@ -561,6 +605,9 @@ impl Renderer {
             beam_bgl, beam_pipeline, beam_bg,
             compute_bgl, compute_pipeline, compute_bg,
             blit_bgl, blit_pipeline, blit_bg,
+            dirty_tiles_scratch: Vec::with_capacity(4096),
+            dirty_chunks_scratch: Vec::with_capacity(512),
+            dirty_words_scratch: Vec::with_capacity(4096),
         })
     }
 
@@ -592,16 +639,14 @@ impl Renderer {
         self.blit_bg = make_blit_bg(&self.device, &self.blit_bgl, &self.output_view, &self.sampler);
     }
 
-    pub fn upload_world(&self, world: &mut World) {
-        // Coalesced upload: walk the sorted dirty list into contiguous spans
-        // and issue one write_buffer per span. Thousands of 72-byte writes
-        // serialise through the wgpu staging path; merging into a handful of
-        // multi-KB writes turns "death by a thousand DMAs" into ~free.
+    pub fn upload_world(&mut self, world: &mut World) {
+        // Whole-world refresh (first frame / explicit invalidate only). A chunk
+        // cross must NEVER reach this path — it goes through the incremental
+        // path below, which is why crossing a boundary no longer re-DMAs ~75 MB.
         if world.all_dirty {
             self.queue.write_buffer(&self.bricks_buf, 0, bytemuck::cast_slice(&world.bricks));
             self.queue.write_buffer(&self.tile_mask_buf, 0, bytemuck::cast_slice(&world.tile_mask));
             self.queue.write_buffer(&self.chunk_mask_buf, 0, bytemuck::cast_slice(&world.chunk_mask));
-            // Re-pack and re-upload uniform tables (whole-world refresh path).
             let bu = pack_u8_to_u32(&world.brick_uniform);
             let tu = pack_u8_to_u32(&world.tile_uniform);
             self.queue.write_buffer(&self.brick_uniform_buf, 0, bytemuck::cast_slice(&bu));
@@ -614,23 +659,69 @@ impl Renderer {
         world.dirty_bricks.sort_unstable();
         world.dirty_bricks.dedup();
 
-        let stride = std::mem::size_of::<crate::voxel::Brick>() as u64;
-        let mut i = 0usize;
-        while i < world.dirty_bricks.len() {
-            let start = world.dirty_bricks[i];
-            let mut end = start;
-            let mut j = i + 1;
-            while j < world.dirty_bricks.len() && world.dirty_bricks[j] == end + 1 {
-                end = world.dirty_bricks[j];
-                j += 1;
+        // 1. Brick voxel data — coalesced contiguous spans (one DMA per run).
+        let stride = std::mem::size_of::<Brick>() as u64;
+        upload_spans(&world.dirty_bricks, |s, e| {
+            let slice = &world.bricks[s as usize..=e as usize];
+            self.queue.write_buffer(&self.bricks_buf, s as u64 * stride, bytemuck::cast_slice(slice));
+        });
+
+        // 2. Per-brick uniform-material table (packed 4 bricks / u32 word).
+        //    Re-pack and upload only the words touched by dirty bricks — this
+        //    is the table the DDA's uniform-skip reads, and it was previously
+        //    NEVER refreshed incrementally, so streamed chunks rendered with
+        //    stale skip data.
+        self.dirty_words_scratch.clear();
+        for &b in &world.dirty_bricks {
+            let w = b >> 2;
+            if self.dirty_words_scratch.last() != Some(&w) {
+                self.dirty_words_scratch.push(w);
             }
-            let offset = start as u64 * stride;
-            let slice = &world.bricks[start as usize ..= end as usize];
-            self.queue.write_buffer(&self.bricks_buf, offset, bytemuck::cast_slice(slice));
-            i = j;
         }
-        self.queue.write_buffer(&self.tile_mask_buf, 0, bytemuck::cast_slice(&world.tile_mask));
-        self.queue.write_buffer(&self.chunk_mask_buf, 0, bytemuck::cast_slice(&world.chunk_mask));
+        upload_packed_word_spans(
+            &self.dirty_words_scratch, &world.brick_uniform, &self.queue, &self.brick_uniform_buf,
+        );
+
+        // 3. Tiles touched by the dirty bricks → tile_mask (u64) + tile_uniform.
+        self.dirty_tiles_scratch.clear();
+        for &b in &world.dirty_bricks {
+            let bx = b % WORLD_BRICKS_X;
+            let by = (b / WORLD_BRICKS_X) % WORLD_BRICKS_Y;
+            let bz = b / (WORLD_BRICKS_X * WORLD_BRICKS_Y);
+            self.dirty_tiles_scratch.push(tile_idx(bx / 4, by / 4, bz / 4));
+        }
+        self.dirty_tiles_scratch.sort_unstable();
+        self.dirty_tiles_scratch.dedup();
+        upload_spans(&self.dirty_tiles_scratch, |s, e| {
+            let slice = &world.tile_mask[s as usize..=e as usize];
+            self.queue.write_buffer(&self.tile_mask_buf, s as u64 * 8, bytemuck::cast_slice(slice));
+        });
+        self.dirty_words_scratch.clear();
+        for &t in &self.dirty_tiles_scratch {
+            let w = t >> 2;
+            if self.dirty_words_scratch.last() != Some(&w) {
+                self.dirty_words_scratch.push(w);
+            }
+        }
+        upload_packed_word_spans(
+            &self.dirty_words_scratch, &world.tile_uniform, &self.queue, &self.tile_uniform_buf,
+        );
+
+        // 4. Chunks touched by those tiles → chunk_mask (u64).
+        self.dirty_chunks_scratch.clear();
+        for &t in &self.dirty_tiles_scratch {
+            let tx = t % WORLD_TILES_X;
+            let ty = (t / WORLD_TILES_X) % WORLD_TILES_Y;
+            let tz = t / (WORLD_TILES_X * WORLD_TILES_Y);
+            self.dirty_chunks_scratch.push(chunk_idx(tx / 4, ty / 4, tz / 4));
+        }
+        self.dirty_chunks_scratch.sort_unstable();
+        self.dirty_chunks_scratch.dedup();
+        upload_spans(&self.dirty_chunks_scratch, |s, e| {
+            let slice = &world.chunk_mask[s as usize..=e as usize];
+            self.queue.write_buffer(&self.chunk_mask_buf, s as u64 * 8, bytemuck::cast_slice(slice));
+        });
+
         world.dirty_bricks.clear();
     }
 

@@ -19,6 +19,14 @@
 
 use glam::UVec3;
 
+use crossbeam_channel::{Receiver, Sender};
+
+/// A request to a background worker: generate this slot's bricks for this world
+/// chunk under this seed. Pure — the worker touches no shared state.
+type GenRequest = (u32, glam::IVec3, u64);
+/// A finished slot from a worker: (slot, world_chunk, generated bricks).
+type GenResult = (u32, glam::IVec3, Vec<Brick>);
+
 // World dimensions live in `src/world_dims.rs` so build.rs can generate the
 // matching WGSL constants from the exact same source. Re-export them here so
 // every existing `crate::voxel::WORLD_*` reference keeps working unchanged.
@@ -188,7 +196,14 @@ pub struct World {
     pub world_origin_chunk: glam::IVec2,
     /// For each slot, the world chunk coord it currently holds. None = stale.
     pub slot_world_chunk: Vec<Option<glam::IVec3>>,
-    pub regen_queue: std::collections::VecDeque<(u32, glam::IVec3)>,
+    /// Async chunk generation. shift_origin sends (slot, world_chunk, seed) to a
+    /// pool of background worker threads; install_finished_chunks pulls finished
+    /// bricks back and stitches them in on the main thread. This keeps the
+    /// expensive noise generation off the frame thread — the chunk-load hitch.
+    gen_req_tx: Sender<GenRequest>,
+    gen_res_rx: Receiver<GenResult>,
+    /// Outstanding (requested but not yet received) generation jobs.
+    in_flight: usize,
     /// Persistent voxel edits keyed by *world* voxel coord. Survives chunk
     /// unload/regen — applied on top of fresh noise when a chunk reloads,
     /// and synced over the network so all clients agree on player builds.
@@ -201,6 +216,30 @@ impl World {
     }
 
     pub fn with_seed(seed: u64) -> Self {
+        // Spawn a small pool of generation workers. Each pulls (slot, chunk,
+        // seed) jobs and pushes back finished bricks; gen_slot_bricks is a pure
+        // function so there is no shared state and no locking.
+        let (gen_req_tx, gen_req_rx) = crossbeam_channel::unbounded::<GenRequest>();
+        let (gen_res_tx, gen_res_rx) = crossbeam_channel::unbounded::<GenResult>();
+        let n_workers = std::thread::available_parallelism()
+            .map(|n| n.get().saturating_sub(2))
+            .unwrap_or(4)
+            .clamp(2, 6);
+        for _ in 0..n_workers {
+            let rx = gen_req_rx.clone();
+            let tx = gen_res_tx.clone();
+            std::thread::Builder::new()
+                .name("chunkgen".into())
+                .spawn(move || {
+                    while let Ok((slot, world_chunk, seed)) = rx.recv() {
+                        let bricks = gen_slot_bricks(world_chunk, seed);
+                        if tx.send((slot, world_chunk, bricks)).is_err() {
+                            break;
+                        }
+                    }
+                })
+                .expect("spawn chunkgen worker");
+        }
         Self {
             bricks: vec![Brick::EMPTY; WORLD_BRICKS_TOTAL as usize],
             tile_mask: vec![0u64; WORLD_TILES_TOTAL as usize],
@@ -215,7 +254,9 @@ impl World {
             seed,
             world_origin_chunk: glam::IVec2::ZERO,
             slot_world_chunk: vec![None; WORLD_STORE_CHUNKS as usize],
-            regen_queue: std::collections::VecDeque::with_capacity(256),
+            gen_req_tx,
+            gen_res_rx,
+            in_flight: 0,
             edits: std::collections::HashMap::new(),
         }
     }
@@ -305,91 +346,111 @@ impl World {
                     let want = glam::IVec3::new(want_x, cy as i32, want_z);
                     let slot = storage_chunk_idx(cx, cy, cz) as usize;
                     if self.slot_world_chunk[slot] != Some(want) {
+                        // Show sky immediately, then queue async regen. The
+                        // worker pool fills it in over the next few frames.
                         self.clear_slot(cx, cy, cz);
                         self.slot_world_chunk[slot] = Some(want);
-                        self.regen_queue.push_back((slot as u32, want));
+                        if self.gen_req_tx.send((slot as u32, want, self.seed)).is_ok() {
+                            self.in_flight += 1;
+                        }
                     }
                 }
             }
         }
     }
 
-    /// Regenerate up to `budget` slots from the queue. Each regenerated slot
-    /// gets the persistent-edit map replayed on top so player builds survive
-    /// the chunk-streaming round-trip.
-    ///
-    /// Noise generation is **parallelised across rayon's thread pool** — each
-    /// worker computes a scratch `Vec<Brick>` for its slot independently
-    /// (pure function of world-chunk coord + seed), then the main thread
-    /// merges results into the flat world array serially. No shared mutable
-    /// state, no locks.
-    pub fn process_regen_queue(&mut self, budget: u32) {
-        use rayon::prelude::*;
-        let seed = self.seed;
-        // Drain budget items from the queue first.
-        let mut batch: Vec<(u32, glam::IVec3)> = Vec::with_capacity(budget as usize);
-        for _ in 0..budget {
-            let Some(item) = self.regen_queue.pop_front() else { break; };
-            batch.push(item);
-        }
-        if batch.is_empty() { return; }
-        // Parallel: each worker generates its slot's bricks into a private
-        // Vec — pure function of (world_chunk, seed), no shared state.
-        let results: Vec<(u32, glam::IVec3, Vec<Brick>)> = batch
-            .par_iter()
-            .map(|&(slot, want)| {
-                let bricks = gen_slot_bricks(want, seed);
-                (slot, want, bricks)
-            })
-            .collect();
-        // Serial merge: stitch each scratch chunk into the flat world array.
-        let mut regenerated_chunks: Vec<glam::IVec3> = Vec::with_capacity(results.len());
-        for (slot, want, scratch) in results {
-            let cx = slot % WORLD_STORE_CX;
-            let cy = (slot / WORLD_STORE_CX) % WORLD_STORE_CY;
-            let cz = slot / (WORLD_STORE_CX * WORLD_STORE_CY);
-            self.apply_slot_bricks(cx, cy, cz, &scratch);
-            regenerated_chunks.push(want);
-        }
-        if !regenerated_chunks.is_empty() && !self.edits.is_empty() {
-            let cv = STORAGE_CHUNK_VOXELS as i32;
-            let origin = self.world_origin_voxel();
-            // Pre-filter into a vec so we don't hold an immutable borrow on
-            // self.edits while calling self.set_voxel.
-            let mut to_apply: Vec<(i32, i32, i32, u8)> = Vec::new();
-            for (&(wx, wy, wz), &mat) in &self.edits {
-                let edit_chunk = glam::IVec3::new(
-                    wx.div_euclid(cv),
-                    wy.div_euclid(cv),
-                    wz.div_euclid(cv),
-                );
-                if regenerated_chunks.contains(&edit_chunk) {
-                    to_apply.push((wx, wy, wz, mat));
-                }
+    /// Number of chunk-generation jobs still in flight on the worker pool.
+    pub fn pending_gen(&self) -> usize {
+        self.in_flight
+    }
+
+    /// Install up to `budget` finished chunks from the worker pool onto the main
+    /// thread (the cheap stitch + edit replay). This is the per-frame upload
+    /// budget: capping installs caps how many bricks get marked dirty (and thus
+    /// uploaded) per frame, so a chunk cross streams in smoothly over several
+    /// frames instead of spiking. Returns the number installed.
+    pub fn install_finished_chunks(&mut self, budget: u32) -> u32 {
+        let mut installed = 0u32;
+        while installed < budget {
+            let (slot, want, scratch) = match self.gen_res_rx.try_recv() {
+                Ok(r) => r,
+                Err(_) => break,
+            };
+            self.in_flight = self.in_flight.saturating_sub(1);
+            // Discard stale results: the origin may have shifted again while
+            // this slot was generating, reassigning it to a different chunk.
+            if self.slot_world_chunk[slot as usize] != Some(want) {
+                continue;
             }
-            for (wx, wy, wz, mat) in to_apply {
-                let rel_x = wx - origin.x;
-                let rel_y = wy - origin.y;
-                let rel_z = wz - origin.z;
-                if rel_x < 0 || rel_y < 0 || rel_z < 0
-                    || (rel_x as u32) >= WORLD_VOXELS_X
-                    || (rel_y as u32) >= WORLD_VOXELS_Y
-                    || (rel_z as u32) >= WORLD_VOXELS_Z
-                {
-                    continue;
-                }
-                // Toroidal local mapping — must match the shader.
-                let lx = wx.rem_euclid(WORLD_VOXELS_X as i32) as u32;
-                let ly = rel_y as u32;
-                let lz = wz.rem_euclid(WORLD_VOXELS_Z as i32) as u32;
-                self.set_voxel(lx, ly, lz, mat);
+            self.install_slot(slot, want, &scratch);
+            installed += 1;
+        }
+        installed
+    }
+
+    /// Block until every in-flight generation job has been received and
+    /// installed. Used by tests and any "must be fully loaded now" path; the
+    /// per-frame loop uses the budgeted `install_finished_chunks` instead.
+    pub fn process_pending_gen_blocking(&mut self) {
+        while self.in_flight > 0 {
+            let (slot, want, scratch) = match self.gen_res_rx.recv() {
+                Ok(r) => r,
+                Err(_) => break,
+            };
+            self.in_flight = self.in_flight.saturating_sub(1);
+            if self.slot_world_chunk[slot as usize] == Some(want) {
+                self.install_slot(slot, want, &scratch);
             }
+        }
+    }
+
+    fn install_slot(&mut self, slot: u32, want: glam::IVec3, scratch: &[Brick]) {
+        let cx = slot % WORLD_STORE_CX;
+        let cy = (slot / WORLD_STORE_CX) % WORLD_STORE_CY;
+        let cz = slot / (WORLD_STORE_CX * WORLD_STORE_CY);
+        self.apply_slot_bricks(cx, cy, cz, scratch);
+        self.replay_edits_for_chunk(want);
+    }
+
+    /// Replay persistent edits that fall inside `world_chunk` on top of freshly
+    /// generated terrain, so player builds survive the streaming round-trip.
+    fn replay_edits_for_chunk(&mut self, world_chunk: glam::IVec3) {
+        if self.edits.is_empty() {
+            return;
+        }
+        let cv = STORAGE_CHUNK_VOXELS as i32;
+        let origin = self.world_origin_voxel();
+        // Collect first so we don't hold a borrow on self.edits across set_voxel.
+        let mut to_apply: Vec<(i32, i32, i32, u8)> = Vec::new();
+        for (&(wx, wy, wz), &mat) in &self.edits {
+            if wx.div_euclid(cv) == world_chunk.x
+                && wy.div_euclid(cv) == world_chunk.y
+                && wz.div_euclid(cv) == world_chunk.z
+            {
+                to_apply.push((wx, wy, wz, mat));
+            }
+        }
+        for (wx, wy, wz, mat) in to_apply {
+            let rel_x = wx - origin.x;
+            let rel_y = wy - origin.y;
+            let rel_z = wz - origin.z;
+            if rel_x < 0 || rel_y < 0 || rel_z < 0
+                || (rel_x as u32) >= WORLD_VOXELS_X
+                || (rel_y as u32) >= WORLD_VOXELS_Y
+                || (rel_z as u32) >= WORLD_VOXELS_Z
+            {
+                continue;
+            }
+            let lx = wx.rem_euclid(WORLD_VOXELS_X as i32) as u32;
+            let ly = rel_y as u32;
+            let lz = wz.rem_euclid(WORLD_VOXELS_Z as i32) as u32;
+            self.set_voxel(lx, ly, lz, mat);
         }
     }
 
     /// Wipe one slot's voxels (and the corresponding mask bits) so the
     /// renderer immediately shows sky/air there. The slot stays empty until
-    /// `process_regen_queue` gets to it.
+    /// the async worker pool delivers its regenerated bricks.
     fn clear_slot(&mut self, slot_cx: u32, slot_cy: u32, slot_cz: u32) {
         let x0 = slot_cx * STORAGE_CHUNK_BRICKS;
         let y0 = slot_cy * STORAGE_CHUNK_BRICKS;
