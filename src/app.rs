@@ -87,10 +87,17 @@ impl App {
     pub fn new(net: Option<net::NetClient>) -> Self {
         let mut world = World::new();
         world.fill_demo_terrain();
+        // Spawn above the surface at the spawn column. The default y (80) is
+        // often *below* the terrain/mountains, which renders as an opaque black
+        // screen ("you see nothing"); lift the camera to clear ground + water.
+        let mut camera = Camera::new();
+        let s = voxel::sample_terrain(camera.pos.x, camera.pos.z, world.seed);
+        let surface = s.h.max(s.water_top) as f32;
+        camera.pos.y = surface + 10.0;
         Self {
             window: None,
             renderer: None,
-            camera: Camera::new(),
+            camera,
             world,
             keys: Keys::default(),
             last_frame: Instant::now(),

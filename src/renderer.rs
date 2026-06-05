@@ -969,22 +969,32 @@ mod gpu_render_tests {
         })
     }
 
-    /// Render the default world from a camera placed high above spawn and read
-    /// the frame back. Returns per-pixel luma (min, max, mean) or None if no GPU.
-    pub(super) fn render_luma_stats() -> Option<(f32, f32, f32)> {
+    /// Render the default world from a camera placed high above the loaded
+    /// window (optionally streamed far from spawn to exercise origin-rebasing
+    /// precision) and read the frame back. Returns per-pixel luma
+    /// (min, max, mean), or None if no GPU.
+    pub(super) fn render_luma_stats_at(origin_chunk: glam::IVec2) -> Option<(f32, f32, f32)> {
         let (device, queue) = headless_device()?;
         let (w, h) = (320u32, 200u32);
 
         let mut world = World::new();
         world.fill_demo_terrain();
+        if origin_chunk != glam::IVec2::ZERO {
+            world.shift_origin(origin_chunk);
+            world.process_pending_gen_blocking();
+        }
+        let wo = world.world_origin_voxel();
 
-        // Camera high above the spawn column, tilted toward the horizon so the
-        // frame contains terrain (lower) and sky (upper) — never inside a voxel.
+        // Camera high above the centre of the loaded window, tilted toward the
+        // horizon so the frame contains terrain (lower) and sky (upper) — never
+        // inside a voxel.
         let mut cam = Camera::new();
+        cam.pos.x = wo.x as f32 + 256.0;
+        cam.pos.z = wo.z as f32 + 256.0;
         let s = crate::voxel::sample_terrain(cam.pos.x, cam.pos.z, world.seed);
         cam.pos.y = s.h as f32 + 30.0;
         cam.pitch = -0.35;
-        let cu = CameraUniform::from_camera(&cam, w, h, 0.0, glam::IVec3::ZERO);
+        let cu = CameraUniform::from_camera(&cam, w, h, 0.0, wo);
 
         let camera_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("camera"),
@@ -1095,18 +1105,40 @@ mod gpu_render_tests {
         Some((min, max, (sum / n as f64) as f32))
     }
 
+    fn assert_sane(label: &str, min: f32, max: f32, mean: f32) {
+        eprintln!("headless render [{label}] luma: min={min:.3} max={max:.3} mean={mean:.3}");
+        // Bright sky pixels present (catches all-black / DDA-returns-nothing).
+        assert!(max > 0.55, "[{label}] no bright sky pixels (max luma {max:.3}) — render likely broken");
+        // Dark terrain pixels present (catches all-sky / DDA never hits geometry).
+        assert!(min < 0.45, "[{label}] no dark terrain pixels (min luma {min:.3}) — DDA not hitting voxels");
+        assert!(mean > 0.05 && mean < 0.95, "[{label}] implausible mean luma {mean:.3}");
+    }
+
     #[test]
     fn renders_terrain_and_sky() {
-        let Some((min, max, mean)) = render_luma_stats() else {
+        let Some((min, max, mean)) = render_luma_stats_at(glam::IVec2::ZERO) else {
             eprintln!("no GPU adapter — skipping headless render test");
             return;
         };
-        eprintln!("headless render luma: min={min:.3} max={max:.3} mean={mean:.3}");
-        // Bright sky pixels present (catches all-black / DDA-returns-nothing).
-        assert!(max > 0.55, "no bright sky pixels (max luma {max:.3}) — render likely broken");
-        // Dark terrain pixels present (catches all-sky / DDA never hits geometry).
-        assert!(min < 0.45, "no dark terrain pixels (min luma {min:.3}) — DDA likely not hitting voxels");
-        // Sane overall exposure.
-        assert!(mean > 0.05 && mean < 0.95, "implausible mean luma {mean:.3}");
+        assert_sane("spawn", min, max, mean);
+    }
+
+    /// Stream the window thousands of voxels from spawn and render. Catches
+    /// origin-rebasing / large-float-precision regressions ("sky through hills")
+    /// that the spawn test (world_origin == 0) can't see. The far-origin frame
+    /// should look statistically just like spawn.
+    #[test]
+    fn renders_far_from_origin() {
+        // ~3.2M voxels from spawn: f32 ulp there is ~0.4 voxel, so WITHOUT
+        // origin-rebasing the DDA's `f32(voxel) - origin` cancels into garbage
+        // and the frame collapses (sky through everything / black). With
+        // rebasing the float math is window-local and stays precise, so the
+        // frame must still show terrain + sky. (Biome differs from spawn, so we
+        // assert sanity, not a luma match.)
+        let Some((min, max, mean)) = render_luma_stats_at(glam::IVec2::new(100_000, 100_000)) else {
+            eprintln!("no GPU adapter — skipping far-origin render test");
+            return;
+        };
+        assert_sane("far(100k chunks)", min, max, mean);
     }
 }

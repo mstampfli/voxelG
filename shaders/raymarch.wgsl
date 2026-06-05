@@ -1118,28 +1118,31 @@ fn trace_no_water(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
     out.last_axis = -1;
     out.t_hit = 0.0;
 
-    let win_min = vec3<f32>(camera.world_origin);
-    let win_max = win_min + vec3<f32>(f32(WORLD_VOXELS_X), f32(WORLD_VOXELS_Y), f32(WORLD_VOXELS_Z));
+    // Origin-rebased (see trace() for the rationale).
+    let ro = camera.world_origin;
+    let org = origin - vec3<f32>(ro);
+    let dims = vec3<f32>(f32(WORLD_VOXELS_X), f32(WORLD_VOXELS_Y), f32(WORLD_VOXELS_Z));
     let inv_dir = vec3<f32>(safe_inv(dir.x), safe_inv(dir.y), safe_inv(dir.z));
-    let t0 = (win_min - origin) * inv_dir;
-    let t1 = (win_max - origin) * inv_dir;
+    let t0 = (vec3<f32>(0.0) - org) * inv_dir;
+    let t1 = (dims - org) * inv_dir;
     let tmin3 = min(t0, t1);
     let tmax3 = max(t0, t1);
     let t_enter = max(max(tmin3.x, tmin3.y), max(tmin3.z, 0.0));
     let t_exit = min(min(tmax3.x, tmax3.y), tmax3.z);
     if (t_enter >= t_exit || t_exit < 0.0) { return out; }
 
-    let bias = 1e-2;
-    var p = origin + dir * (t_enter + bias);
-    p = clamp(p, win_min + vec3<f32>(0.01), win_max - vec3<f32>(0.01));
+    let bias = 1e-3;
+    var p = org + dir * (t_enter + bias);
+    p = clamp(p, vec3<f32>(0.01), dims - vec3<f32>(0.01));
     let step = vec3<i32>(sign(dir));
     let t_delta = abs(inv_dir);
 
-    var voxel = vec3<i32>(floor(p));
+    var voxel = vec3<i32>(floor(p)) + ro;
+    let vl0 = voxel - ro;
     var t_max: vec3<f32>;
-    if (step.x > 0) { t_max.x = (f32(voxel.x + 1) - origin.x) * inv_dir.x; } else { t_max.x = (f32(voxel.x) - origin.x) * inv_dir.x; }
-    if (step.y > 0) { t_max.y = (f32(voxel.y + 1) - origin.y) * inv_dir.y; } else { t_max.y = (f32(voxel.y) - origin.y) * inv_dir.y; }
-    if (step.z > 0) { t_max.z = (f32(voxel.z + 1) - origin.z) * inv_dir.z; } else { t_max.z = (f32(voxel.z) - origin.z) * inv_dir.z; }
+    if (step.x > 0) { t_max.x = (f32(vl0.x + 1) - org.x) * inv_dir.x; } else { t_max.x = (f32(vl0.x) - org.x) * inv_dir.x; }
+    if (step.y > 0) { t_max.y = (f32(vl0.y + 1) - org.y) * inv_dir.y; } else { t_max.y = (f32(vl0.y) - org.y) * inv_dir.y; }
+    if (step.z > 0) { t_max.z = (f32(vl0.z + 1) - org.z) * inv_dir.z; } else { t_max.z = (f32(vl0.z) - org.z) * inv_dir.z; }
 
     var last_axis: i32 = -1;
     for (var s: i32 = 0; s < 1024; s = s + 1) {
@@ -1156,24 +1159,24 @@ fn trace_no_water(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
         let l4p = slot_v >> vec3<u32>(8u);
         let l4i = world_l4_idx(l4p.x, l4p.y, l4p.z);
         if (l4_cell_empty(l4i)) {
-            skip_to_cell(256, &voxel, &t_max, origin, dir, inv_dir, step, &last_axis);
+            skip_to_cell(256, &voxel, &t_max, ro, org, dir, inv_dir, step, &last_axis);
             continue;
         }
         let chunk_lin = (cp.x & 3) + (cp.z & 3) * 4 + (cp.y & 3) * 16;
         if (!l4_has_child(l4i, chunk_lin)) {
-            skip_to_cell(64, &voxel, &t_max, origin, dir, inv_dir, step, &last_axis);
+            skip_to_cell(64, &voxel, &t_max, ro, org, dir, inv_dir, step, &last_axis);
             continue;
         }
         let ci = world_chunk_idx(cp.x, cp.y, cp.z);
         let tile_lin = (tp.x & 3) + (tp.z & 3) * 4 + (tp.y & 3) * 16;
         if (!chunk_has_child(ci, tile_lin)) {
-            skip_to_cell(16, &voxel, &t_max, origin, dir, inv_dir, step, &last_axis);
+            skip_to_cell(16, &voxel, &t_max, ro, org, dir, inv_dir, step, &last_axis);
             continue;
         }
         let ti = world_tile_idx(tp.x, tp.y, tp.z);
         let brick_lin = (bp.x & 3) + (bp.z & 3) * 4 + (bp.y & 3) * 16;
         if (!tile_has_child(ti, brick_lin)) {
-            skip_to_cell(4, &voxel, &t_max, origin, dir, inv_dir, step, &last_axis);
+            skip_to_cell(4, &voxel, &t_max, ro, org, dir, inv_dir, step, &last_axis);
             continue;
         }
         let bi = world_brick_idx(bp.x, bp.y, bp.z);
@@ -1570,28 +1573,31 @@ fn god_rays(origin: vec3<f32>, dir: vec3<f32>, t_far: f32, pix: vec2<f32>) -> ve
 // Stripped-down DDA — same hierarchy as `trace()` but returns the moment we
 // know the ray is occluded. No normal / material work.
 fn trace_any(origin: vec3<f32>, dir: vec3<f32>) -> bool {
-    let win_min = vec3<f32>(camera.world_origin);
-    let win_max = win_min + vec3<f32>(f32(WORLD_VOXELS_X), f32(WORLD_VOXELS_Y), f32(WORLD_VOXELS_Z));
+    // Origin-rebased (see trace() for the rationale).
+    let ro = camera.world_origin;
+    let org = origin - vec3<f32>(ro);
+    let dims = vec3<f32>(f32(WORLD_VOXELS_X), f32(WORLD_VOXELS_Y), f32(WORLD_VOXELS_Z));
     let inv_dir = vec3<f32>(safe_inv(dir.x), safe_inv(dir.y), safe_inv(dir.z));
-    let t0 = (win_min - origin) * inv_dir;
-    let t1 = (win_max - origin) * inv_dir;
+    let t0 = (vec3<f32>(0.0) - org) * inv_dir;
+    let t1 = (dims - org) * inv_dir;
     let tmin3 = min(t0, t1);
     let tmax3 = max(t0, t1);
     let t_enter = max(max(tmin3.x, tmin3.y), max(tmin3.z, 0.0));
     let t_exit = min(min(tmax3.x, tmax3.y), tmax3.z);
     if (t_enter >= t_exit || t_exit < 0.0) { return false; }
 
-    let bias = 1e-2;
-    var p = origin + dir * (t_enter + bias);
-    p = clamp(p, win_min + vec3<f32>(0.01), win_max - vec3<f32>(0.01));
+    let bias = 1e-3;
+    var p = org + dir * (t_enter + bias);
+    p = clamp(p, vec3<f32>(0.01), dims - vec3<f32>(0.01));
     let step = vec3<i32>(sign(dir));
     let t_delta = abs(inv_dir);
 
-    var voxel = vec3<i32>(floor(p));
+    var voxel = vec3<i32>(floor(p)) + ro;
+    let vl0 = voxel - ro;
     var t_max: vec3<f32>;
-    if (step.x > 0) { t_max.x = (f32(voxel.x + 1) - origin.x) * inv_dir.x; } else { t_max.x = (f32(voxel.x) - origin.x) * inv_dir.x; }
-    if (step.y > 0) { t_max.y = (f32(voxel.y + 1) - origin.y) * inv_dir.y; } else { t_max.y = (f32(voxel.y) - origin.y) * inv_dir.y; }
-    if (step.z > 0) { t_max.z = (f32(voxel.z + 1) - origin.z) * inv_dir.z; } else { t_max.z = (f32(voxel.z) - origin.z) * inv_dir.z; }
+    if (step.x > 0) { t_max.x = (f32(vl0.x + 1) - org.x) * inv_dir.x; } else { t_max.x = (f32(vl0.x) - org.x) * inv_dir.x; }
+    if (step.y > 0) { t_max.y = (f32(vl0.y + 1) - org.y) * inv_dir.y; } else { t_max.y = (f32(vl0.y) - org.y) * inv_dir.y; }
+    if (step.z > 0) { t_max.z = (f32(vl0.z + 1) - org.z) * inv_dir.z; } else { t_max.z = (f32(vl0.z) - org.z) * inv_dir.z; }
 
     var last_axis: i32 = -1;
     var t_cur = t_enter;
@@ -1610,27 +1616,27 @@ fn trace_any(origin: vec3<f32>, dir: vec3<f32>) -> bool {
         let l4p = slot_v >> vec3<u32>(8u);
         let l4i = world_l4_idx(l4p.x, l4p.y, l4p.z);
         if (l4_cell_empty(l4i)) {
-            skip_to_cell(256, &voxel, &t_max, origin, dir, inv_dir, step, &last_axis);
+            skip_to_cell(256, &voxel, &t_max, ro, org, dir, inv_dir, step, &last_axis);
             t_cur = axis_select(t_max, last_axis) - axis_select(t_delta, last_axis);
             continue;
         }
         let chunk_lin = (cp.x & 3) + (cp.z & 3) * 4 + (cp.y & 3) * 16;
         if (!l4_has_child(l4i, chunk_lin)) {
-            skip_to_cell(64, &voxel, &t_max, origin, dir, inv_dir, step, &last_axis);
+            skip_to_cell(64, &voxel, &t_max, ro, org, dir, inv_dir, step, &last_axis);
             t_cur = axis_select(t_max, last_axis) - axis_select(t_delta, last_axis);
             continue;
         }
         let ci = world_chunk_idx(cp.x, cp.y, cp.z);
         let tile_lin = (tp.x & 3) + (tp.z & 3) * 4 + (tp.y & 3) * 16;
         if (!chunk_has_child(ci, tile_lin)) {
-            skip_to_cell(16, &voxel, &t_max, origin, dir, inv_dir, step, &last_axis);
+            skip_to_cell(16, &voxel, &t_max, ro, org, dir, inv_dir, step, &last_axis);
             t_cur = axis_select(t_max, last_axis) - axis_select(t_delta, last_axis);
             continue;
         }
         let ti = world_tile_idx(tp.x, tp.y, tp.z);
         let brick_lin = (bp.x & 3) + (bp.z & 3) * 4 + (bp.y & 3) * 16;
         if (!tile_has_child(ti, brick_lin)) {
-            skip_to_cell(4, &voxel, &t_max, origin, dir, inv_dir, step, &last_axis);
+            skip_to_cell(4, &voxel, &t_max, ro, org, dir, inv_dir, step, &last_axis);
             t_cur = axis_select(t_max, last_axis) - axis_select(t_delta, last_axis);
             continue;
         }
@@ -1771,34 +1777,40 @@ fn trace(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
     out.last_axis = -1;
     out.t_hit = 0.0;
 
-    // Loaded window in world voxel coords.
-    let win_min = vec3<f32>(camera.world_origin);
-    let win_max = win_min + vec3<f32>(f32(WORLD_VOXELS_X), f32(WORLD_VOXELS_Y), f32(WORLD_VOXELS_Z));
+    // ---- Origin-rebased traversal (checklist: rebase to window-relative) ----
+    // The integer voxel grid stays in ABSOLUTE world coords (so cell alignment
+    // and the toroidal slot lookup are unchanged), but every FLOAT computation
+    // is done relative to the window corner `ro`. At large world coords
+    // `f32(voxel) - origin` catastrophically cancels (the "sky through hills"
+    // bug + the 1e-2 bias hack); `f32(voxel - ro) - (origin - ro)` keeps both
+    // operands small and exact. The ray parameter t is a distance, unchanged by
+    // the rebase.
+    let ro = camera.world_origin;
+    let org = origin - vec3<f32>(ro);
+    let dims = vec3<f32>(f32(WORLD_VOXELS_X), f32(WORLD_VOXELS_Y), f32(WORLD_VOXELS_Z));
     let inv_dir = vec3<f32>(safe_inv(dir.x), safe_inv(dir.y), safe_inv(dir.z));
 
-    let t0 = (win_min - origin) * inv_dir;
-    let t1 = (win_max - origin) * inv_dir;
+    let t0 = (vec3<f32>(0.0) - org) * inv_dir;
+    let t1 = (dims - org) * inv_dir;
     let tmin3 = min(t0, t1);
     let tmax3 = max(t0, t1);
     let t_enter = max(max(tmin3.x, tmin3.y), max(tmin3.z, 0.0));
     let t_exit = min(min(tmax3.x, tmax3.y), tmax3.z);
     if (t_enter >= t_exit || t_exit < 0.0) { return out; }
 
-    // Larger bias — at large world coords f32 precision around the voxel
-    // boundary made the ray skip cells and show sky/sun through them.
-    let bias = 1e-2;
-    var p = origin + dir * (t_enter + bias);
-    p = clamp(p, win_min + vec3<f32>(0.01), win_max - vec3<f32>(0.01));
+    let bias = 1e-3;
+    var p = org + dir * (t_enter + bias);
+    p = clamp(p, vec3<f32>(0.01), dims - vec3<f32>(0.01));
 
     let step = vec3<i32>(sign(dir));
     let t_delta = abs(inv_dir);
 
-    // DDA in WORLD voxel coords. The slot lookup folds via mod.
-    var voxel = vec3<i32>(floor(p));
+    var voxel = vec3<i32>(floor(p)) + ro;
+    let vl0 = voxel - ro;
     var t_max: vec3<f32>;
-    if (step.x > 0) { t_max.x = (f32(voxel.x + 1) - origin.x) * inv_dir.x; } else { t_max.x = (f32(voxel.x) - origin.x) * inv_dir.x; }
-    if (step.y > 0) { t_max.y = (f32(voxel.y + 1) - origin.y) * inv_dir.y; } else { t_max.y = (f32(voxel.y) - origin.y) * inv_dir.y; }
-    if (step.z > 0) { t_max.z = (f32(voxel.z + 1) - origin.z) * inv_dir.z; } else { t_max.z = (f32(voxel.z) - origin.z) * inv_dir.z; }
+    if (step.x > 0) { t_max.x = (f32(vl0.x + 1) - org.x) * inv_dir.x; } else { t_max.x = (f32(vl0.x) - org.x) * inv_dir.x; }
+    if (step.y > 0) { t_max.y = (f32(vl0.y + 1) - org.y) * inv_dir.y; } else { t_max.y = (f32(vl0.y) - org.y) * inv_dir.y; }
+    if (step.z > 0) { t_max.z = (f32(vl0.z + 1) - org.z) * inv_dir.z; } else { t_max.z = (f32(vl0.z) - org.z) * inv_dir.z; }
 
     var last_axis: i32 = -1;
     var t_cur: f32 = t_enter;
@@ -1827,13 +1839,13 @@ fn trace(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
         let l4p = slot_v >> vec3<u32>(8u);
         let l4i = world_l4_idx(l4p.x, l4p.y, l4p.z);
         if (l4_cell_empty(l4i)) {
-            skip_to_cell(256, &voxel, &t_max, origin, dir, inv_dir, step, &last_axis);
+            skip_to_cell(256, &voxel, &t_max, ro, org, dir, inv_dir, step, &last_axis);
             t_cur = axis_select(t_max, last_axis) - axis_select(t_delta, last_axis);
             continue;
         }
         let chunk_lin = (cp.x & 3) + (cp.z & 3) * 4 + (cp.y & 3) * 16;
         if (!l4_has_child(l4i, chunk_lin)) {
-            skip_to_cell(64, &voxel, &t_max, origin, dir, inv_dir, step, &last_axis);
+            skip_to_cell(64, &voxel, &t_max, ro, org, dir, inv_dir, step, &last_axis);
             t_cur = axis_select(t_max, last_axis) - axis_select(t_delta, last_axis);
             continue;
         }
@@ -1841,7 +1853,7 @@ fn trace(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
         let ci = world_chunk_idx(cp.x, cp.y, cp.z);
         let tile_in_chunk_lin = (tp.x & 3) + (tp.z & 3) * 4 + (tp.y & 3) * 16;
         if (!chunk_has_child(ci, tile_in_chunk_lin)) {
-            skip_to_cell(16, &voxel, &t_max, origin, dir, inv_dir, step, &last_axis);
+            skip_to_cell(16, &voxel, &t_max, ro, org, dir, inv_dir, step, &last_axis);
             t_cur = axis_select(t_max, last_axis) - axis_select(t_delta, last_axis);
             continue;
         }
@@ -1899,7 +1911,7 @@ fn trace(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
 
         let brick_in_tile_lin = (bp.x & 3) + (bp.z & 3) * 4 + (bp.y & 3) * 16;
         if (!tile_has_child(ti, brick_in_tile_lin)) {
-            skip_to_cell(4, &voxel, &t_max, origin, dir, inv_dir, step, &last_axis);
+            skip_to_cell(4, &voxel, &t_max, ro, org, dir, inv_dir, step, &last_axis);
             t_cur = axis_select(t_max, last_axis) - axis_select(t_delta, last_axis);
             continue;
         }
@@ -1957,7 +1969,7 @@ fn trace(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
                 return out;
             }
             // Brick empty — skip the whole 4-voxel cell.
-            skip_to_cell(4, &voxel, &t_max, origin, dir, inv_dir, step, &last_axis);
+            skip_to_cell(4, &voxel, &t_max, ro, org, dir, inv_dir, step, &last_axis);
             t_cur = axis_select(t_max, last_axis) - axis_select(t_delta, last_axis);
             continue;
         }
@@ -2062,39 +2074,38 @@ fn skip_to_cell(
     cell_size: i32,
     voxel: ptr<function, vec3<i32>>,
     t_max: ptr<function, vec3<f32>>,
-    origin: vec3<f32>,
+    ro: vec3<i32>,        // rebase reference (window corner, world voxels)
+    org: vec3<f32>,       // ray origin in window-local coords (= origin - ro)
     dir: vec3<f32>,
     inv_dir: vec3<f32>,
     step: vec3<i32>,
     last_axis: ptr<function, i32>,
 ) {
-    // voxel can be negative (negative world-origin window), so use a
-    // Euclidean modulo to find the in-cell offset.
+    // Cell alignment is in ABSOLUTE world coords (cell_size divides
+    // WORLD_VOXELS so this matches the toroidal slot cells). Only the float t
+    // math is done relative to `ro` for precision.
     let cell_origin = vec3<i32>(
         (*voxel).x - pos_mod((*voxel).x, cell_size),
         (*voxel).y - pos_mod((*voxel).y, cell_size),
         (*voxel).z - pos_mod((*voxel).z, cell_size),
     );
+    // Local-space cell boundary (small integers → exact in f32).
     var bnd: vec3<f32>;
-    bnd.x = select(f32(cell_origin.x), f32(cell_origin.x + cell_size), step.x > 0);
-    bnd.y = select(f32(cell_origin.y), f32(cell_origin.y + cell_size), step.y > 0);
-    bnd.z = select(f32(cell_origin.z), f32(cell_origin.z + cell_size), step.z > 0);
-    let t_face = (bnd - origin) * inv_dir;
+    bnd.x = f32(select(cell_origin.x, cell_origin.x + cell_size, step.x > 0) - ro.x);
+    bnd.y = f32(select(cell_origin.y, cell_origin.y + cell_size, step.y > 0) - ro.y);
+    bnd.z = f32(select(cell_origin.z, cell_origin.z + cell_size, step.z > 0) - ro.z);
+    let t_face = (bnd - org) * inv_dir;
     let eps = 1e-6;
     var t_min: f32 = 1e30;
     var ax: i32 = 0;
     if (step.x != 0 && t_face.x > eps && t_face.x < t_min) { t_min = t_face.x; ax = 0; }
     if (step.y != 0 && t_face.y > eps && t_face.y < t_min) { t_min = t_face.y; ax = 1; }
     if (step.z != 0 && t_face.z > eps && t_face.z < t_min) { t_min = t_face.z; ax = 2; }
-    // Matches the main trace bias — small bias was creating 1-pixel sky gaps
-    // at large world coords where float rounding straddles voxel boundaries.
-    let bias = 1e-2;
-    let p_new = origin + dir * (t_min + bias);
-    var nv = vec3<i32>(floor(p_new));
-    // Integer-snap the crossed axis. Float-floor of `origin + dir * t` can
-    // land on the *wrong side* of a boundary at far distance no matter how
-    // big the bias; snapping uses the exact cell math instead. This is what
-    // was causing the "huge sky gaps between voxels" while moving sideways.
+    let bias = 1e-3;
+    let p_new = org + dir * (t_min + bias);
+    var nv = vec3<i32>(floor(p_new)) + ro;
+    // Integer-snap the crossed axis exactly (float floor can land on the wrong
+    // side of a boundary; the cell math is exact).
     if (ax == 0) {
         if (step.x > 0) { nv.x = cell_origin.x + cell_size; }
         else            { nv.x = cell_origin.x - 1; }
@@ -2106,8 +2117,10 @@ fn skip_to_cell(
         else            { nv.z = cell_origin.z - 1; }
     }
     (*voxel) = nv;
-    if (step.x > 0) { (*t_max).x = (f32((*voxel).x + 1) - origin.x) * inv_dir.x; } else { (*t_max).x = (f32((*voxel).x) - origin.x) * inv_dir.x; }
-    if (step.y > 0) { (*t_max).y = (f32((*voxel).y + 1) - origin.y) * inv_dir.y; } else { (*t_max).y = (f32((*voxel).y) - origin.y) * inv_dir.y; }
-    if (step.z > 0) { (*t_max).z = (f32((*voxel).z + 1) - origin.z) * inv_dir.z; } else { (*t_max).z = (f32((*voxel).z) - origin.z) * inv_dir.z; }
+    // t_max for the new cell, computed in local coords.
+    let vl = nv - ro;
+    if (step.x > 0) { (*t_max).x = (f32(vl.x + 1) - org.x) * inv_dir.x; } else { (*t_max).x = (f32(vl.x) - org.x) * inv_dir.x; }
+    if (step.y > 0) { (*t_max).y = (f32(vl.y + 1) - org.y) * inv_dir.y; } else { (*t_max).y = (f32(vl.y) - org.y) * inv_dir.y; }
+    if (step.z > 0) { (*t_max).z = (f32(vl.z + 1) - org.z) * inv_dir.z; } else { (*t_max).z = (f32(vl.z) - org.z) * inv_dir.z; }
     *last_axis = ax;
 }
