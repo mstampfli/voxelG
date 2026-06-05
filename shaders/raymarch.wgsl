@@ -70,6 +70,10 @@ struct PlayersBuf {
 @group(0) @binding(9) var<storage, read> brick_uniform_packed: array<u32>;
 @group(0) @binding(10) var<storage, read> tile_uniform_packed: array<u32>;
 
+// L4 occupancy: one u64 (= 2 u32) per 256-voxel cell, one bit per child chunk.
+// The coarsest pyramid level — one bit test skips a 256 region.
+@group(0) @binding(11) var<storage, read> l4_mask: array<u32>;
+
 fn brick_uniform_mat(bi: i32) -> u32 {
     let w = brick_uniform_packed[bi >> 2];
     let shift = u32(bi & 3) * 8u;
@@ -136,6 +140,25 @@ fn chunk_has_child(ci: i32, child_lin: i32) -> bool {
         return (chunk_mask[base] & (1u << u32(child_lin))) != 0u;
     }
     return (chunk_mask[base + 1] & (1u << u32(child_lin - 32))) != 0u;
+}
+
+fn world_l4_idx(x: i32, y: i32, z: i32) -> i32 {
+    return x + y * WORLD_L4_X + z * WORLD_L4_X * WORLD_L4_Y;
+}
+
+// Is this child chunk occupied within its L4 cell?
+fn l4_has_child(li: i32, child_lin: i32) -> bool {
+    let base = li * 2;
+    if (child_lin < 32) {
+        return (l4_mask[base] & (1u << u32(child_lin))) != 0u;
+    }
+    return (l4_mask[base + 1] & (1u << u32(child_lin - 32))) != 0u;
+}
+
+// Is the entire 256-voxel L4 cell empty? One test skips a quarter-million voxels.
+fn l4_cell_empty(li: i32) -> bool {
+    let base = li * 2;
+    return (l4_mask[base] | l4_mask[base + 1]) == 0u;
 }
 
 fn brick_voxel_solid(bi: i32, vi: i32) -> bool {
@@ -1129,6 +1152,18 @@ fn trace_no_water(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
         let bp = slot_v >> vec3<u32>(2u);
         let tp = slot_v >> vec3<u32>(4u);
         let cp = slot_v >> vec3<u32>(6u);
+        // Nested hierarchy: skip the coarsest empty cell (L4 → chunk → tile → brick).
+        let l4p = slot_v >> vec3<u32>(8u);
+        let l4i = world_l4_idx(l4p.x, l4p.y, l4p.z);
+        if (l4_cell_empty(l4i)) {
+            skip_to_cell(256, &voxel, &t_max, origin, dir, inv_dir, step, &last_axis);
+            continue;
+        }
+        let chunk_lin = (cp.x & 3) + (cp.z & 3) * 4 + (cp.y & 3) * 16;
+        if (!l4_has_child(l4i, chunk_lin)) {
+            skip_to_cell(64, &voxel, &t_max, origin, dir, inv_dir, step, &last_axis);
+            continue;
+        }
         let ci = world_chunk_idx(cp.x, cp.y, cp.z);
         let tile_lin = (tp.x & 3) + (tp.z & 3) * 4 + (tp.y & 3) * 16;
         if (!chunk_has_child(ci, tile_lin)) {
@@ -1559,7 +1594,9 @@ fn trace_any(origin: vec3<f32>, dir: vec3<f32>) -> bool {
     if (step.z > 0) { t_max.z = (f32(voxel.z + 1) - origin.z) * inv_dir.z; } else { t_max.z = (f32(voxel.z) - origin.z) * inv_dir.z; }
 
     var last_axis: i32 = -1;
+    var t_cur = t_enter;
     for (var s: i32 = 0; s < 768; s = s + 1) {
+        if (t_cur > SHADOW_MAX_DIST) { return false; }
         let rel = voxel - camera.world_origin;
         if (rel.x < 0 || rel.x >= WORLD_VOXELS_X
          || rel.y < 0 || rel.y >= WORLD_VOXELS_Y
@@ -1569,16 +1606,32 @@ fn trace_any(origin: vec3<f32>, dir: vec3<f32>) -> bool {
         let bp = slot_v >> vec3<u32>(2u);
         let tp = slot_v >> vec3<u32>(4u);
         let cp = slot_v >> vec3<u32>(6u);
+        // Nested hierarchy: skip the coarsest empty cell (L4 → chunk → tile → brick).
+        let l4p = slot_v >> vec3<u32>(8u);
+        let l4i = world_l4_idx(l4p.x, l4p.y, l4p.z);
+        if (l4_cell_empty(l4i)) {
+            skip_to_cell(256, &voxel, &t_max, origin, dir, inv_dir, step, &last_axis);
+            t_cur = axis_select(t_max, last_axis) - axis_select(t_delta, last_axis);
+            continue;
+        }
+        let chunk_lin = (cp.x & 3) + (cp.z & 3) * 4 + (cp.y & 3) * 16;
+        if (!l4_has_child(l4i, chunk_lin)) {
+            skip_to_cell(64, &voxel, &t_max, origin, dir, inv_dir, step, &last_axis);
+            t_cur = axis_select(t_max, last_axis) - axis_select(t_delta, last_axis);
+            continue;
+        }
         let ci = world_chunk_idx(cp.x, cp.y, cp.z);
         let tile_lin = (tp.x & 3) + (tp.z & 3) * 4 + (tp.y & 3) * 16;
         if (!chunk_has_child(ci, tile_lin)) {
             skip_to_cell(16, &voxel, &t_max, origin, dir, inv_dir, step, &last_axis);
+            t_cur = axis_select(t_max, last_axis) - axis_select(t_delta, last_axis);
             continue;
         }
         let ti = world_tile_idx(tp.x, tp.y, tp.z);
         let brick_lin = (bp.x & 3) + (bp.z & 3) * 4 + (bp.y & 3) * 16;
         if (!tile_has_child(ti, brick_lin)) {
             skip_to_cell(4, &voxel, &t_max, origin, dir, inv_dir, step, &last_axis);
+            t_cur = axis_select(t_max, last_axis) - axis_select(t_delta, last_axis);
             continue;
         }
         let bi = world_brick_idx(bp.x, bp.y, bp.z);
@@ -1587,8 +1640,9 @@ fn trace_any(origin: vec3<f32>, dir: vec3<f32>) -> bool {
         if (brick_voxel_solid(bi, vi)) {
             let m = brick_voxel_material(bi, vi);
             if (is_foliage_mat(m)) {
-                // Sub-voxel sphere blocks shadow only if the shadow ray
-                // actually hits the sphere — dappled light through gaps.
+                // Far foliage blocks as a solid cube (cheap); only near foliage
+                // pays for the per-blade dappled-shadow test.
+                if (t_cur > FOLIAGE_NEAR_T) { return true; }
                 let fh = foliage_subvoxel(voxel, origin, dir, m);
                 if (fh.hit) { return true; }
             } else {
@@ -1597,14 +1651,17 @@ fn trace_any(origin: vec3<f32>, dir: vec3<f32>) -> bool {
         }
 
         if (t_max.x < t_max.y && t_max.x < t_max.z) {
+            t_cur = t_max.x;
             voxel.x = voxel.x + step.x;
             t_max.x = t_max.x + t_delta.x;
             last_axis = 0;
         } else if (t_max.y < t_max.z) {
+            t_cur = t_max.y;
             voxel.y = voxel.y + step.y;
             t_max.y = t_max.y + t_delta.y;
             last_axis = 1;
         } else {
+            t_cur = t_max.z;
             voxel.z = voxel.z + step.z;
             t_max.z = t_max.z + t_delta.z;
             last_axis = 2;
@@ -1681,6 +1738,30 @@ fn axis_select(v: vec3<f32>, ax: i32) -> f32 {
 // granularity instead of per-voxel.
 const LOD_BRICK_T: f32 = 400.0;
 
+// Even further out, terminate at TILE (16-voxel) granularity: far terrain is
+// blocky but each occupied tile costs one hit instead of a brick/voxel descent
+// (checklist: tile-level LOD for far terrain).
+const TILE_LOD_T: f32 = 520.0;
+
+// Distance-based ray budget (in voxels). Traversal stops here regardless of how
+// many DDA steps it took — replaces the old fixed voxel-step count so small
+// voxels can't run the loop out before reaching far geometry (holes-through-
+// terrain) and so empty rays don't waste steps. Comfortably covers the loaded
+// window (the camera sits at its centre).
+const MAX_RAY_DIST: f32 = 700.0;
+
+// Beyond this distance, procedural sub-voxel foliage (22-blade grass, leaf
+// alpha-cutouts) is treated as a solid cube rather than ray-marched. The
+// per-blade detail is sub-pixel far away and that inner loop is the single most
+// divergent/expensive thing a ray can hit (checklist: limit procedural foliage
+// to the nearest few metres).
+const FOLIAGE_NEAR_T: f32 = 72.0;
+
+// Shadow / occlusion rays give up past this distance (treated as lit). Far
+// shadows contribute little and are the most expensive secondary rays
+// (checklist: cheaper secondary rays / coarse shadows).
+const SHADOW_MAX_DIST: f32 = 480.0;
+
 fn trace(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
     var out: Hit;
     out.hit = false;
@@ -1723,6 +1804,8 @@ fn trace(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
     var t_cur: f32 = t_enter;
     let max_steps: i32 = 1024;
     for (var s: i32 = 0; s < max_steps; s = s + 1) {
+        // Distance budget — primary termination (the step cap is just a backstop).
+        if (t_cur > MAX_RAY_DIST) { return out; }
         // Bounds check on the LOADED WINDOW (world coords).
         let rel = voxel - camera.world_origin;
         if (rel.x < 0 || rel.x >= WORLD_VOXELS_X
@@ -1736,6 +1819,25 @@ fn trace(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
         let tp = slot_v >> vec3<u32>(4u);
         let cp = slot_v >> vec3<u32>(6u);
 
+        // ---- Nested hierarchical descent: skip the COARSEST empty cell ----
+        // L4 (256) → chunk (64) → tile (16) → brick (4) → voxel. Each empty
+        // level skips its whole cell in one DDA jump, so empty space (most of a
+        // ray) costs O(coarse steps) instead of O(voxels) — this is what keeps
+        // traversal cheap as voxels shrink.
+        let l4p = slot_v >> vec3<u32>(8u);
+        let l4i = world_l4_idx(l4p.x, l4p.y, l4p.z);
+        if (l4_cell_empty(l4i)) {
+            skip_to_cell(256, &voxel, &t_max, origin, dir, inv_dir, step, &last_axis);
+            t_cur = axis_select(t_max, last_axis) - axis_select(t_delta, last_axis);
+            continue;
+        }
+        let chunk_lin = (cp.x & 3) + (cp.z & 3) * 4 + (cp.y & 3) * 16;
+        if (!l4_has_child(l4i, chunk_lin)) {
+            skip_to_cell(64, &voxel, &t_max, origin, dir, inv_dir, step, &last_axis);
+            t_cur = axis_select(t_max, last_axis) - axis_select(t_delta, last_axis);
+            continue;
+        }
+
         let ci = world_chunk_idx(cp.x, cp.y, cp.z);
         let tile_in_chunk_lin = (tp.x & 3) + (tp.z & 3) * 4 + (tp.y & 3) * 16;
         if (!chunk_has_child(ci, tile_in_chunk_lin)) {
@@ -1745,6 +1847,31 @@ fn trace(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
         }
 
         let ti = world_tile_idx(tp.x, tp.y, tp.z);
+
+        // ---- Tile-level LOD: far terrain terminates at the (occupied) tile ----
+        if (t_cur > TILE_LOD_T) {
+            let lm = tile_representative_material(ti, tp);
+            if (lm != 0u && is_uniform_optimisable(lm)) {
+                var n = vec3<f32>(0.0);
+                var t_hit: f32;
+                if (last_axis == 0)      { n.x = -f32(step.x); t_hit = t_max.x - t_delta.x; }
+                else if (last_axis == 1) { n.y = -f32(step.y); t_hit = t_max.y - t_delta.y; }
+                else if (last_axis == 2) { n.z = -f32(step.z); t_hit = t_max.z - t_delta.z; }
+                else {
+                    t_hit = t_enter;
+                    if      (tmin3.x >= tmin3.y && tmin3.x >= tmin3.z) { n.x = -f32(step.x); }
+                    else if (tmin3.y >= tmin3.z)                       { n.y = -f32(step.y); }
+                    else                                               { n.z = -f32(step.z); }
+                }
+                out.hit = true;
+                out.mat = lm;
+                out.normal = n;
+                out.voxel = voxel;
+                out.last_axis = last_axis_after_entry(last_axis, tmin3);
+                out.t_hit = t_hit;
+                return out;
+            }
+        }
 
         // ---- Fast-skip: uniform 16-voxel tile (one material throughout) ----
         // Whole 4096-voxel tile is one opaque material — surface at entry face.
@@ -1839,7 +1966,11 @@ fn trace(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
         let vi = brick_voxel_idx(local.x, local.y, local.z);
         if (brick_voxel_solid(bi, vi)) {
             let m = brick_voxel_material(bi, vi);
-            if (is_foliage_mat(m)) {
+            // Near foliage gets the full per-blade procedural cutout; far
+            // foliage falls through to the solid-cube branch below (the detail
+            // is sub-pixel and the inner loop is the most divergent work a ray
+            // can do — checklist: limit procedural foliage to near distance).
+            if (is_foliage_mat(m) && t_cur <= FOLIAGE_NEAR_T) {
                 let fh = foliage_subvoxel(voxel, origin, dir, m);
                 if (fh.hit) {
                     out.hit = true;
@@ -1897,6 +2028,27 @@ fn trace(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
         }
     }
     return out;
+}
+
+// Representative material of a 16-voxel tile for far tile-LOD: the topmost
+// solid voxel of the tile's first occupied child brick. tp = tile coord in slot
+// space.
+fn tile_representative_material(ti: i32, tp: vec3<i32>) -> u32 {
+    let base = ti * 2;
+    var lin: i32 = -1;
+    let lo = tile_mask[base];
+    if (lo != 0u) {
+        lin = i32(firstTrailingBit(lo));
+    } else {
+        let hi = tile_mask[base + 1];
+        if (hi != 0u) { lin = 32 + i32(firstTrailingBit(hi)); }
+    }
+    if (lin < 0) { return 0u; }
+    let lx = lin & 3;
+    let lz = (lin >> 2) & 3;
+    let ly = (lin >> 4) & 3;
+    let bi = world_brick_idx(tp.x * 4 + lx, tp.y * 4 + ly, tp.z * 4 + lz);
+    return brick_topmost_material(bi);
 }
 
 fn last_axis_after_entry(la: i32, tmin3: vec3<f32>) -> i32 {
