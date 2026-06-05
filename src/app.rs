@@ -98,9 +98,13 @@ pub struct App {
 
     // Multiplayer.
     net: Option<net::NetClient>,
+    /// Server address (Some in connect mode), kept so we can auto-reconnect.
+    server_addr: Option<String>,
+    last_reconnect: Instant,
     last_sent_pose: Option<(Vec3, f32, f32)>,
     last_net_send: Instant,
-    remote_players: std::collections::HashMap<net::PlayerId, ([f32; 3], f32, f32)>,
+    last_heartbeat: Instant,
+    remote_players: std::collections::HashMap<net::PlayerId, net::RemotePlayer>,
 
     // Click queue. Consumed at the top of a frame after camera state for the
     // about-to-render frame is settled, so the raycast direction matches the
@@ -109,7 +113,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(net: Option<net::NetClient>) -> Self {
+    pub fn new(net: Option<net::NetClient>, server_addr: Option<String>) -> Self {
         let mut world = World::new();
         world.fill_demo_terrain();
         // Spawn above the surface at the spawn column. The default y (80) is
@@ -138,8 +142,11 @@ impl App {
             frames_since_log: 0,
             last_log: Instant::now(),
             net,
+            server_addr,
+            last_reconnect: Instant::now(),
             last_sent_pose: None,
             last_net_send: Instant::now(),
+            last_heartbeat: Instant::now(),
             remote_players: std::collections::HashMap::new(),
             pending_clicks: Vec::new(),
         }
@@ -159,7 +166,27 @@ impl App {
         }
     }
 
-    fn poll_net(&mut self) {
+    /// Auto-reconnect: if the link dropped, retry every 2s. A fresh connection
+    /// re-handshakes and the server replays the full ordered edit log, so we
+    /// re-sync world state automatically (checklist: reconnection).
+    fn maybe_reconnect(&mut self, now: Instant) {
+        let Some(addr) = self.server_addr.clone() else { return; };
+        let down = self.net.as_ref().map_or(true, |n| !n.is_connected());
+        if down && (now - self.last_reconnect) >= Duration::from_secs(2) {
+            self.last_reconnect = now;
+            match net::NetClient::connect(&addr) {
+                Ok(c) => {
+                    log::info!("reconnected to {addr}");
+                    self.net = Some(c);
+                    self.last_sent_pose = None;
+                    self.remote_players.clear();
+                }
+                Err(e) => log::warn!("reconnect to {addr} failed: {e}"),
+            }
+        }
+    }
+
+    fn poll_net(&mut self, now: Instant) {
         let (msgs, my_id) = match self.net.as_mut() {
             Some(net) => (net.drain(), net.my_id),
             None => return,
@@ -168,7 +195,11 @@ impl App {
             match msg {
                 net::Message::PlayerUpdate { id, pos, yaw, pitch } => {
                     if Some(id) != my_id {
-                        self.remote_players.insert(id, (pos, yaw, pitch));
+                        // Feed the interpolation buffer instead of snapping.
+                        self.remote_players
+                            .entry(id)
+                            .or_insert_with(net::RemotePlayer::new)
+                            .push_sample(now, pos, yaw, pitch);
                     }
                 }
                 net::Message::PlayerJoin { id } => {
@@ -178,14 +209,33 @@ impl App {
                     log::info!("player {} left", id);
                     self.remote_players.remove(&id);
                 }
-                net::Message::VoxelEdit { wx, wy, wz, mat } => {
+                net::Message::VoxelEdit { wx, wy, wz, mat, .. } => {
                     self.world.apply_edit(wx, wy, wz, mat);
                 }
-                net::Message::Explode { cx, cy, cz, radius, mat } => {
+                net::Message::Explode { cx, cy, cz, radius, mat, .. } => {
                     self.apply_sphere(cx, cy, cz, radius, mat);
                 }
-                net::Message::JoinAck { your_id, seed } => {
+                net::Message::EditLog { compressed } => {
+                    // Ordered, compressed edit-log replay (late-join sync).
+                    let edits = net::decompress_edits(&compressed);
+                    log::info!("applying {} replayed edits", edits.len());
+                    for e in edits {
+                        match e {
+                            net::Message::VoxelEdit { wx, wy, wz, mat, .. } => {
+                                self.world.apply_edit(wx, wy, wz, mat);
+                            }
+                            net::Message::Explode { cx, cy, cz, radius, mat, .. } => {
+                                self.apply_sphere(cx, cy, cz, radius, mat);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                net::Message::JoinAck { your_id, seed, .. } => {
                     log::info!("joined as player {} (seed {})", your_id, seed);
+                }
+                net::Message::VersionMismatch { server_version } => {
+                    log::error!("protocol mismatch: server v{server_version}");
                 }
                 _ => {}
             }
@@ -196,22 +246,22 @@ impl App {
         let Some(net) = self.net.as_ref() else { return; };
         let pose = (self.camera.pos, self.camera.yaw, self.camera.pitch);
         let changed = self.last_sent_pose.map_or(true, |p| p != pose);
-        // Cap at 20 Hz.
+        // Cap at 20 Hz; pose goes over UDP (lossy is fine).
         if changed && (now - self.last_net_send) >= Duration::from_millis(50) {
-            net.send(net::Message::PlayerUpdate {
-                id: net.my_id.unwrap_or(0),
-                pos: pose.0.to_array(),
-                yaw: pose.1,
-                pitch: pose.2,
-            });
+            net.send_pose(net.my_id.unwrap_or(0), pose.0.to_array(), pose.1, pose.2);
             self.last_sent_pose = Some(pose);
             self.last_net_send = now;
+        }
+        // Heartbeat (TCP) so the server doesn't time us out when we're still.
+        if (now - self.last_heartbeat) >= net::HEARTBEAT_INTERVAL {
+            net.heartbeat();
+            self.last_heartbeat = now;
         }
     }
 
     fn broadcast_edit_world(&self, wx: i32, wy: i32, wz: i32, mat: u8) {
         let Some(net) = self.net.as_ref() else { return; };
-        net.send(net::Message::VoxelEdit { wx, wy, wz, mat });
+        net.send(net::Message::VoxelEdit { wx, wy, wz, mat, seq: 0 });
     }
 
     /// Expand a sphere-of-impact into the persistent edit log. Used both for
@@ -302,7 +352,7 @@ impl App {
                     self.apply_sphere(cx, cy, cz, r, voxel::MAT_AIR);
                     if let Some(net) = self.net.as_ref() {
                         net.send(net::Message::Explode {
-                            cx, cy, cz, radius: r, mat: voxel::MAT_AIR,
+                            cx, cy, cz, radius: r, mat: voxel::MAT_AIR, seq: 0,
                         });
                     }
                 }
@@ -330,7 +380,8 @@ impl App {
         self.last_frame = now;
 
         // Pump network in/out before re-borrowing renderer.
-        self.poll_net();
+        self.maybe_reconnect(now);
+        self.poll_net(now);
         self.maybe_send_pose(now);
 
         let speed = if self.keys.sprint { 4.0 } else { 1.0 };
@@ -433,9 +484,10 @@ impl App {
         renderer.upload_world(&mut self.world);
         let t = (now - self.start_time).as_secs_f32();
         renderer.update_camera(&self.camera, t, self.world.world_origin_voxel(), jitter, taa_blend);
+        // Render remote players at their interpolated (delayed) pose.
         let players_vec: Vec<(Vec3, u32)> = self.remote_players
             .iter()
-            .map(|(id, (pos, _yaw, _pitch))| (Vec3::from_array(*pos), *id))
+            .filter_map(|(id, rp)| rp.sample(now).map(|(pos, _, _)| (Vec3::from_array(pos), *id)))
             .collect();
         renderer.upload_players(&players_vec);
         if any_dirty {
@@ -569,12 +621,12 @@ impl ApplicationHandler for App {
 }
 
 /// Build the winit event loop and run the client application.
-pub fn run_client(net: Option<net::NetClient>) {
+pub fn run_client(net: Option<net::NetClient>, server_addr: Option<String>) {
     let event_loop = EventLoop::new().expect("event loop");
     // Frame-paced: the loop wakes on input or at the next scheduled frame
     // (see App::about_to_wait), not in a tight Poll spin.
     event_loop.set_control_flow(ControlFlow::Wait);
-    let mut app = App::new(net);
+    let mut app = App::new(net, server_addr);
     if let Err(e) = event_loop.run_app(&mut app) {
         log::error!("event loop exited with error: {e}");
     }

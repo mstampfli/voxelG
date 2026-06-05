@@ -41,20 +41,24 @@ fn main() {
     match parse_mode() {
         Mode::Server(port) => server::run_server(port),
         mode => {
-            let net = match mode {
-                Mode::Connect(addr) => match net::NetClient::connect(&addr) {
-                    Ok(c) => {
-                        log::info!("connected to {}", addr);
-                        Some(c)
-                    }
-                    Err(e) => {
-                        log::error!("connect failed: {}", e);
-                        None
-                    }
-                },
-                _ => None,
+            let (net, server_addr) = match mode {
+                Mode::Connect(addr) => {
+                    let net = match net::NetClient::connect(&addr) {
+                        Ok(c) => {
+                            log::info!("connected to {}", addr);
+                            Some(c)
+                        }
+                        Err(e) => {
+                            log::error!("connect failed: {} (will retry)", e);
+                            None
+                        }
+                    };
+                    // Keep the address either way so the client auto-reconnects.
+                    (net, Some(addr))
+                }
+                _ => (None, None),
             };
-            app::run_client(net);
+            app::run_client(net, server_addr);
         }
     }
 }
