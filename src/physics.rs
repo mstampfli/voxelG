@@ -35,36 +35,51 @@ pub fn tick(world: &mut World) {
     // brick's bottom row AGAIN after the top brick's pass 2 already filled
     // it, draining a 1-cell gap. Bottom-up means each brick sees the FINAL
     // state of the brick above (which has already finished its passes).
-    let mut active = world.active_bricks.clone();
+    //
+    // Reusable scratch (no per-tick allocation): `active` is a sorted snapshot
+    // of active_bricks, taken out of the world so we can iterate it while
+    // mutating the world; `touched` is the per-tick changed-brick set.
+    let mut active = std::mem::take(&mut world.phys_scratch);
+    active.clear();
+    active.extend_from_slice(&world.active_bricks);
     active.sort_by_key(|&bi| (bi / WORLD_BRICKS_X) % WORLD_BRICKS_Y);
-    let mut touched: Vec<u32> = Vec::with_capacity(active.len() * 2);
-    for bi in &active {
-        if world.movable_mask[*bi as usize] == 0 { continue; }
-        step_brick_water(world, *bi, &mut touched);
+    let mut touched = std::mem::take(&mut world.phys_touched);
+    touched.clear();
+    for &bi in &active {
+        if world.movable_mask[bi as usize] == 0 { continue; }
+        step_brick_water(world, bi, &mut touched);
     }
-    // 3. Smoke — rises top-down so it doesn't teleport up a column in one tick.
-    let mut smoke_active = active;
-    smoke_active.sort_by_key(|&bi| std::cmp::Reverse((bi / WORLD_BRICKS_X) % WORLD_BRICKS_Y));
-    for bi in smoke_active {
+    // 3. Smoke — rises top-down. Re-sort the same buffer (reverse Y) rather than
+    // cloning a second list.
+    active.sort_by_key(|&bi| std::cmp::Reverse((bi / WORLD_BRICKS_X) % WORLD_BRICKS_Y));
+    for &bi in &active {
         if world.movable_mask[bi as usize] == 0 { continue; }
         step_brick_smoke(world, bi, frame, &mut touched);
     }
     // Settle sand on bricks the fluids touched.
     settle_sand(world, &mut touched);
+    // Return the scratch buffers for reuse next tick.
+    world.phys_scratch = active;
+    world.phys_touched = touched;
 }
 
 // ---------------- sand gravity ----------------
 
 fn sand_gravity_pass(world: &mut World) {
-    let mut active: Vec<u32> = world.active_bricks.clone();
+    // Reuse the world's physics scratch (no per-pass clone). Safe because this
+    // runs before tick()'s own use of phys_scratch, and is restored before it.
+    let mut active = std::mem::take(&mut world.phys_scratch);
+    active.clear();
+    active.extend_from_slice(&world.active_bricks);
     active.sort_by_key(|&bi| (bi / WORLD_BRICKS_X) % WORLD_BRICKS_Y);
-    for bi in active {
+    for &bi in &active {
         if world.movable_mask[bi as usize] == 0 { continue; }
         let bx = bi % WORLD_BRICKS_X;
         let by = (bi / WORLD_BRICKS_X) % WORLD_BRICKS_Y;
         let bz = bi / (WORLD_BRICKS_X * WORLD_BRICKS_Y);
         step_brick_sand_fall(world, bx, by, bz);
     }
+    world.phys_scratch = active;
 }
 
 fn settle_sand(world: &mut World, touched: &mut Vec<u32>) {

@@ -2,7 +2,8 @@
 // orchestration loop. Split out of main.rs so the frame loop, the server loop
 // and process startup each live in their own module (checklist: hygiene).
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use winit::application::ApplicationHandler;
@@ -59,6 +60,30 @@ const JITTER_PATTERN: [[f32; 2]; 8] = [
     [-0.062_5, 0.388_888_9],
 ];
 
+/// World-voxel offset of the loaded window's lower corner.
+fn world_origin_voxel(world: &World) -> IVec3 {
+    IVec3::new(
+        world.world_origin_chunk.x * voxel::STORAGE_CHUNK_VOXELS as i32,
+        0,
+        world.world_origin_chunk.y * voxel::STORAGE_CHUNK_VOXELS as i32,
+    )
+}
+
+/// Expand a sphere-of-impact into the world (and its persistent edit log). Free
+/// function so it can run while the world Mutex guard is held (no &mut self).
+fn apply_sphere(world: &mut World, cx: i32, cy: i32, cz: i32, radius: u8, mat: u8) {
+    let r = radius as i32;
+    let r2 = r * r;
+    for dy in -r..=r {
+        for dx in -r..=r {
+            for dz in -r..=r {
+                if dx * dx + dy * dy + dz * dz > r2 { continue; }
+                world.apply_edit(cx + dx, cy + dy, cz + dz, mat);
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct Keys {
     forward: bool,
@@ -74,11 +99,15 @@ pub struct App {
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
     camera: Camera,
-    world: World,
+    /// Shared with the physics worker thread. Streaming, edits, upload and the
+    /// physics tick all lock this; physics no longer runs synchronously inside
+    /// the frame (checklist: physics on a worker thread).
+    world: Arc<Mutex<World>>,
+    /// Signals the physics worker to stop (set in App::drop).
+    phys_stop: Arc<AtomicBool>,
     keys: Keys,
     last_frame: Instant,
     start_time: Instant,
-    physics_acc: f32,
     grabbed: bool,
     frames_since_log: u32,
     last_log: Instant,
@@ -123,15 +152,39 @@ impl App {
         let s = voxel::sample_terrain(camera.pos.x, camera.pos.z, world.seed);
         let surface = s.h.max(s.water_top) as f32;
         camera.pos.y = surface + 10.0;
+
+        // Hand the world to a physics worker thread. It runs the fixed-step CA
+        // at 30 Hz behind the shared mutex; the render thread only takes the
+        // lock briefly for streaming / edits / upload, so a heavy fluid sim no
+        // longer stalls the frame (checklist: physics on a worker thread).
+        let world = Arc::new(Mutex::new(world));
+        let phys_stop = Arc::new(AtomicBool::new(false));
+        {
+            let world = world.clone();
+            let stop = phys_stop.clone();
+            std::thread::Builder::new()
+                .name("physics".into())
+                .spawn(move || {
+                    let step = Duration::from_micros(1_000_000 / 30);
+                    while !stop.load(Ordering::Relaxed) {
+                        std::thread::sleep(step);
+                        if let Ok(mut w) = world.lock() {
+                            physics::tick(&mut w);
+                        }
+                    }
+                })
+                .expect("spawn physics thread");
+        }
+
         Self {
             window: None,
             renderer: None,
             camera,
             world,
+            phys_stop,
             keys: Keys::default(),
             last_frame: Instant::now(),
             start_time: Instant::now(),
-            physics_acc: 0.0,
             last_camera_pose: None,
             frame_counter: 0,
             refresh_phase: 0,
@@ -150,14 +203,6 @@ impl App {
             remote_players: std::collections::HashMap::new(),
             pending_clicks: Vec::new(),
         }
-    }
-
-    fn world_origin_voxel(&self) -> IVec3 {
-        IVec3::new(
-            self.world.world_origin_chunk.x * voxel::STORAGE_CHUNK_VOXELS as i32,
-            0,
-            self.world.world_origin_chunk.y * voxel::STORAGE_CHUNK_VOXELS as i32,
-        )
     }
 
     fn request_redraw(&self) {
@@ -210,22 +255,23 @@ impl App {
                     self.remote_players.remove(&id);
                 }
                 net::Message::VoxelEdit { wx, wy, wz, mat, .. } => {
-                    self.world.apply_edit(wx, wy, wz, mat);
+                    self.world.lock().unwrap().apply_edit(wx, wy, wz, mat);
                 }
                 net::Message::Explode { cx, cy, cz, radius, mat, .. } => {
-                    self.apply_sphere(cx, cy, cz, radius, mat);
+                    apply_sphere(&mut self.world.lock().unwrap(), cx, cy, cz, radius, mat);
                 }
                 net::Message::EditLog { compressed } => {
                     // Ordered, compressed edit-log replay (late-join sync).
                     let edits = net::decompress_edits(&compressed);
                     log::info!("applying {} replayed edits", edits.len());
+                    let mut world = self.world.lock().unwrap();
                     for e in edits {
                         match e {
                             net::Message::VoxelEdit { wx, wy, wz, mat, .. } => {
-                                self.world.apply_edit(wx, wy, wz, mat);
+                                world.apply_edit(wx, wy, wz, mat);
                             }
                             net::Message::Explode { cx, cy, cz, radius, mat, .. } => {
-                                self.apply_sphere(cx, cy, cz, radius, mat);
+                                apply_sphere(&mut world, cx, cy, cz, radius, mat);
                             }
                             _ => {}
                         }
@@ -262,21 +308,6 @@ impl App {
     fn broadcast_edit_world(&self, wx: i32, wy: i32, wz: i32, mat: u8) {
         let Some(net) = self.net.as_ref() else { return; };
         net.send(net::Message::VoxelEdit { wx, wy, wz, mat, seq: 0 });
-    }
-
-    /// Expand a sphere-of-impact into the persistent edit log. Used both for
-    /// the local player's left-click and for received `Explode` messages.
-    fn apply_sphere(&mut self, cx: i32, cy: i32, cz: i32, radius: u8, mat: u8) {
-        let r = radius as i32;
-        let r2 = r * r;
-        for dy in -r..=r {
-            for dx in -r..=r {
-                for dz in -r..=r {
-                    if dx * dx + dy * dy + dz * dz > r2 { continue; }
-                    self.world.apply_edit(cx + dx, cy + dy, cz + dz, mat);
-                }
-            }
-        }
     }
 
     fn grab(&mut self, on: bool) {
@@ -316,7 +347,7 @@ impl App {
             KeyCode::KeyT if pressed => {
                 let fwd = self.camera.forward();
                 let p = self.camera.pos + fwd * 15.0;
-                self.world.apply_edit(
+                self.world.lock().unwrap().apply_edit(
                     p.x.floor() as i32, p.y.floor() as i32, p.z.floor() as i32, voxel::MAT_LAVA,
                 );
             }
@@ -339,17 +370,18 @@ impl App {
         }
         use winit::event::MouseButton;
         let clicks = std::mem::take(&mut self.pending_clicks);
-        let world_origin = self.world_origin_voxel();
+        let mut world = self.world.lock().unwrap();
+        let world_origin = world_origin_voxel(&world);
         for button in clicks {
             let Some(hit) = raycast::raycast(
-                self.camera.pos, self.camera.forward(), &self.world, world_origin,
+                self.camera.pos, self.camera.forward(), &world, world_origin,
             ) else { continue; };
             let v = hit.voxel;
             match button {
                 MouseButton::Left => {
                     let (cx, cy, cz) = (v[0], v[1], v[2]);
                     let r: u8 = 2;
-                    self.apply_sphere(cx, cy, cz, r, voxel::MAT_AIR);
+                    apply_sphere(&mut world, cx, cy, cz, r, voxel::MAT_AIR);
                     if let Some(net) = self.net.as_ref() {
                         net.send(net::Message::Explode {
                             cx, cy, cz, radius: r, mat: voxel::MAT_AIR, seq: 0,
@@ -360,7 +392,7 @@ impl App {
                     let wx = v[0] + hit.normal[0];
                     let wy = v[1] + hit.normal[1];
                     let wz = v[2] + hit.normal[2];
-                    self.world.apply_edit(wx, wy, wz, self.current_material);
+                    world.apply_edit(wx, wy, wz, self.current_material);
                     self.broadcast_edit_world(wx, wy, wz, self.current_material);
                 }
                 _ => {}
@@ -390,30 +422,24 @@ impl App {
         let u = (self.keys.up as i32 - self.keys.down as i32) as f32;
         self.camera.translate_local(dt, f * speed, r * speed, u * speed);
 
-        // Streaming: keep the loaded window centred on the camera, but with a
+        // Streaming (brief world lock): keep the window centred with a
         // hysteresis deadband so boundary oscillation doesn't thrash regen.
-        let cur_origin = self.world.world_origin_chunk;
-        let target_origin = voxel::World::target_origin_chunk(self.camera.pos);
-        let drift = target_origin - cur_origin;
-        if drift.x.abs() >= STREAM_HYSTERESIS || drift.y.abs() >= STREAM_HYSTERESIS {
-            self.world.shift_origin(target_origin);
+        {
+            let mut world = self.world.lock().unwrap();
+            let cur_origin = world.world_origin_chunk;
+            let target_origin = voxel::World::target_origin_chunk(self.camera.pos);
+            let drift = target_origin - cur_origin;
+            if drift.x.abs() >= STREAM_HYSTERESIS || drift.y.abs() >= STREAM_HYSTERESIS {
+                world.shift_origin(target_origin);
+            }
+            // Generation runs on the worker pool; this only installs results.
+            world.install_finished_chunks(CHUNK_INSTALL_BUDGET);
         }
-        // Install async-generated chunks under a per-frame budget. Generation
-        // itself runs on the worker pool, so the frame never blocks on noise.
-        self.world.install_finished_chunks(CHUNK_INSTALL_BUDGET);
 
-        // Raycast queued clicks against the now-settled camera.
+        // Raycast queued clicks against the now-settled camera (locks internally).
         self.consume_clicks();
 
-        // Fixed-step physics.
-        self.physics_acc += dt;
-        let step = 1.0 / 30.0;
-        let mut steps = 0;
-        while self.physics_acc >= step && steps < 4 {
-            physics::tick(&mut self.world);
-            self.physics_acc -= step;
-            steps += 1;
-        }
+        // Physics now runs on its own worker thread — no inline tick here.
 
         // ---- temporal differential ----
         let cur_pose = (self.camera.pos, self.camera.yaw, self.camera.pitch, self.camera.fov_y);
@@ -429,9 +455,6 @@ impl App {
                     || (self.camera.fov_y - pf).abs() > 1.0e-4
             }
         };
-        let physics_changed = self.world.all_dirty || !self.world.dirty_bricks.is_empty();
-        let force_full = self.first_frame || self.world.all_dirty || camera_changed;
-
         let (rw, rh) = self.renderer.as_ref().unwrap().size;
         let tiles_w = (rw + 7) / 8;
         let tiles_h = (rh + 7) / 8;
@@ -440,38 +463,8 @@ impl App {
         self.tile_dirty_mask.clear();
         self.tile_dirty_mask.resize(word_count, 0);
 
-        if force_full {
-            for w in self.tile_dirty_mask.iter_mut() { *w = u32::MAX; }
-        } else {
-            // Physics-dirty tiles (projected from the dirty bricks, no clone).
-            if physics_changed {
-                let world = &self.world;
-                let camera = &self.camera;
-                let mask = &mut self.tile_dirty_mask;
-                for &bi in &world.dirty_bricks {
-                    temporal::project_brick_to_tiles(
-                        bi, world, camera, rw, rh, tiles_w, tiles_h, mask,
-                    );
-                }
-            }
-            // #2: rotating animation refresh — re-trace ~1/ANIM_REFRESH_SPREAD
-            // of the tiles each frame so sky/water/foliage keep animating on a
-            // still camera, spread evenly instead of a hard full re-trace every
-            // 15 frames (which periodically stuttered).
-            let phase = self.refresh_phase as usize;
-            let mut idx = phase;
-            while idx < n_tiles {
-                self.tile_dirty_mask[idx >> 5] |= 1u32 << (idx & 31);
-                idx += ANIM_REFRESH_SPREAD;
-            }
-            self.refresh_phase = (self.refresh_phase + 1) % ANIM_REFRESH_SPREAD as u32;
-        }
-        // We always re-trace at least the rotating animation subset, so a frame
-        // is never fully skipped (keeps the world alive on an idle camera).
-        let any_dirty = true;
-
-        // TAA: jitter + accumulate only on a static camera (where small-voxel
-        // shimmer is worst); on motion pass the current frame through sharp.
+        // TAA: jitter + accumulate only on a static camera (needs only
+        // camera_changed / first_frame, so compute before taking the lock).
         self.frame_counter += 1;
         let accumulate = !camera_changed && !self.first_frame;
         let (jitter, taa_blend) = if accumulate {
@@ -479,11 +472,45 @@ impl App {
         } else {
             ([0.0_f32, 0.0_f32], 0.0_f32)
         };
+        let t = (now - self.start_time).as_secs_f32();
+
+        // Build the dirty-tile mask + upload world + camera under one lock so
+        // the physics worker can run in the gaps between frames.
+        {
+            let mut world = self.world.lock().unwrap();
+            let physics_changed = world.all_dirty || !world.dirty_bricks.is_empty();
+            let force_full = self.first_frame || world.all_dirty || camera_changed;
+            if force_full {
+                for w in self.tile_dirty_mask.iter_mut() { *w = u32::MAX; }
+            } else {
+                // Physics-dirty tiles (projected from the dirty bricks, no clone).
+                if physics_changed {
+                    let camera = &self.camera;
+                    let mask = &mut self.tile_dirty_mask;
+                    for &bi in &world.dirty_bricks {
+                        temporal::project_brick_to_tiles(
+                            bi, &world, camera, rw, rh, tiles_w, tiles_h, mask,
+                        );
+                    }
+                }
+                // #2: rotating animation refresh — re-trace ~1/ANIM_REFRESH_SPREAD
+                // of the tiles each frame so sky/water/foliage keep animating.
+                let mut idx = self.refresh_phase as usize;
+                while idx < n_tiles {
+                    self.tile_dirty_mask[idx >> 5] |= 1u32 << (idx & 31);
+                    idx += ANIM_REFRESH_SPREAD;
+                }
+                self.refresh_phase = (self.refresh_phase + 1) % ANIM_REFRESH_SPREAD as u32;
+            }
+            let world_origin = world_origin_voxel(&world);
+            let renderer = self.renderer.as_mut().unwrap();
+            renderer.upload_world(&mut world);
+            renderer.update_camera(&self.camera, t, world_origin, jitter, taa_blend);
+        }
+        // We always re-trace at least the rotating animation subset.
+        let any_dirty = true;
 
         let renderer = self.renderer.as_mut().unwrap();
-        renderer.upload_world(&mut self.world);
-        let t = (now - self.start_time).as_secs_f32();
-        renderer.update_camera(&self.camera, t, self.world.world_origin_voxel(), jitter, taa_blend);
         // Render remote players at their interpolated (delayed) pose.
         let players_vec: Vec<(Vec3, u32)> = self.remote_players
             .iter()
@@ -524,6 +551,13 @@ impl App {
     }
 }
 
+impl Drop for App {
+    fn drop(&mut self) {
+        // Tell the physics worker to exit so it doesn't outlive the app.
+        self.phys_stop.store(true, Ordering::Relaxed);
+    }
+}
+
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
@@ -540,7 +574,7 @@ impl ApplicationHandler for App {
                 return;
             }
         };
-        let renderer = match Renderer::new(window.clone(), &self.world) {
+        let renderer = match Renderer::new(window.clone(), &self.world.lock().unwrap()) {
             Ok(r) => r,
             Err(e) => {
                 log::error!("failed to initialise renderer: {e}");

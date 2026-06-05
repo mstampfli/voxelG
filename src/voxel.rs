@@ -201,6 +201,11 @@ pub struct World {
     pub tile_uniform: Vec<u8>,
     pub active_bricks: Vec<u32>,
     pub dirty_bricks: Vec<u32>,
+    /// Reusable physics scratch buffers (a sorted snapshot of active_bricks and
+    /// the per-tick "touched" set), kept here so the CA tick allocates nothing —
+    /// previously it cloned active_bricks twice per tick (checklist: physics).
+    pub phys_scratch: Vec<u32>,
+    pub phys_touched: Vec<u32>,
     pub all_dirty: bool,
     pub chunk_meta: Vec<ChunkMeta>,
     pub seed: u64,
@@ -266,6 +271,8 @@ impl World {
             tile_uniform: vec![0u8; WORLD_TILES_TOTAL as usize],
             active_bricks: Vec::with_capacity(4096),
             dirty_bricks: Vec::with_capacity(4096),
+            phys_scratch: Vec::with_capacity(4096),
+            phys_touched: Vec::with_capacity(8192),
             all_dirty: true,
             chunk_meta: vec![ChunkMeta { generated: false }; WORLD_STORE_CHUNKS as usize],
             seed,
