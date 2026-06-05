@@ -1301,6 +1301,70 @@ mod gpu_render_tests {
         assert!(mean > 0.05 && mean < 0.95, "[{label}] implausible mean luma {mean:.3}");
     }
 
+    /// Time the raymarch dispatch at a given resolution from a high downward
+    /// camera (the worst case: most of the screen is terrain). Run with
+    /// `cargo test --lib raymarch_timing -- --nocapture --ignored`.
+    #[test]
+    #[ignore]
+    fn raymarch_timing() {
+        let Some((device, queue)) = headless_device() else {
+            eprintln!("no GPU — skipping");
+            return;
+        };
+        for &(w, h) in &[(1280u32, 720u32), (640u32, 360u32)] {
+            let mut world = World::new();
+            world.fill_demo_terrain();
+            let mut cam = Camera::new();
+            cam.pos = glam::Vec3::new(256.0, 150.0, 256.0);
+            cam.pitch = -0.5;
+            let cu = CameraUniform::from_camera(&cam, w, h, 0.0, glam::IVec3::ZERO);
+            let camera_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None, contents: bytemuck::bytes_of(&cu),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
+            let bricks_buf = storage(&device, "b", bytemuck::cast_slice(&world.bricks));
+            let tm = storage(&device, "tm", bytemuck::cast_slice(&world.tile_mask));
+            let cm = storage(&device, "cm", bytemuck::cast_slice(&world.chunk_mask));
+            let l4 = storage(&device, "l4", bytemuck::cast_slice(&world.l4_mask));
+            let bu = storage(&device, "bu", bytemuck::cast_slice(&pack_u8_to_u32(&world.brick_uniform)));
+            let tu = storage(&device, "tu", bytemuck::cast_slice(&pack_u8_to_u32(&world.tile_uniform)));
+            let palette = default_palette();
+            let palette_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None, contents: bytemuck::cast_slice(&palette),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
+            let tw = (w + 7) / 8; let th = (h + 7) / 8;
+            let words = ((tw * th) as usize + 31) / 32;
+            let td = storage(&device, "td", bytemuck::cast_slice(&vec![u32::MAX; words]));
+            let players = storage(&device, "pl", &vec![0u8; 16 + MAX_REMOTE_PLAYERS * 16]);
+            let (_o, ov) = create_output_texture(&device, w, h);
+            let (_b, bv) = create_beam_texture(&device, w, h);
+            let bgl = create_compute_bgl(&device);
+            let bg = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &ov, &bv, &td, &players, &bu, &tu, &l4);
+            let pll = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[&bgl], push_constant_ranges: &[] });
+            let src = format!("{}\n{}", WORLD_CONSTS_WGSL, include_str!("../shaders/raymarch.wgsl"));
+            let m = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(src.into()) });
+            let pipe = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: None, layout: Some(&pll), module: &m, entry_point: Some("cs_main"), compilation_options: Default::default(), cache: None });
+            // Warm up.
+            for _ in 0..5 {
+                let mut e = device.create_command_encoder(&Default::default());
+                { let mut cp = e.begin_compute_pass(&Default::default()); cp.set_pipeline(&pipe); cp.set_bind_group(0, &bg, &[]); cp.dispatch_workgroups(tw, th, 1); }
+                queue.submit(std::iter::once(e.finish()));
+            }
+            device.poll(wgpu::Maintain::Wait);
+            let n = 60;
+            let t0 = std::time::Instant::now();
+            for _ in 0..n {
+                let mut e = device.create_command_encoder(&Default::default());
+                { let mut cp = e.begin_compute_pass(&Default::default()); cp.set_pipeline(&pipe); cp.set_bind_group(0, &bg, &[]); cp.dispatch_workgroups(tw, th, 1); }
+                queue.submit(std::iter::once(e.finish()));
+            }
+            device.poll(wgpu::Maintain::Wait);
+            let ms = t0.elapsed().as_secs_f64() * 1000.0 / n as f64;
+            eprintln!("raymarch {w}x{h}: {ms:.2} ms/frame  (~{:.0} fps GPU-bound)", 1000.0 / ms);
+        }
+    }
+
     #[test]
     fn renders_terrain_and_sky() {
         let Some((min, max, mean)) = render_luma_stats_at(glam::IVec2::ZERO) else {

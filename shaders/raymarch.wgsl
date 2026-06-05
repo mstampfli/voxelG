@@ -306,6 +306,12 @@ fn ign(x: f32, y: f32, frame: f32) -> f32 {
     return fract(52.9829189 * fract(0.06711056 * (x + frame * 5.588238) + 0.00583715 * (y + frame * 4.182857)));
 }
 
+// Profiling toggles (const-folded out when false): PROFILE_FLAT skips all
+// shading to isolate traversal cost; PROFILE_NO_L4 skips the L4/chunk coarse
+// skips. Both off for normal rendering.
+const PROFILE_FLAT: bool = false;
+const PROFILE_NO_L4: bool = false;
+
 @compute @workgroup_size(8, 8, 1)
 fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let res = vec2<u32>(camera.resolution);
@@ -360,6 +366,11 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
     var col: vec3<f32>;
+    if (PROFILE_FLAT) {
+        col = select(sky(dir), palette[hit.mat].rgb, hit.hit);
+        textureStore(output_tex, vec2<i32>(i32(gid.x), i32(gid.y)), vec4<f32>(col, 1.0));
+        return;
+    }
     if (hit.hit) {
         if (is_water_mat(hit.mat) && hit.normal.y > 0.5) {
             col = shade_water_top(hit, camera.origin, dir);
@@ -436,6 +447,13 @@ fn is_foliage_mat(m: u32) -> bool {
     return m == MAT_LEAVES || m == MAT_LEAVES_BIRCH
         || m == MAT_LEAVES_PINE || m == MAT_LEAVES_AUTUMN
         || m == MAT_FLOWER || m == MAT_TALL_GRASS;
+}
+// Ground decoration (single sub-voxel sprites). Far away these must NOT be
+// drawn as solid cubes (that's the "pink flower blocks" bug) — they vanish
+// instead. Leaves, by contrast, stay solid cubes far away so tree canopies
+// don't disappear.
+fn is_decoration_mat(m: u32) -> bool {
+    return m == MAT_FLOWER || m == MAT_TALL_GRASS;
 }
 
 struct SubHit {
@@ -1845,18 +1863,20 @@ fn trace(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
         // level skips its whole cell in one DDA jump, so empty space (most of a
         // ray) costs O(coarse steps) instead of O(voxels) — this is what keeps
         // traversal cheap as voxels shrink.
-        let l4p = slot_v >> vec3<u32>(8u);
-        let l4i = world_l4_idx(l4p.x, l4p.y, l4p.z);
-        if (l4_cell_empty(l4i)) {
-            skip_to_cell(256, &voxel, &t_max, ro, org, dir, inv_dir, step, &last_axis);
-            t_cur = axis_select(t_max, last_axis) - axis_select(t_delta, last_axis);
-            continue;
-        }
-        let chunk_lin = (cp.x & 3) + (cp.z & 3) * 4 + (cp.y & 3) * 16;
-        if (!l4_has_child(l4i, chunk_lin)) {
-            skip_to_cell(64, &voxel, &t_max, ro, org, dir, inv_dir, step, &last_axis);
-            t_cur = axis_select(t_max, last_axis) - axis_select(t_delta, last_axis);
-            continue;
+        if (!PROFILE_NO_L4) {
+            let l4p = slot_v >> vec3<u32>(8u);
+            let l4i = world_l4_idx(l4p.x, l4p.y, l4p.z);
+            if (l4_cell_empty(l4i)) {
+                skip_to_cell(256, &voxel, &t_max, ro, org, dir, inv_dir, step, &last_axis);
+                t_cur = axis_select(t_max, last_axis) - axis_select(t_delta, last_axis);
+                continue;
+            }
+            let chunk_lin = (cp.x & 3) + (cp.z & 3) * 4 + (cp.y & 3) * 16;
+            if (!l4_has_child(l4i, chunk_lin)) {
+                skip_to_cell(64, &voxel, &t_max, ro, org, dir, inv_dir, step, &last_axis);
+                t_cur = axis_select(t_max, last_axis) - axis_select(t_delta, last_axis);
+                continue;
+            }
         }
 
         let ci = world_chunk_idx(cp.x, cp.y, cp.z);
@@ -1956,8 +1976,17 @@ fn trace(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
         // per-voxel DDA loop (up to ~7 steps per brick).
         if (t_cur > LOD_BRICK_T) {
             let b = bricks[bi];
-            if ((b.occ_lo | b.occ_hi) != 0u) {
-                let m = brick_topmost_material(bi);
+            if ((b.occ_lo | b.occ_hi) == 0u) {
+                // Empty brick — skip the whole 4-voxel cell.
+                skip_to_cell(4, &voxel, &t_max, ro, org, dir, inv_dir, step, &last_axis);
+                t_cur = axis_select(t_max, last_axis) - axis_select(t_delta, last_axis);
+                continue;
+            }
+            let m = brick_topmost_material(bi);
+            // Collapse the brick to its representative material — UNLESS the top
+            // is foliage (a flower/grass/leaf cube would look wrong); in that
+            // case fall through to the per-voxel descent below.
+            if (!is_foliage_mat(m)) {
                 var n = vec3<f32>(0.0);
                 var t_hit: f32;
                 if (last_axis == 0)      { n.x = -f32(step.x); t_hit = t_max.x - t_delta.x; }
@@ -1977,20 +2006,16 @@ fn trace(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
                 out.t_hit = t_hit;
                 return out;
             }
-            // Brick empty — skip the whole 4-voxel cell.
-            skip_to_cell(4, &voxel, &t_max, ro, org, dir, inv_dir, step, &last_axis);
-            t_cur = axis_select(t_max, last_axis) - axis_select(t_delta, last_axis);
-            continue;
         }
 
         let local = slot_v - bp * BRICK_DIM;
         let vi = brick_voxel_idx(local.x, local.y, local.z);
         if (brick_voxel_solid(bi, vi)) {
             let m = brick_voxel_material(bi, vi);
-            // Near foliage gets the full per-blade procedural cutout; far
-            // foliage falls through to the solid-cube branch below (the detail
-            // is sub-pixel and the inner loop is the most divergent work a ray
-            // can do — checklist: limit procedural foliage to near distance).
+            // Near foliage gets the full per-blade procedural cutout. Far
+            // foliage: leaves become solid cubes (the else branch) so canopies
+            // survive, but ground decoration (flowers / tall grass) is skipped
+            // entirely — drawing it as a solid cube is the "pink blocks" bug.
             if (is_foliage_mat(m) && t_cur <= FOLIAGE_NEAR_T) {
                 let fh = foliage_subvoxel(voxel, origin, dir, m);
                 if (fh.hit) {
@@ -2003,6 +2028,9 @@ fn trace(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
                     g_foliage_tint = fh.color_tint;
                     return out;
                 }
+                // cutout missed → fall through to the DDA step below.
+            } else if (is_decoration_mat(m)) {
+                // Far decoration → invisible; fall through to the DDA step.
             } else {
                 var n = vec3<f32>(0.0);
                 var t_hit: f32;

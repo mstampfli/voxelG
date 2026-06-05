@@ -98,6 +98,40 @@ Validation tooling added so changes are checkable without a display:
   (dedicated server) + thin `main.rs` launcher.
 - **zero tests/benchmarks** → see the validation tooling list at the top.
 
+## Performance notes (measured)
+
+Headless GPU timing of the raymarch pass (RTX 5060, `cargo test --lib
+raymarch_timing -- --ignored`), high camera looking down (worst case — most of
+the screen is terrain):
+
+| | on AC power | on battery |
+|---|---|---|
+| 1280×720 | **5.5 ms (~180 fps)** | ~80 ms (~12 fps) |
+| 640×360  | **1.5 ms (~650 fps)** | ~23 ms (~44 fps) |
+
+The engine is GPU-light on AC (~5.5 ms/frame for the raymarch). **Laptop battery
+throttling is ~14×** — measure/play on AC. Cost breakdown at 1280×720 on battery:
+~41 ms base traversal, +8 ms for the L4/chunk coarse skips (net-negative on
+terrain-heavy views, a win on sky/empty views), +31 ms shading (shadows + AO +
+clouds + god-rays — all pre-existing per-pixel secondary rays).
+
+## Known issues / remaining work
+
+- **Chunk-load lag spike.** Crossing a chunk boundary still hitches. The
+  *generation* is async (worker pool), but the *install* — `apply_slot_bricks`
+  (per-brick movable/uniform recompute + `refresh_masks_for_brick`) for up to
+  `CHUNK_INSTALL_BUDGET` (6) chunks/frame, plus the resulting brick upload burst
+  — still runs on the main thread under the world lock. Fix paths: (a) compute
+  masks/uniform on the worker so the main thread only memcpy-installs; (b) lower
+  the per-frame install budget; (c) spread the brick upload across more frames.
+- **L4 per-step cost.** The L4/chunk coarse checks run every voxel step; on
+  terrain-dense views that's ~+8 ms with no skip benefit. A true *nested* march
+  (descend once, step within a level, ascend) would make the coarse levels pay
+  for themselves instead of costing per-step — the bigger traversal rewrite.
+- **Shading is brute-forced per pixel per frame** (shadows/AO/god-rays re-traced
+  every frame). Amortizing them via a reprojected shadow/AO cache (checklist #12,
+  only partially done) is the path to small-voxel/LOTL-class perf.
+
 ## Deliberately deferred (with rationale)
 - Full reprojection/disocclusion TAA (skip tracing reprojectable tiles on motion) —
   the same-pixel TAA here gives the AA win safely; checkerboard/disocclusion needs
