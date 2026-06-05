@@ -130,6 +130,18 @@ pub const fn chunk_idx(cx: u32, cy: u32, cz: u32) -> u32 {
 }
 
 #[inline(always)]
+pub const fn l4_idx(l4x: u32, l4y: u32, l4z: u32) -> u32 {
+    l4x + l4y * WORLD_L4_X + l4z * WORLD_L4_X * WORLD_L4_Y
+}
+
+/// Bit position of a child chunk inside its L4 cell's u64 (same x + z*4 + y*16
+/// linearisation every level uses).
+#[inline(always)]
+pub const fn chunk_bit_in_l4(lx: u32, ly: u32, lz: u32) -> u32 {
+    lx + lz * 4 + ly * 16
+}
+
+#[inline(always)]
 pub const fn brick_bit_in_tile(lx: u32, ly: u32, lz: u32) -> u32 {
     lx + lz * 4 + ly * 16
 }
@@ -175,6 +187,10 @@ pub struct World {
     pub bricks: Vec<Brick>,
     pub tile_mask: Vec<u64>,
     pub chunk_mask: Vec<u64>,
+    /// L4 occupancy: one u64 per 256³-voxel cell, one bit per child chunk. The
+    /// coarsest pyramid level — lets the DDA skip a 256³ empty region in a
+    /// single bit test (checklist: L4 level).
+    pub l4_mask: Vec<u64>,
     pub movable_mask: Vec<u64>,
     /// Per-brick "this whole brick is one material" hint. 0 = not uniform;
     /// any non-zero value = uniform with that material id. Lets the DDA
@@ -244,6 +260,7 @@ impl World {
             bricks: vec![Brick::EMPTY; WORLD_BRICKS_TOTAL as usize],
             tile_mask: vec![0u64; WORLD_TILES_TOTAL as usize],
             chunk_mask: vec![0u64; WORLD_CHUNKS_TOTAL as usize],
+            l4_mask: vec![0u64; WORLD_L4_TOTAL as usize],
             movable_mask: vec![0u64; WORLD_BRICKS_TOTAL as usize],
             brick_uniform: vec![0u8; WORLD_BRICKS_TOTAL as usize],
             tile_uniform: vec![0u8; WORLD_TILES_TOTAL as usize],
@@ -698,10 +715,22 @@ impl World {
             let (cx, cy, cz) = (tx / 4, ty / 4, tz / 4);
             let ci = chunk_idx(cx, cy, cz);
             let cbit = tile_bit_in_chunk(tx & 3, ty & 3, tz & 3);
+            let cprev = self.chunk_mask[ci as usize];
             if now == 0 {
                 self.chunk_mask[ci as usize] &= !(1u64 << cbit);
             } else {
                 self.chunk_mask[ci as usize] |= 1u64 << cbit;
+            }
+            let cnow = self.chunk_mask[ci as usize];
+            // Propagate a chunk empty↔non-empty transition up to the L4 level.
+            if (cprev == 0) != (cnow == 0) {
+                let li = l4_idx(cx / 4, cy / 4, cz / 4);
+                let lbit = chunk_bit_in_l4(cx & 3, cy & 3, cz & 3);
+                if cnow == 0 {
+                    self.l4_mask[li as usize] &= !(1u64 << lbit);
+                } else {
+                    self.l4_mask[li as usize] |= 1u64 << lbit;
+                }
             }
         }
     }
@@ -819,6 +848,7 @@ impl World {
     pub fn rebuild_all_masks(&mut self) {
         self.tile_mask.iter_mut().for_each(|m| *m = 0);
         self.chunk_mask.iter_mut().for_each(|m| *m = 0);
+        self.l4_mask.iter_mut().for_each(|m| *m = 0);
         for bz in 0..WORLD_BRICKS_Z {
             for by in 0..WORLD_BRICKS_Y {
                 for bx in 0..WORLD_BRICKS_X {
@@ -838,6 +868,17 @@ impl World {
                         let (cx, cy, cz) = (tx / 4, ty / 4, tz / 4);
                         let ci = chunk_idx(cx, cy, cz) as usize;
                         self.chunk_mask[ci] |= 1u64 << tile_bit_in_chunk(tx & 3, ty & 3, tz & 3);
+                    }
+                }
+            }
+        }
+        for cz in 0..WORLD_CHUNKS_Z {
+            for cy in 0..WORLD_CHUNKS_Y {
+                for cx in 0..WORLD_CHUNKS_X {
+                    let ci = chunk_idx(cx, cy, cz) as usize;
+                    if self.chunk_mask[ci] != 0 {
+                        let li = l4_idx(cx / 4, cy / 4, cz / 4) as usize;
+                        self.l4_mask[li] |= 1u64 << chunk_bit_in_l4(cx & 3, cy & 3, cz & 3);
                     }
                 }
             }

@@ -142,6 +142,7 @@ pub struct Renderer {
     bricks_buf: wgpu::Buffer,
     tile_mask_buf: wgpu::Buffer,
     chunk_mask_buf: wgpu::Buffer,
+    l4_mask_buf: wgpu::Buffer,
     brick_uniform_buf: wgpu::Buffer,
     tile_uniform_buf: wgpu::Buffer,
     palette_buf: wgpu::Buffer,
@@ -265,6 +266,11 @@ impl Renderer {
             contents: bytemuck::cast_slice(&world.chunk_mask),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
+        let l4_mask_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("l4_mask"),
+            contents: bytemuck::cast_slice(&world.l4_mask),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
 
         // Packed uniform-material lookups (1 byte per brick / tile, packed
         // 4 per u32 word). Lets the DDA skip uniform regions in 1 lookup
@@ -326,125 +332,7 @@ impl Renderer {
         });
 
         // -- compute pipeline --
-        let compute_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("compute bgl"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 4,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 5,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::StorageTexture {
-                        access: wgpu::StorageTextureAccess::WriteOnly,
-                        format: wgpu::TextureFormat::Rgba8Unorm,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 6,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                // Per-tile dirty bitmask for temporal-differential raymarch.
-                wgpu::BindGroupLayoutEntry {
-                    binding: 7,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // Remote-player marker positions.
-                wgpu::BindGroupLayoutEntry {
-                    binding: 8,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // Packed per-brick uniform-material bytes (4 per u32).
-                wgpu::BindGroupLayoutEntry {
-                    binding: 9,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // Packed per-tile uniform-material bytes.
-                wgpu::BindGroupLayoutEntry {
-                    binding: 10,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-            ],
-        });
+        let compute_bgl = create_compute_bgl(&device);
 
         let compute_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("compute pl"),
@@ -472,45 +360,11 @@ impl Renderer {
         let compute_bg = make_compute_bg(
             &device, &compute_bgl, &camera_buf, &bricks_buf,
             &tile_mask_buf, &chunk_mask_buf, &palette_buf, &output_view, &beam_view,
-            &tile_dirty_buf, &players_buf, &brick_uniform_buf, &tile_uniform_buf,
+            &tile_dirty_buf, &players_buf, &brick_uniform_buf, &tile_uniform_buf, &l4_mask_buf,
         );
 
         // -- beam pipeline (1/8-res coarse pre-pass) --
-        let beam_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("beam bgl"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::StorageTexture {
-                        access: wgpu::StorageTextureAccess::WriteOnly,
-                        format: wgpu::TextureFormat::R32Float,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                    },
-                    count: None,
-                },
-            ],
-        });
+        let beam_bgl = create_beam_bgl(&device);
         let beam_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("beam pl"),
             bind_group_layouts: &[&beam_bgl],
@@ -598,7 +452,7 @@ impl Renderer {
             device, queue, surface, config,
             size: (width, height),
             surface_size: (surface_w, surface_h),
-            camera_buf, bricks_buf, tile_mask_buf, chunk_mask_buf, palette_buf,
+            camera_buf, bricks_buf, tile_mask_buf, chunk_mask_buf, l4_mask_buf, palette_buf,
             brick_uniform_buf, tile_uniform_buf,
             tile_dirty_buf, players_buf,
             output_tex, output_view, beam_tex, beam_view, sampler,
@@ -632,6 +486,7 @@ impl Renderer {
             &self.device, &self.compute_bgl, &self.camera_buf, &self.bricks_buf,
             &self.tile_mask_buf, &self.chunk_mask_buf, &self.palette_buf, &self.output_view, &self.beam_view,
             &self.tile_dirty_buf, &self.players_buf, &self.brick_uniform_buf, &self.tile_uniform_buf,
+            &self.l4_mask_buf,
         );
         self.beam_bg = make_beam_bg(
             &self.device, &self.beam_bgl, &self.camera_buf, &self.chunk_mask_buf, &self.beam_view,
@@ -647,6 +502,7 @@ impl Renderer {
             self.queue.write_buffer(&self.bricks_buf, 0, bytemuck::cast_slice(&world.bricks));
             self.queue.write_buffer(&self.tile_mask_buf, 0, bytemuck::cast_slice(&world.tile_mask));
             self.queue.write_buffer(&self.chunk_mask_buf, 0, bytemuck::cast_slice(&world.chunk_mask));
+            self.queue.write_buffer(&self.l4_mask_buf, 0, bytemuck::cast_slice(&world.l4_mask));
             let bu = pack_u8_to_u32(&world.brick_uniform);
             let tu = pack_u8_to_u32(&world.tile_uniform);
             self.queue.write_buffer(&self.brick_uniform_buf, 0, bytemuck::cast_slice(&bu));
@@ -721,6 +577,11 @@ impl Renderer {
             let slice = &world.chunk_mask[s as usize..=e as usize];
             self.queue.write_buffer(&self.chunk_mask_buf, s as u64 * 8, bytemuck::cast_slice(slice));
         });
+        // L4 mask is only a handful of u64s — if any chunk changed, just push
+        // the whole thing.
+        if !self.dirty_chunks_scratch.is_empty() {
+            self.queue.write_buffer(&self.l4_mask_buf, 0, bytemuck::cast_slice(&world.l4_mask));
+        }
 
         world.dirty_bricks.clear();
     }
@@ -825,7 +686,11 @@ fn create_output_texture(device: &wgpu::Device, w: u32, h: u32) -> (wgpu::Textur
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: wgpu::TextureFormat::Rgba8Unorm,
-        usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+        // COPY_SRC lets the headless render test read the frame back for
+        // automated validation; harmless for the windowed path.
+        usage: wgpu::TextureUsages::STORAGE_BINDING
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     });
     let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
@@ -849,6 +714,106 @@ fn create_beam_texture(device: &wgpu::Device, w: u32, h: u32) -> (wgpu::Texture,
     (tex, view)
 }
 
+/// Compute-pass bind-group layout. Single definition shared by the renderer and
+/// the headless render test so the two can never drift. Binding order matches
+/// `make_compute_bg` and the `@group(0) @binding(N)` declarations in
+/// shaders/raymarch.wgsl.
+fn create_compute_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    let storage_ro = |binding: u32| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: true },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    };
+    let uniform = |binding: u32| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Uniform,
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    };
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("compute bgl"),
+        entries: &[
+            uniform(0),    // camera
+            storage_ro(1), // bricks
+            storage_ro(2), // tile_mask
+            storage_ro(3), // chunk_mask
+            uniform(4),    // palette
+            wgpu::BindGroupLayoutEntry {
+                binding: 5, // output storage texture
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::StorageTexture {
+                    access: wgpu::StorageTextureAccess::WriteOnly,
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 6, // beam depth texture
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            storage_ro(7),  // tile_dirty
+            storage_ro(8),  // players
+            storage_ro(9),  // brick_uniform
+            storage_ro(10), // tile_uniform
+            storage_ro(11), // l4_mask (coarsest pyramid level)
+        ],
+    })
+}
+
+fn create_beam_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("beam bgl"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::StorageTexture {
+                    access: wgpu::StorageTextureAccess::WriteOnly,
+                    format: wgpu::TextureFormat::R32Float,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                },
+                count: None,
+            },
+        ],
+    })
+}
+
 fn make_compute_bg(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
@@ -863,6 +828,7 @@ fn make_compute_bg(
     players_buf: &wgpu::Buffer,
     brick_uniform_buf: &wgpu::Buffer,
     tile_uniform_buf: &wgpu::Buffer,
+    l4_mask_buf: &wgpu::Buffer,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("compute bg"),
@@ -879,6 +845,7 @@ fn make_compute_bg(
             wgpu::BindGroupEntry { binding: 8, resource: players_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 9, resource: brick_uniform_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 10, resource: tile_uniform_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 11, resource: l4_mask_buf.as_entire_binding() },
         ],
     })
 }
@@ -952,5 +919,194 @@ mod shader_tests {
     #[test]
     fn blit_wgsl_valid() {
         validate("blit.wgsl", include_str!("../shaders/blit.wgsl"));
+    }
+}
+
+#[cfg(test)]
+mod gpu_render_tests {
+    //! Headless offscreen render + pixel readback. Runs the REAL raymarch
+    //! pipeline (reusing the renderer's own bind-group / buffer helpers) on a
+    //! windowless device, then reads the frame back and asserts the scene has
+    //! both sky and terrain. This is the automated regression net for shader
+    //! changes (the DDA rewrite, LOD, etc.) where there's no display to look at.
+    //! Skips cleanly when no GPU adapter is available (e.g. headless CI).
+    use super::*;
+    use crate::camera::{Camera, CameraUniform};
+    use crate::voxel::World;
+    use wgpu::util::DeviceExt;
+
+    fn headless_device() -> Option<(wgpu::Device, wgpu::Queue)> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::PRIMARY,
+            ..Default::default()
+        });
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        }))?;
+        let (device, queue) = pollster::block_on(adapter.request_device(
+            &wgpu::DeviceDescriptor {
+                label: Some("headless test device"),
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits {
+                    max_storage_buffer_binding_size: 256 << 20,
+                    ..wgpu::Limits::default()
+                },
+                memory_hints: wgpu::MemoryHints::Performance,
+            },
+            None,
+        ))
+        .ok()?;
+        Some((device, queue))
+    }
+
+    fn storage(device: &wgpu::Device, label: &str, bytes: &[u8]) -> wgpu::Buffer {
+        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(label),
+            contents: bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        })
+    }
+
+    /// Render the default world from a camera placed high above spawn and read
+    /// the frame back. Returns per-pixel luma (min, max, mean) or None if no GPU.
+    pub(super) fn render_luma_stats() -> Option<(f32, f32, f32)> {
+        let (device, queue) = headless_device()?;
+        let (w, h) = (320u32, 200u32);
+
+        let mut world = World::new();
+        world.fill_demo_terrain();
+
+        // Camera high above the spawn column, tilted toward the horizon so the
+        // frame contains terrain (lower) and sky (upper) — never inside a voxel.
+        let mut cam = Camera::new();
+        let s = crate::voxel::sample_terrain(cam.pos.x, cam.pos.z, world.seed);
+        cam.pos.y = s.h as f32 + 30.0;
+        cam.pitch = -0.35;
+        let cu = CameraUniform::from_camera(&cam, w, h, 0.0, glam::IVec3::ZERO);
+
+        let camera_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("camera"),
+            contents: bytemuck::bytes_of(&cu),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let bricks_buf = storage(&device, "bricks", bytemuck::cast_slice(&world.bricks));
+        let tile_mask_buf = storage(&device, "tile_mask", bytemuck::cast_slice(&world.tile_mask));
+        let chunk_mask_buf = storage(&device, "chunk_mask", bytemuck::cast_slice(&world.chunk_mask));
+        let l4_mask_buf = storage(&device, "l4_mask", bytemuck::cast_slice(&world.l4_mask));
+        let brick_uniform_buf = storage(&device, "brick_uniform", bytemuck::cast_slice(&pack_u8_to_u32(&world.brick_uniform)));
+        let tile_uniform_buf = storage(&device, "tile_uniform", bytemuck::cast_slice(&pack_u8_to_u32(&world.tile_uniform)));
+        let palette = default_palette();
+        let palette_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("palette"),
+            contents: bytemuck::cast_slice(&palette),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        // All tiles dirty → render every pixel.
+        let tiles_w = (w + 7) / 8;
+        let tiles_h = (h + 7) / 8;
+        let words = ((tiles_w * tiles_h) as usize + 31) / 32;
+        let tile_dirty_buf = storage(&device, "tile_dirty", bytemuck::cast_slice(&vec![u32::MAX; words]));
+        let players_buf = storage(&device, "players", &vec![0u8; 16 + MAX_REMOTE_PLAYERS * 16]);
+
+        let (_otex, output_view) = create_output_texture(&device, w, h);
+        let output_tex = _otex;
+        let (_btex, beam_view) = create_beam_texture(&device, w, h);
+
+        let bgl = create_compute_bgl(&device);
+        let bg = make_compute_bg(
+            &device, &bgl, &camera_buf, &bricks_buf, &tile_mask_buf, &chunk_mask_buf,
+            &palette_buf, &output_view, &beam_view, &tile_dirty_buf, &players_buf,
+            &brick_uniform_buf, &tile_uniform_buf, &l4_mask_buf,
+        );
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("test pl"),
+            bind_group_layouts: &[&bgl],
+            push_constant_ranges: &[],
+        });
+        let src = format!("{}\n{}", WORLD_CONSTS_WGSL, include_str!("../shaders/raymarch.wgsl"));
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("test raymarch"),
+            source: wgpu::ShaderSource::Wgsl(src.into()),
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("test raymarch pipeline"),
+            layout: Some(&pl),
+            module: &module,
+            entry_point: Some("cs_main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        // Readback buffer (bytes_per_row already 256-aligned for w=320).
+        let bpr = w * 4;
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("readback"),
+            size: (bpr * h) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut enc = device.create_command_encoder(&Default::default());
+        {
+            let mut cp = enc.begin_compute_pass(&Default::default());
+            cp.set_pipeline(&pipeline);
+            cp.set_bind_group(0, &bg, &[]);
+            cp.dispatch_workgroups((w + 7) / 8, (h + 7) / 8, 1);
+        }
+        enc.copy_texture_to_buffer(
+            wgpu::ImageCopyTexture {
+                texture: &output_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::ImageCopyBuffer {
+                buffer: &readback,
+                layout: wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bpr),
+                    rows_per_image: Some(h),
+                },
+            },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        queue.submit(std::iter::once(enc.finish()));
+
+        let slice = readback.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        device.poll(wgpu::Maintain::Wait);
+        let data = slice.get_mapped_range();
+
+        let mut min = 1.0f32;
+        let mut max = 0.0f32;
+        let mut sum = 0.0f64;
+        let n = (w * h) as usize;
+        for px in data.chunks_exact(4) {
+            let r = px[0] as f32 / 255.0;
+            let g = px[1] as f32 / 255.0;
+            let b = px[2] as f32 / 255.0;
+            let luma = 0.299 * r + 0.587 * g + 0.114 * b;
+            min = min.min(luma);
+            max = max.max(luma);
+            sum += luma as f64;
+        }
+        Some((min, max, (sum / n as f64) as f32))
+    }
+
+    #[test]
+    fn renders_terrain_and_sky() {
+        let Some((min, max, mean)) = render_luma_stats() else {
+            eprintln!("no GPU adapter — skipping headless render test");
+            return;
+        };
+        eprintln!("headless render luma: min={min:.3} max={max:.3} mean={mean:.3}");
+        // Bright sky pixels present (catches all-black / DDA-returns-nothing).
+        assert!(max > 0.55, "no bright sky pixels (max luma {max:.3}) — render likely broken");
+        // Dark terrain pixels present (catches all-sky / DDA never hits geometry).
+        assert!(min < 0.45, "no dark terrain pixels (min luma {min:.3}) — DDA likely not hitting voxels");
+        // Sane overall exposure.
+        assert!(mean > 0.05 && mean < 0.95, "implausible mean luma {mean:.3}");
     }
 }
