@@ -153,6 +153,12 @@ pub struct Renderer {
     output_view: wgpu::TextureView,
     beam_tex: wgpu::Texture,
     beam_view: wgpu::TextureView,
+    // TAA: history = previous resolved frame; resolve = this frame's resolved
+    // output (also what the blit samples). output_tex is the raw raymarch.
+    history_tex: wgpu::Texture,
+    history_view: wgpu::TextureView,
+    resolve_tex: wgpu::Texture,
+    resolve_view: wgpu::TextureView,
     sampler: wgpu::Sampler,
 
     beam_bgl: wgpu::BindGroupLayout,
@@ -166,6 +172,10 @@ pub struct Renderer {
     blit_bgl: wgpu::BindGroupLayout,
     blit_pipeline: wgpu::RenderPipeline,
     blit_bg: wgpu::BindGroup,
+
+    taa_bgl: wgpu::BindGroupLayout,
+    taa_pipeline: wgpu::ComputePipeline,
+    taa_bg: wgpu::BindGroup,
 
     // Reused per-frame scratch for incremental mask/uniform uploads — derived
     // from the dirty-brick list so no extra dirty tracking is needed and no
@@ -318,6 +328,10 @@ impl Renderer {
 
         let (output_tex, output_view) = create_output_texture(&device, width, height);
         let (beam_tex, beam_view) = create_beam_texture(&device, width, height);
+        // resolve_tex shares the output usage (storage write + sampled + copy
+        // src); history_tex is sampled + copy dst.
+        let (resolve_tex, resolve_view) = create_output_texture(&device, width, height);
+        let (history_tex, history_view) = create_history_texture(&device, width, height);
 
         // Bilinear filtering for the half-res → full-res blit upscale.
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -446,7 +460,30 @@ impl Renderer {
             cache: None,
         });
 
-        let blit_bg = make_blit_bg(&device, &blit_bgl, &output_view, &sampler);
+        // The blit now samples the TAA-resolved image, not the raw raymarch.
+        let blit_bg = make_blit_bg(&device, &blit_bgl, &resolve_view, &sampler);
+
+        // -- TAA resolve pipeline --
+        let taa_bgl = create_taa_bgl(&device);
+        let taa_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("taa pl"),
+            bind_group_layouts: &[&taa_bgl],
+            push_constant_ranges: &[],
+        });
+        let taa_src = format!("{}\n{}", WORLD_CONSTS_WGSL, include_str!("../shaders/taa.wgsl"));
+        let taa_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("taa shader"),
+            source: wgpu::ShaderSource::Wgsl(taa_src.into()),
+        });
+        let taa_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("taa pipeline"),
+            layout: Some(&taa_pl),
+            module: &taa_shader,
+            entry_point: Some("cs_taa"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let taa_bg = make_taa_bg(&device, &taa_bgl, &camera_buf, &output_view, &history_view, &resolve_view);
 
         Ok(Self {
             device, queue, surface, config,
@@ -455,10 +492,12 @@ impl Renderer {
             camera_buf, bricks_buf, tile_mask_buf, chunk_mask_buf, l4_mask_buf, palette_buf,
             brick_uniform_buf, tile_uniform_buf,
             tile_dirty_buf, players_buf,
-            output_tex, output_view, beam_tex, beam_view, sampler,
+            output_tex, output_view, beam_tex, beam_view,
+            history_tex, history_view, resolve_tex, resolve_view, sampler,
             beam_bgl, beam_pipeline, beam_bg,
             compute_bgl, compute_pipeline, compute_bg,
             blit_bgl, blit_pipeline, blit_bg,
+            taa_bgl, taa_pipeline, taa_bg,
             dirty_tiles_scratch: Vec::with_capacity(4096),
             dirty_chunks_scratch: Vec::with_capacity(512),
             dirty_words_scratch: Vec::with_capacity(4096),
@@ -481,6 +520,12 @@ impl Renderer {
         let (btex, bview) = create_beam_texture(&self.device, rw, rh);
         self.beam_tex = btex;
         self.beam_view = bview;
+        let (rtex, rview) = create_output_texture(&self.device, rw, rh);
+        self.resolve_tex = rtex;
+        self.resolve_view = rview;
+        let (htex, hview) = create_history_texture(&self.device, rw, rh);
+        self.history_tex = htex;
+        self.history_view = hview;
 
         self.compute_bg = make_compute_bg(
             &self.device, &self.compute_bgl, &self.camera_buf, &self.bricks_buf,
@@ -491,7 +536,10 @@ impl Renderer {
         self.beam_bg = make_beam_bg(
             &self.device, &self.beam_bgl, &self.camera_buf, &self.chunk_mask_buf, &self.beam_view,
         );
-        self.blit_bg = make_blit_bg(&self.device, &self.blit_bgl, &self.output_view, &self.sampler);
+        self.taa_bg = make_taa_bg(
+            &self.device, &self.taa_bgl, &self.camera_buf, &self.output_view, &self.history_view, &self.resolve_view,
+        );
+        self.blit_bg = make_blit_bg(&self.device, &self.blit_bgl, &self.resolve_view, &self.sampler);
     }
 
     pub fn upload_world(&mut self, world: &mut World) {
@@ -605,8 +653,17 @@ impl Renderer {
         self.queue.write_buffer(&self.players_buf, 0, bytemuck::bytes_of(&data));
     }
 
-    pub fn update_camera(&self, camera: &Camera, time: f32, world_origin_voxel: glam::IVec3) {
-        let u = CameraUniform::from_camera(camera, self.size.0, self.size.1, time, world_origin_voxel);
+    pub fn update_camera(
+        &self,
+        camera: &Camera,
+        time: f32,
+        world_origin_voxel: glam::IVec3,
+        jitter: [f32; 2],
+        taa_blend: f32,
+    ) {
+        let u = CameraUniform::with_taa(
+            camera, self.size.0, self.size.1, time, world_origin_voxel, jitter, taa_blend,
+        );
         self.queue.write_buffer(&self.camera_buf, 0, bytemuck::bytes_of(&u));
     }
 
@@ -648,6 +705,34 @@ impl Renderer {
                 let gy = (self.size.1 + 7) / 8;
                 cp.dispatch_workgroups(gx, gy, 1);
             }
+            // ---- TAA resolve: raymarch output + history -> resolve ----
+            {
+                let mut cp = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("taa"),
+                    timestamp_writes: None,
+                });
+                cp.set_pipeline(&self.taa_pipeline);
+                cp.set_bind_group(0, &self.taa_bg, &[]);
+                let gx = (self.size.0 + 7) / 8;
+                let gy = (self.size.1 + 7) / 8;
+                cp.dispatch_workgroups(gx, gy, 1);
+            }
+            // Feed this frame's resolved image back as next frame's history.
+            encoder.copy_texture_to_texture(
+                wgpu::ImageCopyTexture {
+                    texture: &self.resolve_tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::ImageCopyTexture {
+                    texture: &self.history_tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d { width: self.size.0, height: self.size.1, depth_or_array_layers: 1 },
+            );
         }
 
         {
@@ -695,6 +780,89 @@ fn create_output_texture(device: &wgpu::Device, w: u32, h: u32) -> (wgpu::Textur
     });
     let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
     (tex, view)
+}
+
+fn create_history_texture(device: &wgpu::Device, w: u32, h: u32) -> (wgpu::Texture, wgpu::TextureView) {
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("taa history"),
+        size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+    (tex, view)
+}
+
+fn create_taa_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("taa bgl"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1, // current (raymarch output)
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2, // history
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 3, // resolve out
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::StorageTexture {
+                    access: wgpu::StorageTextureAccess::WriteOnly,
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                },
+                count: None,
+            },
+        ],
+    })
+}
+
+fn make_taa_bg(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    camera_buf: &wgpu::Buffer,
+    current_view: &wgpu::TextureView,
+    history_view: &wgpu::TextureView,
+    resolve_view: &wgpu::TextureView,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("taa bg"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: camera_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(current_view) },
+            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(history_view) },
+            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(resolve_view) },
+        ],
+    })
 }
 
 fn create_beam_texture(device: &wgpu::Device, w: u32, h: u32) -> (wgpu::Texture, wgpu::TextureView) {
@@ -919,6 +1087,12 @@ mod shader_tests {
     #[test]
     fn blit_wgsl_valid() {
         validate("blit.wgsl", include_str!("../shaders/blit.wgsl"));
+    }
+
+    #[test]
+    fn taa_wgsl_valid() {
+        let src = format!("{}\n{}", WORLD_CONSTS_WGSL, include_str!("../shaders/taa.wgsl"));
+        validate("taa.wgsl", &src);
     }
 }
 

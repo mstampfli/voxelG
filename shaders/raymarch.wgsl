@@ -23,6 +23,9 @@ struct Camera {
     _pad3: f32,
     world_origin: vec3<i32>,
     _pad4: i32,
+    jitter: vec2<f32>,
+    taa_blend: f32,
+    _pad5: f32,
 };
 
 // Toroidal storage: world voxel coords get folded into [0, WORLD_VOXELS_*)
@@ -320,7 +323,8 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Per-pixel + per-frame jitter, threaded through shading.
     let pix_jitter = ign(f32(gid.x), f32(gid.y), camera.time * 60.0);
 
-    let uv = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5)) / camera.resolution;
+    // Sub-pixel jitter for temporal anti-aliasing (zero unless accumulating).
+    let uv = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5) + camera.jitter) / camera.resolution;
     let ndc = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
     let aspect = camera.resolution.x / camera.resolution.y;
     let dir = normalize(
@@ -1483,7 +1487,11 @@ fn render_clouds(origin: vec3<f32>, dir: vec3<f32>, t_terrain: f32, pix: vec2<f3
     let s = sun_dir();
     let sc = sun_color(s);
 
-    let N: i32 = 12;
+    // Half the marching steps of the original full-res march — the TAA pass
+    // temporally accumulates the result on a static camera, so the lower
+    // per-frame sample count is upsampled over time instead of in one frame
+    // (checklist: clouds at reduced res + temporal upsample).
+    let N: i32 = 6;
     let step_t = (t_far_clamp - t_start) / f32(N);
     // Spatial-only jitter (no time) — time-varying jitter combined with the
     // temporal-differential pass that re-renders only some tiles per frame
@@ -1554,7 +1562,8 @@ fn god_rays(origin: vec3<f32>, dir: vec3<f32>, t_far: f32, pix: vec2<f32>) -> ve
     if (t_max <= 1.0) { return vec3<f32>(0.0); }
     // Sample count scales with phase — looking right at the sun gets denser
     // sampling for a smooth halo; off-axis stays cheap.
-    let N: i32 = select(4, 8, phase > 0.40);
+    // Reduced step count; TAA accumulates the god-ray term across frames.
+    let N: i32 = select(3, 6, phase > 0.40);
     let step_t = t_max / f32(N);
     let h = ign(pix.x, pix.y, camera.time * 60.0);
     var sum = 0.0;

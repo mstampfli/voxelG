@@ -77,10 +77,29 @@ pub struct CameraUniform {
     /// toroidal slot storage.
     pub world_origin: [i32; 3],
     pub _pad4: i32,
+    /// Sub-pixel ray jitter (in pixels) for temporal anti-aliasing. Non-zero
+    /// only while accumulating (static camera); 0 on motion.
+    pub jitter: [f32; 2],
+    /// TAA history blend weight: 0 = use current frame only (reset / motion),
+    /// ~0.9 = accumulate with reprojected history.
+    pub taa_blend: f32,
+    pub _pad5: f32,
 }
 
 impl CameraUniform {
     pub fn from_camera(c: &Camera, width: u32, height: u32, time: f32, world_origin_voxel: glam::IVec3) -> Self {
+        Self::with_taa(c, width, height, time, world_origin_voxel, [0.0, 0.0], 0.0)
+    }
+
+    pub fn with_taa(
+        c: &Camera,
+        width: u32,
+        height: u32,
+        time: f32,
+        world_origin_voxel: glam::IVec3,
+        jitter: [f32; 2],
+        taa_blend: f32,
+    ) -> Self {
         Self {
             origin: c.pos.to_array(),
             _pad0: 0.0,
@@ -95,6 +114,9 @@ impl CameraUniform {
             _pad3: 0.0,
             world_origin: [world_origin_voxel.x, world_origin_voxel.y, world_origin_voxel.z],
             _pad4: 0,
+            jitter,
+            taa_blend,
+            _pad5: 0.0,
         }
     }
 }

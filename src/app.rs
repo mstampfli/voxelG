@@ -40,6 +40,25 @@ const STREAM_HYSTERESIS: i32 = 2;
 /// frames instead of one big hitch (checklist: per-frame upload budget).
 const CHUNK_INSTALL_BUDGET: u32 = 6;
 
+/// On an idle camera, a 1/N slice of the screen's tiles is re-traced each frame
+/// so animated materials (sky, water, foliage) keep moving. N frames = one full
+/// refresh; spread evenly so there's no periodic full-frame stutter.
+const ANIM_REFRESH_SPREAD: usize = 8;
+
+/// 8-tap sub-pixel jitter pattern (Halton(2,3), centred to [-0.5, 0.5]) for
+/// temporal anti-aliasing. Applied only while the camera is static so the
+/// accumulation converges to an anti-aliased image.
+const JITTER_PATTERN: [[f32; 2]; 8] = [
+    [0.0, -0.166_666_7],
+    [-0.25, 0.166_666_7],
+    [0.25, -0.388_888_9],
+    [-0.375, -0.055_555_6],
+    [0.125, 0.277_777_8],
+    [-0.125, -0.277_777_8],
+    [0.375, 0.055_555_6],
+    [-0.062_5, 0.388_888_9],
+];
+
 #[derive(Default)]
 struct Keys {
     forward: bool,
@@ -66,7 +85,13 @@ pub struct App {
 
     // Temporal differential bookkeeping.
     last_camera_pose: Option<(Vec3, f32, f32, f32)>,
-    frames_since_full: u32,
+    /// Monotonic frame counter, used to index the TAA jitter pattern.
+    frame_counter: u64,
+    /// Rotating animation-refresh phase: each frame ~1/ANIM_REFRESH_SPREAD of
+    /// the (otherwise clean) tiles are re-traced so sky/water/foliage keep
+    /// animating on a still camera — spread evenly instead of one hard full
+    /// re-trace every 15 frames (which stuttered).
+    refresh_phase: u32,
     tile_dirty_mask: Vec<u32>,
     first_frame: bool,
     current_material: u8,
@@ -104,7 +129,8 @@ impl App {
             start_time: Instant::now(),
             physics_acc: 0.0,
             last_camera_pose: None,
-            frames_since_full: 0,
+            frame_counter: 0,
+            refresh_phase: 0,
             tile_dirty_mask: Vec::with_capacity(2048),
             first_frame: true,
             current_material: MAT_STONE,
@@ -340,42 +366,73 @@ impl App {
 
         // ---- temporal differential ----
         let cur_pose = (self.camera.pos, self.camera.yaw, self.camera.pitch, self.camera.fov_y);
-        let camera_changed = self.last_camera_pose.map_or(true, |p| p != cur_pose);
+        // #1: only a *real* camera move forces a full re-trace. A sub-mm /
+        // sub-pixel jitter (float noise, micro mouse drift) no longer re-traces
+        // every tile — it would just reproduce the same image.
+        let camera_changed = match self.last_camera_pose {
+            None => true,
+            Some((pp, py, ppi, pf)) => {
+                (self.camera.pos - pp).length_squared() > 1.0e-6
+                    || (self.camera.yaw - py).abs() > 1.0e-4
+                    || (self.camera.pitch - ppi).abs() > 1.0e-4
+                    || (self.camera.fov_y - pf).abs() > 1.0e-4
+            }
+        };
         let physics_changed = self.world.all_dirty || !self.world.dirty_bricks.is_empty();
-        self.frames_since_full += 1;
-        let force_full = self.first_frame
-            || self.frames_since_full >= 15
-            || self.world.all_dirty
-            || camera_changed;
-        let any_dirty = force_full || physics_changed;
+        let force_full = self.first_frame || self.world.all_dirty || camera_changed;
 
         let (rw, rh) = self.renderer.as_ref().unwrap().size;
         let tiles_w = (rw + 7) / 8;
         let tiles_h = (rh + 7) / 8;
-        let word_count = ((tiles_w * tiles_h) as usize + 31) / 32;
+        let n_tiles = (tiles_w * tiles_h) as usize;
+        let word_count = (n_tiles + 31) / 32;
         self.tile_dirty_mask.clear();
         self.tile_dirty_mask.resize(word_count, 0);
 
         if force_full {
             for w in self.tile_dirty_mask.iter_mut() { *w = u32::MAX; }
-            self.frames_since_full = 0;
-        } else if physics_changed {
-            // Project the dirty bricks straight from the world's dirty list —
-            // no per-frame clone. upload_world (below) clears the list after.
-            let world = &self.world;
-            let camera = &self.camera;
-            let mask = &mut self.tile_dirty_mask;
-            for &bi in &world.dirty_bricks {
-                temporal::project_brick_to_tiles(
-                    bi, world, camera, rw, rh, tiles_w, tiles_h, mask,
-                );
+        } else {
+            // Physics-dirty tiles (projected from the dirty bricks, no clone).
+            if physics_changed {
+                let world = &self.world;
+                let camera = &self.camera;
+                let mask = &mut self.tile_dirty_mask;
+                for &bi in &world.dirty_bricks {
+                    temporal::project_brick_to_tiles(
+                        bi, world, camera, rw, rh, tiles_w, tiles_h, mask,
+                    );
+                }
             }
+            // #2: rotating animation refresh — re-trace ~1/ANIM_REFRESH_SPREAD
+            // of the tiles each frame so sky/water/foliage keep animating on a
+            // still camera, spread evenly instead of a hard full re-trace every
+            // 15 frames (which periodically stuttered).
+            let phase = self.refresh_phase as usize;
+            let mut idx = phase;
+            while idx < n_tiles {
+                self.tile_dirty_mask[idx >> 5] |= 1u32 << (idx & 31);
+                idx += ANIM_REFRESH_SPREAD;
+            }
+            self.refresh_phase = (self.refresh_phase + 1) % ANIM_REFRESH_SPREAD as u32;
         }
+        // We always re-trace at least the rotating animation subset, so a frame
+        // is never fully skipped (keeps the world alive on an idle camera).
+        let any_dirty = true;
+
+        // TAA: jitter + accumulate only on a static camera (where small-voxel
+        // shimmer is worst); on motion pass the current frame through sharp.
+        self.frame_counter += 1;
+        let accumulate = !camera_changed && !self.first_frame;
+        let (jitter, taa_blend) = if accumulate {
+            (JITTER_PATTERN[(self.frame_counter & 7) as usize], 0.9_f32)
+        } else {
+            ([0.0_f32, 0.0_f32], 0.0_f32)
+        };
 
         let renderer = self.renderer.as_mut().unwrap();
         renderer.upload_world(&mut self.world);
         let t = (now - self.start_time).as_secs_f32();
-        renderer.update_camera(&self.camera, t, self.world.world_origin_voxel());
+        renderer.update_camera(&self.camera, t, self.world.world_origin_voxel(), jitter, taa_blend);
         let players_vec: Vec<(Vec3, u32)> = self.remote_players
             .iter()
             .map(|(id, (pos, _yaw, _pitch))| (Vec3::from_array(*pos), *id))

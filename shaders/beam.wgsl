@@ -20,6 +20,9 @@ struct Camera {
     _pad3: f32,
     world_origin: vec3<i32>,
     _pad4: i32,
+    jitter: vec2<f32>,
+    taa_blend: f32,
+    _pad5: f32,
 };
 
 fn pos_mod(a: i32, b: i32) -> i32 {
