@@ -19,37 +19,10 @@
 
 use glam::UVec3;
 
-pub const BRICK_DIM: u32 = 4;
-pub const BRICK_VOXELS: u32 = BRICK_DIM * BRICK_DIM * BRICK_DIM;
-
-pub const WORLD_BRICKS_X: u32 = 128;
-pub const WORLD_BRICKS_Y: u32 = 64;
-pub const WORLD_BRICKS_Z: u32 = 128;
-pub const WORLD_BRICKS_TOTAL: u32 = WORLD_BRICKS_X * WORLD_BRICKS_Y * WORLD_BRICKS_Z;
-
-pub const WORLD_VOXELS_X: u32 = WORLD_BRICKS_X * BRICK_DIM;
-pub const WORLD_VOXELS_Y: u32 = WORLD_BRICKS_Y * BRICK_DIM;
-pub const WORLD_VOXELS_Z: u32 = WORLD_BRICKS_Z * BRICK_DIM;
-
-pub const WORLD_TILES_X: u32 = WORLD_BRICKS_X / 4;
-pub const WORLD_TILES_Y: u32 = WORLD_BRICKS_Y / 4;
-pub const WORLD_TILES_Z: u32 = WORLD_BRICKS_Z / 4;
-pub const WORLD_TILES_TOTAL: u32 = WORLD_TILES_X * WORLD_TILES_Y * WORLD_TILES_Z;
-
-pub const WORLD_CHUNKS_X: u32 = (WORLD_TILES_X + 3) / 4;
-pub const WORLD_CHUNKS_Y: u32 = (WORLD_TILES_Y + 3) / 4;
-pub const WORLD_CHUNKS_Z: u32 = (WORLD_TILES_Z + 3) / 4;
-pub const WORLD_CHUNKS_TOTAL: u32 = WORLD_CHUNKS_X * WORLD_CHUNKS_Y * WORLD_CHUNKS_Z;
-
-// ---- storage chunks (the "chunked world") ----
-// A storage chunk holds 8x8x8 bricks = 32x32x32 voxels. Generation, dirty
-// tracking, and (eventually) GPU streaming all operate at this granularity.
-pub const STORAGE_CHUNK_BRICKS: u32 = 8;
-pub const STORAGE_CHUNK_VOXELS: u32 = STORAGE_CHUNK_BRICKS * BRICK_DIM;
-pub const WORLD_STORE_CX: u32 = WORLD_BRICKS_X / STORAGE_CHUNK_BRICKS;
-pub const WORLD_STORE_CY: u32 = WORLD_BRICKS_Y / STORAGE_CHUNK_BRICKS;
-pub const WORLD_STORE_CZ: u32 = WORLD_BRICKS_Z / STORAGE_CHUNK_BRICKS;
-pub const WORLD_STORE_CHUNKS: u32 = WORLD_STORE_CX * WORLD_STORE_CY * WORLD_STORE_CZ;
+// World dimensions live in `src/world_dims.rs` so build.rs can generate the
+// matching WGSL constants from the exact same source. Re-export them here so
+// every existing `crate::voxel::WORLD_*` reference keeps working unchanged.
+pub use crate::world_dims::*;
 
 #[inline(always)]
 pub const fn storage_chunk_idx(cx: u32, cy: u32, cz: u32) -> u32 {
@@ -944,6 +917,31 @@ impl World {
 
     pub fn dims_voxels(&self) -> UVec3 {
         UVec3::new(WORLD_VOXELS_X, WORLD_VOXELS_Y, WORLD_VOXELS_Z)
+    }
+
+    /// Material at a WORLD voxel coord using the same toroidal slot mapping the
+    /// shader and CPU raycaster use. Returns MAT_AIR if empty or outside the
+    /// loaded window. Single source of truth for "what's at this world voxel".
+    pub fn material_at_world(&self, wx: i32, wy: i32, wz: i32) -> u8 {
+        let origin = self.world_origin_voxel();
+        let rel = glam::IVec3::new(wx - origin.x, wy - origin.y, wz - origin.z);
+        if rel.x < 0 || rel.y < 0 || rel.z < 0
+            || rel.x as u32 >= WORLD_VOXELS_X
+            || rel.y as u32 >= WORLD_VOXELS_Y
+            || rel.z as u32 >= WORLD_VOXELS_Z
+        {
+            return MAT_AIR;
+        }
+        let sx = wx.rem_euclid(WORLD_VOXELS_X as i32) as u32;
+        let sy = rel.y as u32;
+        let sz = wz.rem_euclid(WORLD_VOXELS_Z as i32) as u32;
+        let bi = brick_idx(sx / BRICK_DIM, sy / BRICK_DIM, sz / BRICK_DIM) as usize;
+        let b = &self.bricks[bi];
+        let vi = brick_voxel_idx(sx % BRICK_DIM, sy % BRICK_DIM, sz % BRICK_DIM);
+        if (b.occupancy & (1u64 << vi)) == 0 {
+            return MAT_AIR;
+        }
+        b.materials[vi as usize]
     }
 }
 
