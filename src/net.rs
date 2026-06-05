@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -218,9 +218,23 @@ pub struct NetClient {
     token: std::sync::atomic::AtomicU64,
     /// Cleared when the TCP reader/writer thread dies — the host uses this to
     /// trigger a reconnect (checklist: reconnection).
-    connected: Arc<std::sync::atomic::AtomicBool>,
+    connected: Arc<AtomicBool>,
+    /// Set in Drop so the worker threads exit instead of leaking on reconnect.
+    shutdown: Arc<AtomicBool>,
+    /// A clone of the TCP stream kept solely to shut it down on Drop, which
+    /// unblocks the reader thread's blocking read.
+    tcp: TcpStream,
     pub my_id: Option<PlayerId>,
     pub seed: Option<u64>,
+}
+
+impl Drop for NetClient {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+        // Unblock the TCP reader (and writer) so their threads exit promptly;
+        // the UDP reader wakes from its read timeout and sees `shutdown`.
+        let _ = self.tcp.shutdown(std::net::Shutdown::Both);
+    }
 }
 
 impl NetClient {
@@ -229,13 +243,18 @@ impl NetClient {
         stream.set_nodelay(true)?;
         let server_ip = stream.peer_addr()?.ip();
         let stream_r = stream.try_clone()?;
+        let stream_ctl = stream.try_clone()?; // kept for shutdown on Drop
         let stream_w = stream;
         let (tx_inbound, rx_inbound) = unbounded::<Message>();
         let (tx_outbound, rx_outbound) = unbounded::<Message>();
 
-        // UDP socket for pose (ephemeral local port).
+        // UDP socket for pose (ephemeral local port). A read timeout lets the
+        // reader thread periodically check the shutdown flag instead of blocking
+        // on recv_from forever (which would leak the thread on reconnect).
         let udp = Arc::new(UdpSocket::bind(("0.0.0.0", 0))?);
-        let connected = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        udp.set_read_timeout(Some(Duration::from_secs(1)))?;
+        let connected = Arc::new(AtomicBool::new(true));
+        let shutdown = Arc::new(AtomicBool::new(false));
 
         let tx_in_tcp = tx_inbound.clone();
         let connected_r = connected.clone();
@@ -267,9 +286,13 @@ impl NetClient {
         // UDP reader: surface incoming poses into the same inbox.
         let udp_r = udp.clone();
         let tx_in_udp = tx_inbound;
+        let shutdown_u = shutdown.clone();
         thread::spawn(move || {
             let mut buf = [0u8; 512];
             loop {
+                if shutdown_u.load(Ordering::Relaxed) {
+                    break;
+                }
                 match udp_r.recv_from(&mut buf) {
                     Ok((n, _src)) => {
                         if let Ok(p) = bincode::deserialize::<PosePacket>(&buf[..n]) {
@@ -279,6 +302,10 @@ impl NetClient {
                             }
                         }
                     }
+                    // Read timeout — loop back to check the shutdown flag.
+                    Err(ref e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::TimedOut => {}
                     Err(_) => break,
                 }
             }
@@ -291,6 +318,8 @@ impl NetClient {
             server_udp: Mutex::new(None),
             token: std::sync::atomic::AtomicU64::new(0),
             connected,
+            shutdown,
+            tcp: stream_ctl,
             my_id: None,
             seed: None,
         };
@@ -366,7 +395,6 @@ impl NetClient {
 
 struct NewClient {
     id: PlayerId,
-    token: u64,
     tx: Sender<Message>,
 }
 
@@ -426,8 +454,9 @@ impl NetServer {
                             }
                             _ => return,
                         }
-                        let token: u64 = (id as u64) << 32 | 0x9E37_79B9 ^ (id as u64).wrapping_mul(2654435761);
-                        let _ = tx_new_clone.send(NewClient { id, token, tx: tx_out_for_new });
+                        // The UDP auth token is issued lazily in issue_token()
+                        // (sent in JoinAck) — no token is registered here.
+                        let _ = tx_new_clone.send(NewClient { id, tx: tx_out_for_new });
                         loop {
                             match read_message(&mut r) {
                                 Ok(m) => {
@@ -513,7 +542,6 @@ impl NetServer {
         while let Ok(nc) = self.new_clients.try_recv() {
             self.clients.insert(nc.id, nc.tx);
             self.last_seen.insert(nc.id, Instant::now());
-            self.tokens.lock().unwrap().insert(nc.token, nc.id);
             joined.push(nc.id);
         }
         let mut msgs = Vec::new();

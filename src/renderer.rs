@@ -176,6 +176,9 @@ pub struct Renderer {
     taa_bgl: wgpu::BindGroupLayout,
     taa_pipeline: wgpu::ComputePipeline,
     taa_bg: wgpu::BindGroup,
+    /// Set after (re)creating the history texture so the next frame skips the
+    /// TAA blend — otherwise it would read uninitialised history (garbage).
+    taa_reset: bool,
 
     // Reused per-frame scratch for incremental mask/uniform uploads — derived
     // from the dirty-brick list so no extra dirty tracking is needed and no
@@ -498,6 +501,7 @@ impl Renderer {
             compute_bgl, compute_pipeline, compute_bg,
             blit_bgl, blit_pipeline, blit_bg,
             taa_bgl, taa_pipeline, taa_bg,
+            taa_reset: true,
             dirty_tiles_scratch: Vec::with_capacity(4096),
             dirty_chunks_scratch: Vec::with_capacity(512),
             dirty_words_scratch: Vec::with_capacity(4096),
@@ -540,6 +544,15 @@ impl Renderer {
             &self.device, &self.taa_bgl, &self.camera_buf, &self.output_view, &self.history_view, &self.resolve_view,
         );
         self.blit_bg = make_blit_bg(&self.device, &self.blit_bgl, &self.resolve_view, &self.sampler);
+        // History texture is newly (re)created and uninitialised — skip the TAA
+        // blend next frame so it isn't read as garbage.
+        self.taa_reset = true;
+    }
+
+    /// Returns whether the TAA history was just (re)created, clearing the flag.
+    /// The caller forces taa_blend = 0 for that one frame.
+    pub fn take_taa_reset(&mut self) -> bool {
+        std::mem::take(&mut self.taa_reset)
     }
 
     pub fn upload_world(&mut self, world: &mut World) {

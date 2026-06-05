@@ -168,9 +168,10 @@ impl App {
                     let step = Duration::from_micros(1_000_000 / 30);
                     while !stop.load(Ordering::Relaxed) {
                         std::thread::sleep(step);
-                        if let Ok(mut w) = world.lock() {
-                            physics::tick(&mut w);
-                        }
+                        // Recover a poisoned lock rather than propagating a
+                        // second panic — the render thread does the same.
+                        let mut w = world.lock().unwrap_or_else(|e| e.into_inner());
+                        physics::tick(&mut w);
                     }
                 })
                 .expect("spawn physics thread");
@@ -255,16 +256,16 @@ impl App {
                     self.remote_players.remove(&id);
                 }
                 net::Message::VoxelEdit { wx, wy, wz, mat, .. } => {
-                    self.world.lock().unwrap().apply_edit(wx, wy, wz, mat);
+                    self.world.lock().unwrap_or_else(|e| e.into_inner()).apply_edit(wx, wy, wz, mat);
                 }
                 net::Message::Explode { cx, cy, cz, radius, mat, .. } => {
-                    apply_sphere(&mut self.world.lock().unwrap(), cx, cy, cz, radius, mat);
+                    apply_sphere(&mut self.world.lock().unwrap_or_else(|e| e.into_inner()), cx, cy, cz, radius, mat);
                 }
                 net::Message::EditLog { compressed } => {
                     // Ordered, compressed edit-log replay (late-join sync).
                     let edits = net::decompress_edits(&compressed);
                     log::info!("applying {} replayed edits", edits.len());
-                    let mut world = self.world.lock().unwrap();
+                    let mut world = self.world.lock().unwrap_or_else(|e| e.into_inner());
                     for e in edits {
                         match e {
                             net::Message::VoxelEdit { wx, wy, wz, mat, .. } => {
@@ -347,7 +348,7 @@ impl App {
             KeyCode::KeyT if pressed => {
                 let fwd = self.camera.forward();
                 let p = self.camera.pos + fwd * 15.0;
-                self.world.lock().unwrap().apply_edit(
+                self.world.lock().unwrap_or_else(|e| e.into_inner()).apply_edit(
                     p.x.floor() as i32, p.y.floor() as i32, p.z.floor() as i32, voxel::MAT_LAVA,
                 );
             }
@@ -370,7 +371,7 @@ impl App {
         }
         use winit::event::MouseButton;
         let clicks = std::mem::take(&mut self.pending_clicks);
-        let mut world = self.world.lock().unwrap();
+        let mut world = self.world.lock().unwrap_or_else(|e| e.into_inner());
         let world_origin = world_origin_voxel(&world);
         for button in clicks {
             let Some(hit) = raycast::raycast(
@@ -425,7 +426,7 @@ impl App {
         // Streaming (brief world lock): keep the window centred with a
         // hysteresis deadband so boundary oscillation doesn't thrash regen.
         {
-            let mut world = self.world.lock().unwrap();
+            let mut world = self.world.lock().unwrap_or_else(|e| e.into_inner());
             let cur_origin = world.world_origin_chunk;
             let target_origin = voxel::World::target_origin_chunk(self.camera.pos);
             let drift = target_origin - cur_origin;
@@ -465,8 +466,11 @@ impl App {
 
         // TAA: jitter + accumulate only on a static camera (needs only
         // camera_changed / first_frame, so compute before taking the lock).
+        // Skip the blend for one frame after a resize — the history texture was
+        // just recreated and would otherwise be read uninitialised.
+        let taa_reset = self.renderer.as_mut().unwrap().take_taa_reset();
         self.frame_counter += 1;
-        let accumulate = !camera_changed && !self.first_frame;
+        let accumulate = !camera_changed && !self.first_frame && !taa_reset;
         let (jitter, taa_blend) = if accumulate {
             (JITTER_PATTERN[(self.frame_counter & 7) as usize], 0.9_f32)
         } else {
@@ -477,7 +481,7 @@ impl App {
         // Build the dirty-tile mask + upload world + camera under one lock so
         // the physics worker can run in the gaps between frames.
         {
-            let mut world = self.world.lock().unwrap();
+            let mut world = self.world.lock().unwrap_or_else(|e| e.into_inner());
             let physics_changed = world.all_dirty || !world.dirty_bricks.is_empty();
             let force_full = self.first_frame || world.all_dirty || camera_changed;
             if force_full {
@@ -574,7 +578,7 @@ impl ApplicationHandler for App {
                 return;
             }
         };
-        let renderer = match Renderer::new(window.clone(), &self.world.lock().unwrap()) {
+        let renderer = match Renderer::new(window.clone(), &self.world.lock().unwrap_or_else(|e| e.into_inner())) {
             Ok(r) => r,
             Err(e) => {
                 log::error!("failed to initialise renderer: {e}");
