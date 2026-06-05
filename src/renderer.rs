@@ -131,7 +131,7 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    pub fn new(window: Arc<Window>, world: &World) -> Self {
+    pub fn new(window: Arc<Window>, world: &World) -> Result<Self, String> {
         let inner = window.inner_size();
         let (surface_w, surface_h) = (inner.width.max(1), inner.height.max(1));
         let (width, height) = (
@@ -146,14 +146,14 @@ impl Renderer {
 
         let surface = instance
             .create_surface(window.clone())
-            .expect("create_surface");
+            .map_err(|e| format!("create_surface failed: {e}"))?;
 
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: Some(&surface),
             force_fallback_adapter: false,
         }))
-        .expect("request_adapter");
+        .ok_or_else(|| "no compatible GPU adapter found".to_string())?;
 
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
@@ -167,7 +167,7 @@ impl Renderer {
             },
             None,
         ))
-        .expect("request_device");
+        .map_err(|e| format!("request_device failed: {e}"))?;
 
         let caps = surface.get_capabilities(&adapter);
         let surface_format = caps
@@ -181,12 +181,15 @@ impl Renderer {
             format: surface_format,
             width: surface_w,
             height: surface_h,
-            present_mode: caps
-                .present_modes
-                .iter()
-                .copied()
-                .find(|m| matches!(m, wgpu::PresentMode::Immediate | wgpu::PresentMode::Mailbox))
-                .unwrap_or(wgpu::PresentMode::Fifo),
+            // Explicit present policy: prefer Mailbox (low-latency, tear-free,
+            // capped to the display refresh) and fall back to Fifo (vsync,
+            // always supported). We deliberately avoid Immediate — it was the
+            // source of the uncapped ~1800 fps idle GPU burn.
+            present_mode: if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
+                wgpu::PresentMode::Mailbox
+            } else {
+                wgpu::PresentMode::Fifo
+            },
             alpha_mode: caps.alpha_modes[0],
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
@@ -547,7 +550,7 @@ impl Renderer {
 
         let blit_bg = make_blit_bg(&device, &blit_bgl, &output_view, &sampler);
 
-        Self {
+        Ok(Self {
             device, queue, surface, config,
             size: (width, height),
             surface_size: (surface_w, surface_h),
@@ -558,7 +561,7 @@ impl Renderer {
             beam_bgl, beam_pipeline, beam_bg,
             compute_bgl, compute_pipeline, compute_bg,
             blit_bgl, blit_pipeline, blit_bg,
-        }
+        })
     }
 
     pub fn resize(&mut self, w: u32, h: u32) {
