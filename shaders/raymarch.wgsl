@@ -1167,13 +1167,16 @@ fn trace_no_water(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
     if (step.z > 0) { t_max.z = (f32(vl0.z + 1) - org.z) * inv_dir.z; } else { t_max.z = (f32(vl0.z) - org.z) * inv_dir.z; }
 
     var last_axis: i32 = -1;
+    // Slot voxel tracked incrementally (avoids the two per-step pos_mod folds —
+    // checklist #10). skip_to_cell resyncs it after a jump.
+    var slot_v = world_to_slot_voxel(voxel);
     for (var s: i32 = 0; s < 1024; s = s + 1) {
         let rel = voxel - camera.world_origin;
         if (rel.x < 0 || rel.x >= WORLD_VOXELS_X
          || rel.y < 0 || rel.y >= WORLD_VOXELS_Y
          || rel.z < 0 || rel.z >= WORLD_VOXELS_Z) { return out; }
 
-        let slot_v = world_to_slot_voxel(voxel);
+        // slot_v is maintained incrementally (see step + skip_to_cell).
         let bp = slot_v >> vec3<u32>(2u);
         let tp = slot_v >> vec3<u32>(4u);
         let cp = slot_v >> vec3<u32>(6u);
@@ -1181,24 +1184,24 @@ fn trace_no_water(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
         let l4p = slot_v >> vec3<u32>(8u);
         let l4i = world_l4_idx(l4p.x, l4p.y, l4p.z);
         if (l4_cell_empty(l4i)) {
-            skip_to_cell(256, &voxel, &t_max, ro, org, dir, inv_dir, step, &last_axis);
+            skip_to_cell(256, &voxel, &t_max, ro, org, dir, inv_dir, step, &last_axis, &slot_v);
             continue;
         }
         let chunk_lin = (cp.x & 3) + (cp.z & 3) * 4 + (cp.y & 3) * 16;
         if (!l4_has_child(l4i, chunk_lin)) {
-            skip_to_cell(64, &voxel, &t_max, ro, org, dir, inv_dir, step, &last_axis);
+            skip_to_cell(64, &voxel, &t_max, ro, org, dir, inv_dir, step, &last_axis, &slot_v);
             continue;
         }
         let ci = world_chunk_idx(cp.x, cp.y, cp.z);
         let tile_lin = (tp.x & 3) + (tp.z & 3) * 4 + (tp.y & 3) * 16;
         if (!chunk_has_child(ci, tile_lin)) {
-            skip_to_cell(16, &voxel, &t_max, ro, org, dir, inv_dir, step, &last_axis);
+            skip_to_cell(16, &voxel, &t_max, ro, org, dir, inv_dir, step, &last_axis, &slot_v);
             continue;
         }
         let ti = world_tile_idx(tp.x, tp.y, tp.z);
         let brick_lin = (bp.x & 3) + (bp.z & 3) * 4 + (bp.y & 3) * 16;
         if (!tile_has_child(ti, brick_lin)) {
-            skip_to_cell(4, &voxel, &t_max, ro, org, dir, inv_dir, step, &last_axis);
+            skip_to_cell(4, &voxel, &t_max, ro, org, dir, inv_dir, step, &last_axis, &slot_v);
             continue;
         }
         let bi = world_brick_idx(bp.x, bp.y, bp.z);
@@ -1226,14 +1229,21 @@ fn trace_no_water(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
 
         if (t_max.x < t_max.y && t_max.x < t_max.z) {
             voxel.x = voxel.x + step.x;
+            slot_v.x = slot_v.x + step.x;
+            if (slot_v.x >= WORLD_VOXELS_X) { slot_v.x = slot_v.x - WORLD_VOXELS_X; }
+            else if (slot_v.x < 0) { slot_v.x = slot_v.x + WORLD_VOXELS_X; }
             t_max.x = t_max.x + t_delta.x;
             last_axis = 0;
         } else if (t_max.y < t_max.z) {
             voxel.y = voxel.y + step.y;
+            slot_v.y = slot_v.y + step.y;
             t_max.y = t_max.y + t_delta.y;
             last_axis = 1;
         } else {
             voxel.z = voxel.z + step.z;
+            slot_v.z = slot_v.z + step.z;
+            if (slot_v.z >= WORLD_VOXELS_Z) { slot_v.z = slot_v.z - WORLD_VOXELS_Z; }
+            else if (slot_v.z < 0) { slot_v.z = slot_v.z + WORLD_VOXELS_Z; }
             t_max.z = t_max.z + t_delta.z;
             last_axis = 2;
         }
@@ -1626,6 +1636,9 @@ fn trace_any(origin: vec3<f32>, dir: vec3<f32>) -> bool {
     if (step.z > 0) { t_max.z = (f32(vl0.z + 1) - org.z) * inv_dir.z; } else { t_max.z = (f32(vl0.z) - org.z) * inv_dir.z; }
 
     var last_axis: i32 = -1;
+    // Slot voxel tracked incrementally (avoids the two per-step pos_mod folds —
+    // checklist #10). skip_to_cell resyncs it after a jump.
+    var slot_v = world_to_slot_voxel(voxel);
     var t_cur = t_enter;
     for (var s: i32 = 0; s < 768; s = s + 1) {
         if (t_cur > SHADOW_MAX_DIST) { return false; }
@@ -1634,7 +1647,7 @@ fn trace_any(origin: vec3<f32>, dir: vec3<f32>) -> bool {
          || rel.y < 0 || rel.y >= WORLD_VOXELS_Y
          || rel.z < 0 || rel.z >= WORLD_VOXELS_Z) { return false; }
 
-        let slot_v = world_to_slot_voxel(voxel);
+        // slot_v is maintained incrementally (see step + skip_to_cell).
         let bp = slot_v >> vec3<u32>(2u);
         let tp = slot_v >> vec3<u32>(4u);
         let cp = slot_v >> vec3<u32>(6u);
@@ -1642,27 +1655,27 @@ fn trace_any(origin: vec3<f32>, dir: vec3<f32>) -> bool {
         let l4p = slot_v >> vec3<u32>(8u);
         let l4i = world_l4_idx(l4p.x, l4p.y, l4p.z);
         if (l4_cell_empty(l4i)) {
-            skip_to_cell(256, &voxel, &t_max, ro, org, dir, inv_dir, step, &last_axis);
+            skip_to_cell(256, &voxel, &t_max, ro, org, dir, inv_dir, step, &last_axis, &slot_v);
             t_cur = axis_select(t_max, last_axis) - axis_select(t_delta, last_axis);
             continue;
         }
         let chunk_lin = (cp.x & 3) + (cp.z & 3) * 4 + (cp.y & 3) * 16;
         if (!l4_has_child(l4i, chunk_lin)) {
-            skip_to_cell(64, &voxel, &t_max, ro, org, dir, inv_dir, step, &last_axis);
+            skip_to_cell(64, &voxel, &t_max, ro, org, dir, inv_dir, step, &last_axis, &slot_v);
             t_cur = axis_select(t_max, last_axis) - axis_select(t_delta, last_axis);
             continue;
         }
         let ci = world_chunk_idx(cp.x, cp.y, cp.z);
         let tile_lin = (tp.x & 3) + (tp.z & 3) * 4 + (tp.y & 3) * 16;
         if (!chunk_has_child(ci, tile_lin)) {
-            skip_to_cell(16, &voxel, &t_max, ro, org, dir, inv_dir, step, &last_axis);
+            skip_to_cell(16, &voxel, &t_max, ro, org, dir, inv_dir, step, &last_axis, &slot_v);
             t_cur = axis_select(t_max, last_axis) - axis_select(t_delta, last_axis);
             continue;
         }
         let ti = world_tile_idx(tp.x, tp.y, tp.z);
         let brick_lin = (bp.x & 3) + (bp.z & 3) * 4 + (bp.y & 3) * 16;
         if (!tile_has_child(ti, brick_lin)) {
-            skip_to_cell(4, &voxel, &t_max, ro, org, dir, inv_dir, step, &last_axis);
+            skip_to_cell(4, &voxel, &t_max, ro, org, dir, inv_dir, step, &last_axis, &slot_v);
             t_cur = axis_select(t_max, last_axis) - axis_select(t_delta, last_axis);
             continue;
         }
@@ -1685,16 +1698,23 @@ fn trace_any(origin: vec3<f32>, dir: vec3<f32>) -> bool {
         if (t_max.x < t_max.y && t_max.x < t_max.z) {
             t_cur = t_max.x;
             voxel.x = voxel.x + step.x;
+            slot_v.x = slot_v.x + step.x;
+            if (slot_v.x >= WORLD_VOXELS_X) { slot_v.x = slot_v.x - WORLD_VOXELS_X; }
+            else if (slot_v.x < 0) { slot_v.x = slot_v.x + WORLD_VOXELS_X; }
             t_max.x = t_max.x + t_delta.x;
             last_axis = 0;
         } else if (t_max.y < t_max.z) {
             t_cur = t_max.y;
             voxel.y = voxel.y + step.y;
+            slot_v.y = slot_v.y + step.y;
             t_max.y = t_max.y + t_delta.y;
             last_axis = 1;
         } else {
             t_cur = t_max.z;
             voxel.z = voxel.z + step.z;
+            slot_v.z = slot_v.z + step.z;
+            if (slot_v.z >= WORLD_VOXELS_Z) { slot_v.z = slot_v.z - WORLD_VOXELS_Z; }
+            else if (slot_v.z < 0) { slot_v.z = slot_v.z + WORLD_VOXELS_Z; }
             t_max.z = t_max.z + t_delta.z;
             last_axis = 2;
         }
@@ -1844,6 +1864,9 @@ fn trace(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
     if (step.z > 0) { t_max.z = (f32(vl0.z + 1) - org.z) * inv_dir.z; } else { t_max.z = (f32(vl0.z) - org.z) * inv_dir.z; }
 
     var last_axis: i32 = -1;
+    // Slot voxel tracked incrementally (avoids the two per-step pos_mod folds —
+    // checklist #10). skip_to_cell resyncs it after a jump.
+    var slot_v = world_to_slot_voxel(voxel);
     var t_cur: f32 = t_enter;
     let max_steps: i32 = 1024;
     for (var s: i32 = 0; s < max_steps; s = s + 1) {
@@ -1857,7 +1880,7 @@ fn trace(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
             return out;
         }
 
-        let slot_v = world_to_slot_voxel(voxel);
+        // slot_v is maintained incrementally (see step + skip_to_cell).
         let bp = slot_v >> vec3<u32>(2u);
         let tp = slot_v >> vec3<u32>(4u);
         let cp = slot_v >> vec3<u32>(6u);
@@ -1871,13 +1894,13 @@ fn trace(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
             let l4p = slot_v >> vec3<u32>(8u);
             let l4i = world_l4_idx(l4p.x, l4p.y, l4p.z);
             if (l4_cell_empty(l4i)) {
-                skip_to_cell(256, &voxel, &t_max, ro, org, dir, inv_dir, step, &last_axis);
+                skip_to_cell(256, &voxel, &t_max, ro, org, dir, inv_dir, step, &last_axis, &slot_v);
                 t_cur = axis_select(t_max, last_axis) - axis_select(t_delta, last_axis);
                 continue;
             }
             let chunk_lin = (cp.x & 3) + (cp.z & 3) * 4 + (cp.y & 3) * 16;
             if (!l4_has_child(l4i, chunk_lin)) {
-                skip_to_cell(64, &voxel, &t_max, ro, org, dir, inv_dir, step, &last_axis);
+                skip_to_cell(64, &voxel, &t_max, ro, org, dir, inv_dir, step, &last_axis, &slot_v);
                 t_cur = axis_select(t_max, last_axis) - axis_select(t_delta, last_axis);
                 continue;
             }
@@ -1886,7 +1909,7 @@ fn trace(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
         let ci = world_chunk_idx(cp.x, cp.y, cp.z);
         let tile_in_chunk_lin = (tp.x & 3) + (tp.z & 3) * 4 + (tp.y & 3) * 16;
         if (!chunk_has_child(ci, tile_in_chunk_lin)) {
-            skip_to_cell(16, &voxel, &t_max, ro, org, dir, inv_dir, step, &last_axis);
+            skip_to_cell(16, &voxel, &t_max, ro, org, dir, inv_dir, step, &last_axis, &slot_v);
             t_cur = axis_select(t_max, last_axis) - axis_select(t_delta, last_axis);
             continue;
         }
@@ -1944,7 +1967,7 @@ fn trace(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
 
         let brick_in_tile_lin = (bp.x & 3) + (bp.z & 3) * 4 + (bp.y & 3) * 16;
         if (!tile_has_child(ti, brick_in_tile_lin)) {
-            skip_to_cell(4, &voxel, &t_max, ro, org, dir, inv_dir, step, &last_axis);
+            skip_to_cell(4, &voxel, &t_max, ro, org, dir, inv_dir, step, &last_axis, &slot_v);
             t_cur = axis_select(t_max, last_axis) - axis_select(t_delta, last_axis);
             continue;
         }
@@ -1982,7 +2005,7 @@ fn trace(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
             let b = bricks[bi];
             if ((b.occ_lo | b.occ_hi) == 0u) {
                 // Empty brick — skip the whole 4-voxel cell.
-                skip_to_cell(4, &voxel, &t_max, ro, org, dir, inv_dir, step, &last_axis);
+                skip_to_cell(4, &voxel, &t_max, ro, org, dir, inv_dir, step, &last_axis, &slot_v);
                 t_cur = axis_select(t_max, last_axis) - axis_select(t_delta, last_axis);
                 continue;
             }
@@ -2066,16 +2089,23 @@ fn trace(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
         if (t_max.x < t_max.y && t_max.x < t_max.z) {
             t_cur = t_max.x;
             voxel.x = voxel.x + step.x;
+            slot_v.x = slot_v.x + step.x;
+            if (slot_v.x >= WORLD_VOXELS_X) { slot_v.x = slot_v.x - WORLD_VOXELS_X; }
+            else if (slot_v.x < 0) { slot_v.x = slot_v.x + WORLD_VOXELS_X; }
             t_max.x = t_max.x + t_delta.x;
             last_axis = 0;
         } else if (t_max.y < t_max.z) {
             t_cur = t_max.y;
             voxel.y = voxel.y + step.y;
+            slot_v.y = slot_v.y + step.y;
             t_max.y = t_max.y + t_delta.y;
             last_axis = 1;
         } else {
             t_cur = t_max.z;
             voxel.z = voxel.z + step.z;
+            slot_v.z = slot_v.z + step.z;
+            if (slot_v.z >= WORLD_VOXELS_Z) { slot_v.z = slot_v.z - WORLD_VOXELS_Z; }
+            else if (slot_v.z < 0) { slot_v.z = slot_v.z + WORLD_VOXELS_Z; }
             t_max.z = t_max.z + t_delta.z;
             last_axis = 2;
         }
@@ -2121,6 +2151,7 @@ fn skip_to_cell(
     inv_dir: vec3<f32>,
     step: vec3<i32>,
     last_axis: ptr<function, i32>,
+    slot_v: ptr<function, vec3<i32>>,
 ) {
     // Cell alignment is in ABSOLUTE world coords (cell_size divides
     // WORLD_VOXELS so this matches the toroidal slot cells). Only the float t
@@ -2164,4 +2195,7 @@ fn skip_to_cell(
     if (step.y > 0) { (*t_max).y = (f32(vl.y + 1) - org.y) * inv_dir.y; } else { (*t_max).y = (f32(vl.y) - org.y) * inv_dir.y; }
     if (step.z > 0) { (*t_max).z = (f32(vl.z + 1) - org.z) * inv_dir.z; } else { (*t_max).z = (f32(vl.z) - org.z) * inv_dir.z; }
     *last_axis = ax;
+    // A skip jumps the voxel arbitrarily, so the incrementally-tracked slot
+    // coord must be recomputed here (the per-step path keeps it in sync cheaply).
+    *slot_v = world_to_slot_voxel(nv);
 }

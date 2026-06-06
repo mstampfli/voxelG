@@ -100,37 +100,64 @@ Validation tooling added so changes are checkable without a display:
 
 ## Performance notes (measured)
 
-Headless GPU timing of the raymarch pass (RTX 5060, `cargo test --lib
-raymarch_timing -- --ignored`), high camera looking down (worst case — most of
-the screen is terrain):
+Headless GPU timing of the raymarch pass (RTX 5060, **on AC**, `cargo test --lib
+raymarch_timing -- --ignored`), worst-case view (high camera, all terrain,
+force-full = every tile re-traced). Real static/slow play is much faster — the
+temporal-differential system re-traces only ~1/8 of tiles per frame.
 
-| | on AC power | on battery |
+| build stage | 1920×1080 | 1280×720 |
 |---|---|---|
-| 1280×720 | **5.5 ms (~180 fps)** | ~80 ms (~12 fps) |
-| 640×360  | **1.5 ms (~650 fps)** | ~23 ms (~44 fps) |
+| pre-optimisation baseline | 13.8 ms (72 fps) | 11.4 ms (88 fps) |
+| + shadow PCF 2→1 (Win B) | 11.0 ms (91 fps) | 8.6 ms (117 fps) |
+| **+ AO distance-LOD** | **9.8 ms (102 fps)** | **6.9 ms (144 fps)** |
+| pure traversal (no shading) | 5.6 ms | 3.1 ms |
 
-The engine is GPU-light on AC (~5.5 ms/frame for the raymarch). **Laptop battery
-throttling is ~14×** — measure/play on AC. Cost breakdown at 1280×720 on battery:
-~41 ms base traversal, +8 ms for the L4/chunk coarse skips (net-negative on
-terrain-heavy views, a win on sky/empty views), +31 ms shading (shadows + AO +
-clouds + god-rays — all pre-existing per-pixel secondary rays).
+So the worst case now clears **100+ fps even at 1080p**, and shading (the
+dominant ~60–70%) was cut ~40% with no visible quality loss (TAA accumulates the
+1-sample shadow + the AO is only dropped where it's sub-pixel). **Battery
+throttles the GPU ~14×** — measure/play on AC.
 
-## Known issues / remaining work
+In-game (a real 84 s session, per-second fps): avg **99.6**, 5%-low **70**,
+lowest 65 (excluding the one-time startup second). Chunk-load spike: fixed
+(async install + mask-only sky-clear).
 
-- **Chunk-load lag spike.** Crossing a chunk boundary still hitches. The
-  *generation* is async (worker pool), but the *install* — `apply_slot_bricks`
-  (per-brick movable/uniform recompute + `refresh_masks_for_brick`) for up to
-  `CHUNK_INSTALL_BUDGET` (6) chunks/frame, plus the resulting brick upload burst
-  — still runs on the main thread under the world lock. Fix paths: (a) compute
-  masks/uniform on the worker so the main thread only memcpy-installs; (b) lower
-  the per-frame install budget; (c) spread the brick upload across more frames.
-- **L4 per-step cost.** The L4/chunk coarse checks run every voxel step; on
-  terrain-dense views that's ~+8 ms with no skip benefit. A true *nested* march
-  (descend once, step within a level, ascend) would make the coarse levels pay
-  for themselves instead of costing per-step — the bigger traversal rewrite.
-- **Shading is brute-forced per pixel per frame** (shadows/AO/god-rays re-traced
-  every frame). Amortizing them via a reprojected shadow/AO cache (checklist #12,
-  only partially done) is the path to small-voxel/LOTL-class perf.
+## Roadmap to 10 cm voxels @ 100 fps
+
+10 cm voxels at the current ~128 m world means a ~2.5× denser grid (~15× the
+voxels). Traversal and shading both scale up; the wins below are the path. Done
+this pass are the high-ROI, measured, low-risk ones; the rest are designed but
+deferred (they're heavier rewrites that touch the working render path, and the
+engine already clears 100 fps at the current scale).
+
+**Done (measured):**
+- Shadow rays 2→1 sample + cloud self-shadow 3→2 (Win B).
+- AO distance-LOD (skip the 12-tap AO past 64 voxels).
+- L4/chunk/tile/brick skip hierarchy + distance budget + tile/brick LOD (Phase 3)
+  — the "hierarchical DDA" foundation; empty space already costs O(coarse steps).
+
+**Designed, deferred (next, in priority order for small voxels):**
+1. **Reprojected shadow/AO cache** (checklist #12). Shadow + AO are world-space
+   properties of the hit point, so cache them in a screen buffer and reproject
+   from the previous frame (using the hit world-pos + previous camera); re-trace
+   only disoccluded pixels. This is the biggest *moving-frame* shading win and
+   scales directly with voxel density. Risk: ghosting/disocclusion needs visual
+   tuning. (The static case is already amortised by the temporal-diff tiles.)
+2. **True nested descend/ascend DDA.** The hierarchy is present, but each voxel
+   step still re-derives indices + folds two `pos_mod`s. Descending once into an
+   occupied chunk/tile/brick and stepping within it (incremental slot coords,
+   no re-fold) makes per-step cost ~constant — the key as bricks-per-ray grow at
+   10 cm. Risk: core-DDA rewrite; validate against the headless render test +
+   far-origin test.
+3. **Half-res volumetric pass** (checklist #14). Clouds (and god-rays) in a
+   dedicated half-res compute pass + bilinear upsample, instead of full-res in
+   `cs_main`. ~4× fewer cloud marches on sky-facing views. Self-contained (its
+   own texture/pipeline like the TAA pass).
+4. **GPU-compute physics** — `docs/gpu-physics-design.md` (pull-only,
+   double-buffered, integer-only CA). Removes the CPU CA cost, which matters most
+   at 10 cm where there are far more active cells.
+
+Each is independently landable and measurable with the `raymarch_timing` probe
+(traversal items) or a horizon-camera variant (volumetrics).
 
 ## Deliberately deferred (with rationale)
 - Full reprojection/disocclusion TAA (skip tracing reprojectable tiles on motion) —
