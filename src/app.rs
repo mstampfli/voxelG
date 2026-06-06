@@ -466,16 +466,15 @@ impl App {
         // just recreated and would otherwise be read uninitialised.
         let taa_reset = self.renderer.as_mut().unwrap().take_taa_reset();
         self.frame_counter += 1;
-        // Full-reprojection TAA: a STILL camera jitters + accumulates (sub-pixel
-        // AA); a MOVING camera keeps accumulating too (taa_blend > 0) but without
-        // jitter — the TAA pass reprojects the history by motion, so we no longer
-        // hard-reset on movement. A hard reset only happens on the first frame /
-        // after a resize (taa_blend = 0 → passthrough).
-        let hard_reset = self.first_frame || taa_reset;
+        // TAA + reprojection caches are STATIC-ONLY: a still camera jitters +
+        // accumulates (sub-pixel AA) and the shadow/AO + colour history reproject
+        // onto themselves (exact, no warp). A MOVING camera passes the freshly
+        // traced frame straight through (taa_blend = 0) — motion reprojection was
+        // visibly warping/smearing, and the engine is fast enough to trace every
+        // moving frame fresh, so we keep motion sharp instead.
+        let hard_reset = self.first_frame || taa_reset || camera_changed;
         let (jitter, taa_blend) = if hard_reset {
             ([0.0_f32, 0.0_f32], 0.0_f32)
-        } else if camera_changed {
-            ([0.0_f32, 0.0_f32], 0.85_f32)
         } else {
             (JITTER_PATTERN[(self.frame_counter & 7) as usize], 0.9_f32)
         };

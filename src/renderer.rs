@@ -863,11 +863,14 @@ impl Renderer {
         let mut u = CameraUniform::from_camera(
             camera, self.size.0, self.size.1, time, world_origin_voxel, jitter, taa_blend,
         );
-        // Lighting reprojection is valid only with a previous frame AND an
-        // unchanged world origin (cached positions are relative to it).
+        // Lighting + colour-history reprojection runs only while ACCUMULATING
+        // (taa_blend > 0 = static camera), with a previous frame and an unchanged
+        // world origin. On motion (taa_blend == 0) it's disabled so we trace fresh
+        // — motion reprojection warped the image and the engine has the headroom.
+        let reproject_ok = taa_blend > 0.0 && self.prev_world_origin == world_origin_voxel;
         match &self.prev_cam {
-            Some(prev) if self.prev_world_origin == world_origin_voxel => u.set_prev_camera(prev, true),
-            _ => u.set_prev_camera(camera, false),
+            Some(prev) => u.set_prev_camera(prev, reproject_ok),
+            None => u.set_prev_camera(camera, false),
         }
         self.queue.write_buffer(&self.camera_buf, 0, bytemuck::bytes_of(&u));
         self.prev_cam = Some(camera.clone());
