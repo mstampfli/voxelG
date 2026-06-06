@@ -433,8 +433,10 @@ impl App {
             if drift.x.abs() >= STREAM_HYSTERESIS || drift.y.abs() >= STREAM_HYSTERESIS {
                 world.shift_origin(target_origin);
             }
-            // Generation runs on the worker pool; this only installs results.
-            world.install_finished_chunks(CHUNK_INSTALL_BUDGET);
+            // Budgeted streaming: clear+dispatch a few queued slots and install
+            // a few finished ones. Generation + the derived-mask computation run
+            // on the worker pool, so the frame never does the heavy work.
+            world.process_streaming(CHUNK_INSTALL_BUDGET);
         }
 
         // Raycast queued clicks against the now-settled camera (locks internally).
