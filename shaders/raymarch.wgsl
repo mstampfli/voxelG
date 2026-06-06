@@ -25,7 +25,15 @@ struct Camera {
     _pad4: i32,
     jitter: vec2<f32>,
     taa_blend: f32,
-    _pad5: f32,
+    reproject_lighting: f32,
+    prev_origin: vec3<f32>,
+    _pad6: f32,
+    prev_forward: vec3<f32>,
+    _pad7: f32,
+    prev_right: vec3<f32>,
+    _pad8: f32,
+    prev_up: vec3<f32>,
+    _pad9: f32,
 };
 
 // Toroidal storage: world voxel coords get folded into [0, WORLD_VOXELS_*)
@@ -83,6 +91,13 @@ struct PlayersBuf {
 @group(0) @binding(12) var cloud_in: texture_2d<f32>;
 @group(0) @binding(13) var cloud_samp: sampler;
 @group(0) @binding(14) var cloud_out: texture_storage_2d<rgba16float, write>;
+
+// Reprojected shadow/AO cache (#12). light_in = previous frame's G-buffer
+// (xyz = hit pos relative to world_origin, w = pack2x16float(shadow, ao));
+// light_out = this frame's. cs_main reprojects each hit into last frame's screen
+// and reuses the cached shadow/AO when the stored position matches (else traces).
+@group(0) @binding(15) var light_in: texture_2d<f32>;
+@group(0) @binding(16) var light_out: texture_storage_2d<rgba32float, write>;
 
 fn brick_uniform_mat(bi: i32) -> u32 {
     let w = brick_uniform_packed[bi >> 2];
@@ -319,6 +334,13 @@ fn ign(x: f32, y: f32, frame: f32) -> f32 {
 const PROFILE_FLAT: bool = false;
 const PROFILE_NO_L4: bool = false;
 
+// Reprojected shadow/AO cache (#12). Set false to fall back to tracing shadow+AO
+// every frame (e.g. if reprojection ghosting is ever observed). REPROJ_EPS2 is
+// the squared world-space distance (voxels²) within which a reprojected sample
+// is accepted as the same surface.
+const REPROJECT_LIGHTING: bool = true;
+const REPROJ_EPS2: f32 = 0.5;
+
 // Primary ray direction for a normalized screen uv (0..1). Shared by cs_main
 // (full-res, jittered) and cs_clouds (half-res). aspect uses the full-res
 // resolution ratio, which is identical at half res.
@@ -412,17 +434,52 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         textureStore(output_tex, vec2<i32>(i32(gid.x), i32(gid.y)), vec4<f32>(col, 1.0));
         return;
     }
+    // G-buffer for the shadow/AO reprojection cache; sentinel pos = never reused.
+    var gbuf = vec4<f32>(1e9, 1e9, 1e9, 0.0);
     if (hit.hit) {
         if (is_water_mat(hit.mat) && hit.normal.y > 0.5) {
             col = shade_water_top(hit, camera.origin, dir);
         } else if (hit.mat == MAT_GLASS) {
             col = shade_glass(hit, camera.origin, dir);
         } else {
-            col = shade(hit, camera.origin, dir, pix_jitter);
+            // Solid terrain faces have stable (view-independent) shadow + AO, so
+            // reproject them from last frame's G-buffer and reuse on a position
+            // match — only foliage/sub-voxel hits always re-trace.
+            let hitpos_rel = (camera.origin - vec3<f32>(camera.world_origin)) + dir * hit.t_hit;
+            let cacheable = hit.last_axis >= 0 && !is_foliage_mat(hit.mat);
+            var light = vec2<f32>(0.0);
+            var reuse = false;
+            if (REPROJECT_LIGHTING && cacheable && camera.reproject_lighting > 0.5) {
+                let abs_pos = hitpos_rel + vec3<f32>(camera.world_origin);
+                let d = abs_pos - camera.prev_origin;
+                let pz = dot(d, camera.prev_forward);
+                if (pz > 0.01) {
+                    let aspect = camera.resolution.x / camera.resolution.y;
+                    let px = dot(d, camera.prev_right);
+                    let py = dot(d, camera.prev_up);
+                    let ndc = vec2<f32>(px / (pz * camera.tan_half_fov * aspect),
+                                        py / (pz * camera.tan_half_fov));
+                    let uvp = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+                    if (uvp.x >= 0.0 && uvp.x < 1.0 && uvp.y >= 0.0 && uvp.y < 1.0) {
+                        let pc = vec2<i32>(uvp * camera.resolution);
+                        let g = textureLoad(light_in, pc, 0);
+                        let dpos = g.xyz - hitpos_rel;
+                        if (dot(dpos, dpos) < REPROJ_EPS2) {
+                            light = unpack2x16float(bitcast<u32>(g.w));
+                            reuse = true;
+                        }
+                    }
+                }
+            }
+            col = shade_cached(hit, camera.origin, dir, pix_jitter, reuse, &light);
+            if (cacheable) {
+                gbuf = vec4<f32>(hitpos_rel, bitcast<f32>(pack2x16float(light)));
+            }
         }
     } else {
         col = sky(dir);
     }
+    textureStore(light_out, vec2<i32>(i32(gid.x), i32(gid.y)), gbuf);
 
     // Remote-player markers: each player is a 1.6×2×1.6 box in world coords.
     // Pick the closest hit (player vs terrain) and override colour if a
@@ -1379,7 +1436,20 @@ fn shade_water_top(hit: Hit, origin: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
     return mix(col, fog_atmospheric(dir), fog_t);
 }
 
+// Thin wrapper: full shade with no lighting reuse (used by reflection/refraction
+// secondary rays, which aren't cached).
 fn shade(hit: Hit, origin: vec3<f32>, dir: vec3<f32>, pix_jit: f32) -> vec3<f32> {
+    var dummy = vec2<f32>(0.0);
+    return shade_cached(hit, origin, dir, pix_jit, false, &dummy);
+}
+
+// `reuse_light`: when true, the shadow + AO terms are taken from *light (the
+// reprojected cache) instead of being traced. When false they are computed and
+// written back into *light so the caller can store them for next frame.
+fn shade_cached(
+    hit: Hit, origin: vec3<f32>, dir: vec3<f32>, pix_jit: f32,
+    reuse_light: bool, light: ptr<function, vec2<f32>>,
+) -> vec3<f32> {
     let p_hit = origin + dir * hit.t_hit;
     let tex = material_texture(p_hit, hit.normal, hit.mat);
     var base = palette[hit.mat].rgb * tex;
@@ -1394,7 +1464,9 @@ fn shade(hit: Hit, origin: vec3<f32>, dir: vec3<f32>, pix_jit: f32) -> vec3<f32>
     // contact-shadow detail is invisible far away, so skip it past AO_DIST and
     // for sub-voxel foliage hits.
     let skip_ao = hit.last_axis < 0 || hit.t_hit > AO_DIST;
-    let ao = select(compute_ao(hit, origin, dir), 1.0, skip_ao);
+    var ao: f32;
+    if (reuse_light) { ao = (*light).y; }
+    else { ao = select(compute_ao(hit, origin, dir), 1.0, skip_ao); }
 
     // ---- swaying foliage ----
     // Leaves and grass-tops perturb their shading normal with a wind field
@@ -1424,7 +1496,9 @@ fn shade(hit: Hit, origin: vec3<f32>, dir: vec3<f32>, pix_jit: f32) -> vec3<f32>
     let p_off = p_hit + n * 0.001;
     let n_dot_l = max(0.0, dot(n, s));
     var shadow_term = 0.0;
-    if (n_dot_l > 0.0 && s_int > 0.0) {
+    if (reuse_light) {
+        shadow_term = (*light).x;
+    } else if (n_dot_l > 0.0 && s_int > 0.0) {
         // ONE jittered shadow ray (was 2). The per-pixel + per-frame jitter
         // (pix_jit rotates each frame) plus the TAA history accumulation average
         // the single sample into a soft penumbra over time — at half the cost.
@@ -1445,6 +1519,8 @@ fn shade(hit: Hit, origin: vec3<f32>, dir: vec3<f32>, pix_jit: f32) -> vec3<f32>
         let ss = normalize(s + off);
         shadow_term = select(0.0, 1.0, !trace_any(p_off, ss));
     }
+    // Hand the freshly-computed terms back so the caller can cache them.
+    if (!reuse_light) { *light = vec2<f32>(shadow_term, ao); }
 
     let direct = sun_color(s) * (n_dot_l * shadow_term);
     let ambient = ambient_color() * ao;

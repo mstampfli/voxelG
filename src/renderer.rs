@@ -178,6 +178,13 @@ pub struct Renderer {
     cloud_sampled_view: wgpu::TextureView,
     cloud_storage_view: wgpu::TextureView,
 
+    // Reprojected shadow/AO cache: ping-pong G-buffer (write this frame, read
+    // next). `light_out` is copied into `light_hist` at the end of each frame.
+    light_out_tex: wgpu::Texture,
+    light_out_view: wgpu::TextureView,
+    light_hist_tex: wgpu::Texture,
+    light_hist_view: wgpu::TextureView,
+
     blit_bgl: wgpu::BindGroupLayout,
     blit_pipeline: wgpu::RenderPipeline,
     blit_bg: wgpu::BindGroup,
@@ -195,6 +202,11 @@ pub struct Renderer {
     dirty_tiles_scratch: Vec<u32>,
     dirty_chunks_scratch: Vec<u32>,
     dirty_words_scratch: Vec<u32>,
+
+    // Previous frame's camera + world origin, for the lighting reprojection
+    // cache. None on the first frame (no reuse).
+    prev_cam: Option<Camera>,
+    prev_world_origin: glam::IVec3,
 }
 
 impl Renderer {
@@ -360,6 +372,9 @@ impl Renderer {
         // Half-res cloud target for the volumetric pass (reuses `sampler`).
         let (cloud_tex, cloud_sampled_view, cloud_storage_view) =
             create_cloud_texture(&device, width, height);
+        // Ping-pong lighting G-buffer for the reprojection cache.
+        let (light_out_tex, light_out_view) = create_lighting_texture(&device, width, height);
+        let (light_hist_tex, light_hist_view) = create_lighting_texture(&device, width, height);
 
         // -- compute pipeline --
         let compute_bgl = create_compute_bgl(&device);
@@ -391,7 +406,7 @@ impl Renderer {
             &device, &compute_bgl, &camera_buf, &bricks_buf,
             &tile_mask_buf, &chunk_mask_buf, &palette_buf, &output_view, &beam_view,
             &tile_dirty_buf, &players_buf, &brick_uniform_buf, &tile_uniform_buf, &l4_mask_buf,
-            &cloud_sampled_view, &sampler,
+            &cloud_sampled_view, &sampler, &light_hist_view, &light_out_view,
         );
 
         // -- half-res cloud pipeline (cs_clouds, same shader module) --
@@ -531,12 +546,15 @@ impl Renderer {
             beam_bgl, beam_pipeline, beam_bg,
             compute_bgl, compute_pipeline, compute_bg,
             cloud_bgl, cloud_pipeline, cloud_bg, cloud_tex, cloud_sampled_view, cloud_storage_view,
+            light_out_tex, light_out_view, light_hist_tex, light_hist_view,
             blit_bgl, blit_pipeline, blit_bg,
             taa_bgl, taa_pipeline, taa_bg,
             taa_reset: true,
             dirty_tiles_scratch: Vec::with_capacity(4096),
             dirty_chunks_scratch: Vec::with_capacity(512),
             dirty_words_scratch: Vec::with_capacity(4096),
+            prev_cam: None,
+            prev_world_origin: glam::IVec3::ZERO,
         })
     }
 
@@ -566,12 +584,19 @@ impl Renderer {
         self.cloud_tex = ctex;
         self.cloud_sampled_view = csampled;
         self.cloud_storage_view = cstorage;
+        let (lo_tex, lo_view) = create_lighting_texture(&self.device, rw, rh);
+        self.light_out_tex = lo_tex;
+        self.light_out_view = lo_view;
+        let (lh_tex, lh_view) = create_lighting_texture(&self.device, rw, rh);
+        self.light_hist_tex = lh_tex;
+        self.light_hist_view = lh_view;
 
         self.compute_bg = make_compute_bg(
             &self.device, &self.compute_bgl, &self.camera_buf, &self.bricks_buf,
             &self.tile_mask_buf, &self.chunk_mask_buf, &self.palette_buf, &self.output_view, &self.beam_view,
             &self.tile_dirty_buf, &self.players_buf, &self.brick_uniform_buf, &self.tile_uniform_buf,
             &self.l4_mask_buf, &self.cloud_sampled_view, &self.sampler,
+            &self.light_hist_view, &self.light_out_view,
         );
         self.cloud_bg = make_cloud_bg(
             &self.device, &self.cloud_bgl, &self.camera_buf, &self.cloud_storage_view,
@@ -746,17 +771,25 @@ impl Renderer {
     }
 
     pub fn update_camera(
-        &self,
+        &mut self,
         camera: &Camera,
         time: f32,
         world_origin_voxel: glam::IVec3,
         jitter: [f32; 2],
         taa_blend: f32,
     ) {
-        let u = CameraUniform::with_taa(
+        let mut u = CameraUniform::with_taa(
             camera, self.size.0, self.size.1, time, world_origin_voxel, jitter, taa_blend,
         );
+        // Lighting reprojection is valid only with a previous frame AND an
+        // unchanged world origin (cached positions are relative to it).
+        match &self.prev_cam {
+            Some(prev) if self.prev_world_origin == world_origin_voxel => u.set_prev_camera(prev, true),
+            _ => u.set_prev_camera(camera, false),
+        }
         self.queue.write_buffer(&self.camera_buf, 0, bytemuck::bytes_of(&u));
+        self.prev_cam = Some(camera.clone());
+        self.prev_world_origin = world_origin_voxel;
     }
 
     pub fn render(&mut self, any_dirty: bool) -> Result<(), wgpu::SurfaceError> {
@@ -831,6 +864,23 @@ impl Renderer {
                 },
                 wgpu::ImageCopyTexture {
                     texture: &self.history_tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d { width: self.size.0, height: self.size.1, depth_or_array_layers: 1 },
+            );
+            // Ping-pong the lighting G-buffer: this frame's output becomes next
+            // frame's reprojection source.
+            encoder.copy_texture_to_texture(
+                wgpu::ImageCopyTexture {
+                    texture: &self.light_out_tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::ImageCopyTexture {
+                    texture: &self.light_hist_tex,
                     mip_level: 0,
                     origin: wgpu::Origin3d::ZERO,
                     aspect: wgpu::TextureAspect::All,
@@ -1060,8 +1110,50 @@ fn create_compute_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
                 ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                 count: None,
             },
+            wgpu::BindGroupLayoutEntry {
+                binding: 15, // light_in: previous-frame lighting G-buffer (textureLoad)
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 16, // light_out: this-frame lighting G-buffer (storage write)
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::StorageTexture {
+                    access: wgpu::StorageTextureAccess::WriteOnly,
+                    format: wgpu::TextureFormat::Rgba32Float,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                },
+                count: None,
+            },
         ],
     })
+}
+
+// Full-res lighting G-buffer for the reprojected shadow/AO cache (ping-ponged).
+// Rgba32Float: xyz = hit pos rel world_origin, w = packed shadow/AO.
+fn create_lighting_texture(
+    device: &wgpu::Device, w: u32, h: u32,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("lighting gbuffer"),
+        size: wgpu::Extent3d { width: w.max(1), height: h.max(1), depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba32Float,
+        usage: wgpu::TextureUsages::STORAGE_BINDING
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_SRC
+            | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+    (tex, view)
 }
 
 // cs_clouds writes the half-res clouds; its own (tiny) layout: camera + the
@@ -1172,6 +1264,8 @@ fn make_compute_bg(
     l4_mask_buf: &wgpu::Buffer,
     cloud_sampled_view: &wgpu::TextureView,
     cloud_sampler: &wgpu::Sampler,
+    light_in_view: &wgpu::TextureView,
+    light_out_view: &wgpu::TextureView,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("compute bg"),
@@ -1191,6 +1285,8 @@ fn make_compute_bg(
             wgpu::BindGroupEntry { binding: 11, resource: l4_mask_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 12, resource: wgpu::BindingResource::TextureView(cloud_sampled_view) },
             wgpu::BindGroupEntry { binding: 13, resource: wgpu::BindingResource::Sampler(cloud_sampler) },
+            wgpu::BindGroupEntry { binding: 15, resource: wgpu::BindingResource::TextureView(light_in_view) },
+            wgpu::BindGroupEntry { binding: 16, resource: wgpu::BindingResource::TextureView(light_out_view) },
         ],
     })
 }
@@ -1399,11 +1495,13 @@ mod gpu_render_tests {
         });
 
         let bgl = create_compute_bgl(&device);
+        let (_ltex, light_in_view) = create_lighting_texture(&device, w, h);
+        let (_ltex2, light_out_view) = create_lighting_texture(&device, w, h);
         let bg = make_compute_bg(
             &device, &bgl, &camera_buf, &bricks_buf, &tile_mask_buf, &chunk_mask_buf,
             &palette_buf, &output_view, &beam_view, &tile_dirty_buf, &players_buf,
             &brick_uniform_buf, &tile_uniform_buf, &l4_mask_buf,
-            &cloud_sampled_view, &cloud_sampler,
+            &cloud_sampled_view, &cloud_sampler, &light_in_view, &light_out_view,
         );
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("test pl"),
@@ -1449,6 +1547,35 @@ mod gpu_render_tests {
             mapped_at_creation: false,
         });
 
+        // Frame 1: reproject OFF (cu has reproject_lighting=0), builds the
+        // lighting G-buffer in light_out.
+        let mut enc = device.create_command_encoder(&Default::default());
+        {
+            let mut cp = enc.begin_compute_pass(&Default::default());
+            cp.set_pipeline(&cloud_pipeline);
+            cp.set_bind_group(0, &cloud_bg, &[]);
+            cp.dispatch_workgroups(((w + 1) / 2 + 7) / 8, ((h + 1) / 2 + 7) / 8, 1);
+        }
+        {
+            let mut cp = enc.begin_compute_pass(&Default::default());
+            cp.set_pipeline(&pipeline);
+            cp.set_bind_group(0, &bg, &[]);
+            cp.dispatch_workgroups((w + 7) / 8, (h + 7) / 8, 1);
+        }
+        // Ping-pong: frame 1's G-buffer (light_out) becomes frame 2's light_in.
+        enc.copy_texture_to_texture(
+            wgpu::ImageCopyTexture { texture: &_ltex2, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::ImageCopyTexture { texture: &_ltex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        queue.submit(std::iter::once(enc.finish()));
+        // Frame 2: reproject ON with the same camera as prev → every pixel should
+        // reproject to itself, match position, and reuse frame 1's shadow/AO.
+        // A static camera means the result must equal frame 1 (validates the
+        // reuse path: reprojection math, position match, unpack).
+        let mut cu2 = cu;
+        cu2.set_prev_camera(&cam, true);
+        queue.write_buffer(&camera_buf, 0, bytemuck::bytes_of(&cu2));
         let mut enc = device.create_command_encoder(&Default::default());
         {
             let mut cp = enc.begin_compute_pass(&Default::default());
@@ -1551,8 +1678,10 @@ mod gpu_render_tests {
             let (_b, bv) = create_beam_texture(&device, w, h);
             let (_c, csv, _csw) = create_cloud_texture(&device, w, h);
             let csamp = device.create_sampler(&wgpu::SamplerDescriptor { mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, ..Default::default() });
+            let (_li, liv) = create_lighting_texture(&device, w, h);
+            let (_lo, lov) = create_lighting_texture(&device, w, h);
             let bgl = create_compute_bgl(&device);
-            let bg = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &ov, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp);
+            let bg = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &ov, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &liv, &lov);
             let pll = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[&bgl], push_constant_ranges: &[] });
             let src = format!("{}\n{}", WORLD_CONSTS_WGSL, include_str!("../shaders/raymarch.wgsl"));
             let m = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(src.into()) });

@@ -83,7 +83,20 @@ pub struct CameraUniform {
     /// TAA history blend weight: 0 = use current frame only (reset / motion),
     /// ~0.9 = accumulate with reprojected history.
     pub taa_blend: f32,
-    pub _pad5: f32,
+    /// 1.0 = the lighting (shadow/AO) reprojection cache may reuse last frame's
+    /// values; 0.0 = force a full trace (first frame / after a chunk cross where
+    /// the rebased world origin moved, invalidating cached positions).
+    pub reproject_lighting: f32,
+    // Previous-frame camera basis, for reprojecting a hit world-point into last
+    // frame's screen to look up its cached shadow/AO.
+    pub prev_origin: [f32; 3],
+    pub _pad6: f32,
+    pub prev_forward: [f32; 3],
+    pub _pad7: f32,
+    pub prev_right: [f32; 3],
+    pub _pad8: f32,
+    pub prev_up: [f32; 3],
+    pub _pad9: f32,
 }
 
 impl CameraUniform {
@@ -116,7 +129,25 @@ impl CameraUniform {
             _pad4: 0,
             jitter,
             taa_blend,
-            _pad5: 0.0,
+            reproject_lighting: 0.0,
+            prev_origin: c.pos.to_array(),
+            _pad6: 0.0,
+            prev_forward: c.forward().to_array(),
+            _pad7: 0.0,
+            prev_right: c.right().to_array(),
+            _pad8: 0.0,
+            prev_up: c.up().to_array(),
+            _pad9: 0.0,
         }
+    }
+
+    /// Fill in the previous-frame camera basis + enable lighting reprojection.
+    /// Called by the frame loop once it has last frame's camera.
+    pub fn set_prev_camera(&mut self, prev: &Camera, enable: bool) {
+        self.reproject_lighting = if enable { 1.0 } else { 0.0 };
+        self.prev_origin = prev.pos.to_array();
+        self.prev_forward = prev.forward().to_array();
+        self.prev_right = prev.right().to_array();
+        self.prev_up = prev.up().to_array();
     }
 }
