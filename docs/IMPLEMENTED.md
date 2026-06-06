@@ -158,24 +158,28 @@ so a moving camera keeps accumulating AA instead of hard-resetting. Neighbourhoo
 clamp rejects ghosting; sky/foliage + chunk-cross frames pass through. Reuses the
 Win C prev-camera + G-buffer. (`taa.wgsl`, gated by `reproject_lighting`.)
 
-**Remaining (the two the original docs flagged as research-scale / profiler-gated):**
-- **GPU-compute physics** — `docs/gpu-physics-design.md` (pull-only,
-  double-buffered, integer-only CA). This is a research-scale rewrite: the bricks
-  must become GPU-authoritative with readback for the CPU raycast / net-edit /
-  streaming paths, plus determinism work. Cannot be added incrementally without
-  reworking the data-flow that the working CPU physics depends on — the design
-  doc is the deliverable; implement against it on AC where it can be validated.
-- **Transparent/foliage deferred second pass** (#16) — split foliage/transparent
-  shading into a second coherent pass to cut 8×8 warp divergence. The docs
-  deferred this as "needs a GPU profiler to justify"; near-only foliage already
-  removed the worst divergence. Best done on AC with a profiler so the split is
-  measured, not guessed.
+**Done (GPU-compute physics, #25):** `shaders/physics.wgsl` — a pull-only,
+double-buffered sand CA (one invocation per brick, reads neighbours from the IN
+buffer, writes the OUT buffer; no write conflicts / atomics). `Renderer::
+run_gpu_physics` dispatches it + copies the result back so the render path sees
+it. Opt-in via `VOXELG_GPU_PHYSICS` (default off → the CPU physics worker stays
+authoritative so raycast picking is exact; when on, the worker is skipped). Stage
+1 = sand; water/smoke + the CPU↔GPU readback for raycast are the next migration
+stages in `docs/gpu-physics-design.md`. Headless test `gpu_physics_sand_falls`
+proves sand falls one cell with mass + occupancy conserved.
 
-Everything else in this file is implemented. The render wins are validated by the
-headless render test (spawn + far-origin + the 2-frame reuse path) and naga
-shader validation; traversal/shading perf + TAA/cache visual quality are to be
-re-checked on AC with `raymarch_timing` (battery throttles the GPU ~14×, so
-numbers + visuals there are moot).
+**Done (transparent/foliage deferred pass, #16):** `cs_main` records water-top /
+glass hits into a read_write storage buffer + writes a cheap placeholder; a
+separate `cs_transparent` pass shades only those pixels (reflection / refraction /
+dispersion) and re-applies clouds + god-rays. Keeps the opaque-majority warps in
+`cs_main` coherent (less 8×8 divergence) on top of the existing near-only foliage.
+
+**Everything in this file is now implemented.** The render wins are validated by
+the headless render test (spawn + far-origin + the 2-frame reuse path, which also
+runs the cloud + deferred-transparent passes) and naga shader validation; the GPU
+physics by a functional readback test. Traversal/shading perf + TAA/cache visual
+quality are to be re-checked on AC with `raymarch_timing` (battery throttles the
+GPU ~14×, so numbers + visuals there are moot).
 
 ## Deliberately deferred (with rationale)
 - Full reprojection/disocclusion TAA (skip tracing reprojectable tiles on motion) —
