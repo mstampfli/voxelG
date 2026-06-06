@@ -463,11 +463,18 @@ impl App {
         // just recreated and would otherwise be read uninitialised.
         let taa_reset = self.renderer.as_mut().unwrap().take_taa_reset();
         self.frame_counter += 1;
-        let accumulate = !camera_changed && !self.first_frame && !taa_reset;
-        let (jitter, taa_blend) = if accumulate {
-            (JITTER_PATTERN[(self.frame_counter & 7) as usize], 0.9_f32)
-        } else {
+        // Full-reprojection TAA: a STILL camera jitters + accumulates (sub-pixel
+        // AA); a MOVING camera keeps accumulating too (taa_blend > 0) but without
+        // jitter — the TAA pass reprojects the history by motion, so we no longer
+        // hard-reset on movement. A hard reset only happens on the first frame /
+        // after a resize (taa_blend = 0 → passthrough).
+        let hard_reset = self.first_frame || taa_reset;
+        let (jitter, taa_blend) = if hard_reset {
             ([0.0_f32, 0.0_f32], 0.0_f32)
+        } else if camera_changed {
+            ([0.0_f32, 0.0_f32], 0.85_f32)
+        } else {
+            (JITTER_PATTERN[(self.frame_counter & 7) as usize], 0.9_f32)
         };
         let t = (now - self.start_time).as_secs_f32();
 

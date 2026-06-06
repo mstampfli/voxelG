@@ -532,7 +532,7 @@ impl Renderer {
             compilation_options: Default::default(),
             cache: None,
         });
-        let taa_bg = make_taa_bg(&device, &taa_bgl, &camera_buf, &output_view, &history_view, &resolve_view);
+        let taa_bg = make_taa_bg(&device, &taa_bgl, &camera_buf, &output_view, &history_view, &resolve_view, &light_out_view);
 
         Ok(Self {
             device, queue, surface, config,
@@ -605,6 +605,7 @@ impl Renderer {
         );
         self.taa_bg = make_taa_bg(
             &self.device, &self.taa_bgl, &self.camera_buf, &self.output_view, &self.history_view, &self.resolve_view,
+            &self.light_out_view,
         );
         self.blit_bg = make_blit_bg(&self.device, &self.blit_bgl, &self.resolve_view, &self.sampler);
         // History texture is newly (re)created and uninitialised — skip the TAA
@@ -994,6 +995,16 @@ fn create_taa_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
                 },
                 count: None,
             },
+            wgpu::BindGroupLayoutEntry {
+                binding: 4, // hit G-buffer (for reprojection motion vectors)
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
         ],
     })
 }
@@ -1005,6 +1016,7 @@ fn make_taa_bg(
     current_view: &wgpu::TextureView,
     history_view: &wgpu::TextureView,
     resolve_view: &wgpu::TextureView,
+    gbuffer_view: &wgpu::TextureView,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("taa bg"),
@@ -1014,6 +1026,7 @@ fn make_taa_bg(
             wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(current_view) },
             wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(history_view) },
             wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(resolve_view) },
+            wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(gbuffer_view) },
         ],
     })
 }

@@ -23,13 +23,24 @@ struct Camera {
     _pad4: i32,
     jitter: vec2<f32>,
     taa_blend: f32,
-    _pad5: f32,
+    reproject_lighting: f32,
+    prev_origin: vec3<f32>,
+    _pad6: f32,
+    prev_forward: vec3<f32>,
+    _pad7: f32,
+    prev_right: vec3<f32>,
+    _pad8: f32,
+    prev_up: vec3<f32>,
+    _pad9: f32,
 };
 
 @group(0) @binding(0) var<uniform> camera: Camera;
 @group(0) @binding(1) var current_tex: texture_2d<f32>;
 @group(0) @binding(2) var history_tex: texture_2d<f32>;
 @group(0) @binding(3) var resolve_out: texture_storage_2d<rgba8unorm, write>;
+// Hit G-buffer (xyz = hit pos rel world_origin, w != 0 → valid terrain hit) so
+// the history can be reprojected by motion instead of reset on camera movement.
+@group(0) @binding(4) var gbuffer: texture_2d<f32>;
 
 @compute @workgroup_size(8, 8, 1)
 fn cs_taa(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -39,10 +50,35 @@ fn cs_taa(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let cur = textureLoad(current_tex, p, 0).rgb;
 
-    // taa_blend <= 0 → reset / motion: pass the current frame straight through.
-    if (camera.taa_blend <= 0.0) {
+    // Hard reset (first frame / after resize → taa_blend 0) or no valid
+    // reprojection basis (origin shifted on a chunk cross → reproject_lighting 0)
+    // → pass the current frame straight through (sharp, no smear).
+    if (camera.taa_blend <= 0.0 || camera.reproject_lighting < 0.5) {
         textureStore(resolve_out, p, vec4<f32>(cur, 1.0));
         return;
+    }
+
+    // Reproject this pixel's surface into the previous frame to find where its
+    // history lives (full-reprojection TAA — accumulates across motion instead
+    // of resetting). Terrain pixels reproject by their G-buffer world position;
+    // everything else falls back to the same pixel.
+    var hp = p; // history pixel
+    let g = textureLoad(gbuffer, p, 0);
+    // Sentinel position (1e9) marks sky/foliage/water — only terrain reprojects.
+    if (camera.reproject_lighting > 0.5 && g.x < 1e8) {
+        let abs_pos = g.xyz + vec3<f32>(camera.world_origin);
+        let d = abs_pos - camera.prev_origin;
+        let pz = dot(d, camera.prev_forward);
+        if (pz > 0.01) {
+            let aspect = camera.resolution.x / camera.resolution.y;
+            let ndc = vec2<f32>(
+                dot(d, camera.prev_right) / (pz * camera.tan_half_fov * aspect),
+                dot(d, camera.prev_up) / (pz * camera.tan_half_fov));
+            let uvp = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+            if (uvp.x >= 0.0 && uvp.x < 1.0 && uvp.y >= 0.0 && uvp.y < 1.0) {
+                hp = vec2<i32>(uvp * camera.resolution);
+            }
+        }
     }
 
     // 3x3 neighbourhood colour bounds of the current frame.
@@ -57,8 +93,9 @@ fn cs_taa(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 
-    // Clamp history into the current neighbourhood (rejects ghosting) and blend.
-    let hist = textureLoad(history_tex, p, 0).rgb;
+    // Sample the REPROJECTED history, clamp into the current neighbourhood
+    // (rejects ghosting/disocclusion) and blend.
+    let hist = textureLoad(history_tex, hp, 0).rgb;
     let hist_clamped = clamp(hist, mn, mx);
     let resolved = mix(cur, hist_clamped, camera.taa_blend);
     textureStore(resolve_out, p, vec4<f32>(resolved, 1.0));
