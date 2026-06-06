@@ -647,6 +647,46 @@ impl Renderer {
         world.dirty_bricks.clear();
     }
 
+    /// Upload mask-only clears (slots recycled by shift_origin) — just the
+    /// touched tile_mask / tile_uniform + their chunk_mask + L4, no brick data.
+    /// This is what makes a recycled slot render as sky immediately and cheaply.
+    pub fn upload_mask_clears(&mut self, world: &mut World) {
+        if world.mask_dirty_tiles.is_empty() {
+            return;
+        }
+        world.mask_dirty_tiles.sort_unstable();
+        world.mask_dirty_tiles.dedup();
+        upload_spans(&world.mask_dirty_tiles, |s, e| {
+            let slice = &world.tile_mask[s as usize..=e as usize];
+            self.queue.write_buffer(&self.tile_mask_buf, s as u64 * 8, bytemuck::cast_slice(slice));
+        });
+        self.dirty_words_scratch.clear();
+        for &t in &world.mask_dirty_tiles {
+            let w = t >> 2;
+            if self.dirty_words_scratch.last() != Some(&w) {
+                self.dirty_words_scratch.push(w);
+            }
+        }
+        upload_packed_word_spans(
+            &self.dirty_words_scratch, &world.tile_uniform, &self.queue, &self.tile_uniform_buf,
+        );
+        self.dirty_chunks_scratch.clear();
+        for &t in &world.mask_dirty_tiles {
+            let tx = t % WORLD_TILES_X;
+            let ty = (t / WORLD_TILES_X) % WORLD_TILES_Y;
+            let tz = t / (WORLD_TILES_X * WORLD_TILES_Y);
+            self.dirty_chunks_scratch.push(chunk_idx(tx / 4, ty / 4, tz / 4));
+        }
+        self.dirty_chunks_scratch.sort_unstable();
+        self.dirty_chunks_scratch.dedup();
+        upload_spans(&self.dirty_chunks_scratch, |s, e| {
+            let slice = &world.chunk_mask[s as usize..=e as usize];
+            self.queue.write_buffer(&self.chunk_mask_buf, s as u64 * 8, bytemuck::cast_slice(slice));
+        });
+        self.queue.write_buffer(&self.l4_mask_buf, 0, bytemuck::cast_slice(&world.l4_mask));
+        world.mask_dirty_tiles.clear();
+    }
+
     pub fn upload_tile_dirty(&self, mask: &[u32]) {
         if mask.is_empty() { return; }
         self.queue.write_buffer(&self.tile_dirty_buf, 0, bytemuck::cast_slice(mask));

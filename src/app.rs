@@ -511,6 +511,8 @@ impl App {
             let world_origin = world_origin_voxel(&world);
             let renderer = self.renderer.as_mut().unwrap();
             renderer.upload_world(&mut world);
+            // Mask-only clears from recycled slots (render them as sky now).
+            renderer.upload_mask_clears(&mut world);
             renderer.update_camera(&self.camera, t, world_origin, jitter, taa_blend);
         }
         // We always re-trace at least the rotating animation subset.
