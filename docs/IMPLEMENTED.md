@@ -129,35 +129,41 @@ this pass are the high-ROI, measured, low-risk ones; the rest are designed but
 deferred (they're heavier rewrites that touch the working render path, and the
 engine already clears 100 fps at the current scale).
 
-**Done (measured):**
-- Shadow rays 2→1 sample + cloud self-shadow 3→2 (Win B).
+**Done (Win B — measured on AC):**
+- Shadow rays 2→1 sample + cloud self-shadow 3→2.
 - AO distance-LOD (skip the 12-tap AO past 64 voxels).
-- L4/chunk/tile/brick skip hierarchy + distance budget + tile/brick LOD (Phase 3)
-  — the "hierarchical DDA" foundation; empty space already costs O(coarse steps).
 
-**Designed, deferred (next, in priority order for small voxels):**
-1. **Reprojected shadow/AO cache** (checklist #12). Shadow + AO are world-space
-   properties of the hit point, so cache them in a screen buffer and reproject
-   from the previous frame (using the hit world-pos + previous camera); re-trace
-   only disoccluded pixels. This is the biggest *moving-frame* shading win and
-   scales directly with voxel density. Risk: ghosting/disocclusion needs visual
-   tuning. (The static case is already amortised by the temporal-diff tiles.)
-2. **True nested descend/ascend DDA.** The hierarchy is present, but each voxel
-   step still re-derives indices + folds two `pos_mod`s. Descending once into an
-   occupied chunk/tile/brick and stepping within it (incremental slot coords,
-   no re-fold) makes per-step cost ~constant — the key as bricks-per-ray grow at
-   10 cm. Risk: core-DDA rewrite; validate against the headless render test +
-   far-origin test.
-3. **Half-res volumetric pass** (checklist #14). Clouds (and god-rays) in a
-   dedicated half-res compute pass + bilinear upsample, instead of full-res in
-   `cs_main`. ~4× fewer cloud marches on sky-facing views. Self-contained (its
-   own texture/pipeline like the TAA pass).
-4. **GPU-compute physics** — `docs/gpu-physics-design.md` (pull-only,
-   double-buffered, integer-only CA). Removes the CPU CA cost, which matters most
-   at 10 cm where there are far more active cells.
+**Done (Wins A / C / D — implemented + validated headlessly; benchmark on AC pending):**
+- **Win A — true nested DDA.** The DDA now carries the slot voxel coord and
+  increments it per step (cheap wrap) instead of re-folding two `pos_mod`s every
+  voxel; `skip_to_cell` resyncs after a jump. Per-step cost drops — the key as
+  bricks-per-ray grow at 10 cm. Applied to trace / trace_any / trace_no_water.
+  Verified correct at spawn + 3.2 M voxels from origin (toroidal wrap).
+- **Win C — reprojected shadow/AO cache** (#12). Shadow + AO (view-independent)
+  are cached in a ping-pong G-buffer and reprojected into the previous frame via
+  the prev camera basis; reused on a world-position match, else traced. Biggest
+  *moving-frame* shading win, scales with voxel density. `REPROJECT_LIGHTING`
+  const disables it if ghosting is seen. The render tests run 2 frames so the
+  reuse path is exercised (identical static-camera result = correct round-trip).
+- **Win D — half-res volumetric pass** (#14). Clouds marched once per 2×2 block
+  in `cs_clouds` → half-res texture → bilinear upsample + composite (with a
+  cloud-slab depth test for terrain occlusion). ~4× fewer cloud marches on
+  sky-facing views.
 
-Each is independently landable and measurable with the `raymarch_timing` probe
-(traversal items) or a horizon-camera variant (volumetrics).
+**Remaining (heaviest rewrites, best done with on-AC validation):**
+- **GPU-compute physics** — `docs/gpu-physics-design.md` (pull-only,
+  double-buffered, integer-only CA). Removes the CPU CA cost, which matters most
+  at 10 cm where there are far more active cells. A research-scale rewrite (bricks
+  GPU-resident, indirect-dispatch active set, readback for raycast/net).
+- **Full reprojection TAA** — accumulate the colour history across motion by
+  reprojecting it (the prev-camera basis + the Win C G-buffer make this a small
+  addition); currently TAA resets on motion.
+- **Transparent/foliage deferred second pass** (#16) — reduce 8×8 divergence
+  further; near-only foliage already removed the worst of it.
+
+The render wins are validated by the headless render test (spawn + far-origin +
+the 2-frame reuse path); traversal/shading perf is to be re-measured on AC with
+`raymarch_timing` (battery throttles the GPU ~14×, so numbers there are moot).
 
 ## Deliberately deferred (with rationale)
 - Full reprojection/disocclusion TAA (skip tracing reprojectable tiles on motion) —
