@@ -150,7 +150,10 @@ impl App {
         // longer stalls the frame (checklist: physics on a worker thread).
         let world = Arc::new(Mutex::new(world));
         let phys_stop = Arc::new(AtomicBool::new(false));
-        {
+        // With GPU-compute physics (#25) the CA runs on the GPU in the render
+        // loop, so don't also spawn the CPU physics worker (they'd both mutate
+        // the world). Default path keeps the CPU worker.
+        if std::env::var("VOXELG_GPU_PHYSICS").is_err() {
             let world = world.clone();
             let stop = phys_stop.clone();
             std::thread::Builder::new()
@@ -478,12 +481,16 @@ impl App {
         };
         let t = (now - self.start_time).as_secs_f32();
 
+        // GPU physics modifies the brick buffer directly (not via dirty_bricks),
+        // so force a full re-trace each frame while it's on for the changes to show.
+        let gpu_physics = self.renderer.as_ref().unwrap().gpu_physics;
+
         // Build the dirty-tile mask + upload world + camera under one lock so
         // the physics worker can run in the gaps between frames.
         {
             let mut world = self.world.lock().unwrap_or_else(|e| e.into_inner());
             let physics_changed = world.all_dirty || !world.dirty_bricks.is_empty();
-            let force_full = self.first_frame || world.all_dirty || camera_changed;
+            let force_full = self.first_frame || world.all_dirty || camera_changed || gpu_physics;
             if force_full {
                 for w in self.tile_dirty_mask.iter_mut() { *w = u32::MAX; }
             } else {
@@ -511,6 +518,11 @@ impl App {
             renderer.upload_world(&mut world);
             // Mask-only clears from recycled slots (render them as sky now).
             renderer.upload_mask_clears(&mut world);
+            // GPU-compute physics step (#25): runs the sand CA on the just-uploaded
+            // bricks so player edits/streaming are seen, result rendered this frame.
+            if gpu_physics {
+                renderer.run_gpu_physics();
+            }
             renderer.update_camera(&self.camera, t, world_origin, jitter, taa_blend);
         }
         // We always re-trace at least the rotating animation subset.

@@ -140,6 +140,12 @@ pub struct Renderer {
 
     camera_buf: wgpu::Buffer,
     bricks_buf: wgpu::Buffer,
+    // GPU-compute physics (#25): second brick buffer + pipeline. `gpu_physics`
+    // is opt-in via the VOXELG_GPU_PHYSICS env var.
+    bricks_buf_b: wgpu::Buffer,
+    physics_pipeline: wgpu::ComputePipeline,
+    physics_bg: wgpu::BindGroup,
+    pub gpu_physics: bool,
     tile_mask_buf: wgpu::Buffer,
     chunk_mask_buf: wgpu::Buffer,
     l4_mask_buf: wgpu::Buffer,
@@ -288,6 +294,14 @@ impl Renderer {
             contents: bricks_bytes,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
+        // Second brick buffer for the GPU-compute physics ping-pong (#25). The CA
+        // reads bricks_buf and writes bricks_buf_b, which is then copied back.
+        let bricks_buf_b = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("bricks_b (gpu physics)"),
+            size: bricks_bytes.len() as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
 
         let tile_mask_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("tile_mask"),
@@ -426,6 +440,53 @@ impl Renderer {
         });
         let cloud_bg = make_cloud_bg(&device, &cloud_bgl, &camera_buf, &cloud_storage_view);
 
+        // -- GPU-compute physics pipeline (#25): pull-only sand CA --
+        let physics_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("physics bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+            ],
+        });
+        let physics_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("physics pl"),
+            bind_group_layouts: &[&physics_bgl],
+            push_constant_ranges: &[],
+        });
+        let physics_src = format!("{}\n{}", WORLD_CONSTS_WGSL, include_str!("../shaders/physics.wgsl"));
+        let physics_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("physics shader"),
+            source: wgpu::ShaderSource::Wgsl(physics_src.into()),
+        });
+        let physics_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("physics pipeline"),
+            layout: Some(&physics_pl),
+            module: &physics_shader,
+            entry_point: Some("cs_physics"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let physics_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("physics bg"),
+            layout: &physics_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: bricks_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: bricks_buf_b.as_entire_binding() },
+            ],
+        });
+        // Opt-in (default off): GPU sand physics replaces the CPU CA. When on, the
+        // CPU world.bricks is not kept in sync (raycast picking sees the pre-physics
+        // state) — that CPU<->GPU sync is the next migration stage in the design doc.
+        let gpu_physics_enabled = std::env::var("VOXELG_GPU_PHYSICS").is_ok();
+
         // -- beam pipeline (1/8-res coarse pre-pass) --
         let beam_bgl = create_beam_bgl(&device);
         let beam_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -545,6 +606,7 @@ impl Renderer {
             history_tex, history_view, resolve_tex, resolve_view, sampler,
             beam_bgl, beam_pipeline, beam_bg,
             compute_bgl, compute_pipeline, compute_bg,
+            bricks_buf_b, physics_pipeline, physics_bg, gpu_physics: gpu_physics_enabled,
             cloud_bgl, cloud_pipeline, cloud_bg, cloud_sampled_view, cloud_storage_view,
             light_out_tex, light_out_view, light_hist_tex, light_hist_view,
             blit_bgl, blit_pipeline, blit_bg,
@@ -790,6 +852,29 @@ impl Renderer {
         self.queue.write_buffer(&self.camera_buf, 0, bytemuck::bytes_of(&u));
         self.prev_cam = Some(camera.clone());
         self.prev_world_origin = world_origin_voxel;
+    }
+
+    /// Run one GPU-compute physics step (#25): dispatch the pull-only sand CA
+    /// (bricks_buf → bricks_buf_b) then copy the result back so the render path
+    /// (which reads bricks_buf) sees it. Opt-in via `gpu_physics`. NOTE: the CPU
+    /// `World.bricks` is not updated here — raycast picking sees the pre-physics
+    /// state until the design doc's CPU<->GPU sync stage lands.
+    pub fn run_gpu_physics(&self) {
+        let total = crate::voxel::WORLD_BRICKS_TOTAL;
+        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("gpu physics"),
+        });
+        {
+            let mut cp = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("gpu physics"),
+                timestamp_writes: None,
+            });
+            cp.set_pipeline(&self.physics_pipeline);
+            cp.set_bind_group(0, &self.physics_bg, &[]);
+            cp.dispatch_workgroups((total + 63) / 64, 1, 1);
+        }
+        enc.copy_buffer_to_buffer(&self.bricks_buf_b, 0, &self.bricks_buf, 0, self.bricks_buf.size());
+        self.queue.submit(std::iter::once(enc.finish()));
     }
 
     pub fn render(&mut self, any_dirty: bool) -> Result<(), wgpu::SurfaceError> {
@@ -1395,6 +1480,12 @@ mod shader_tests {
         let src = format!("{}\n{}", WORLD_CONSTS_WGSL, include_str!("../shaders/taa.wgsl"));
         validate("taa.wgsl", &src);
     }
+
+    #[test]
+    fn physics_wgsl_valid() {
+        let src = format!("{}\n{}", WORLD_CONSTS_WGSL, include_str!("../shaders/physics.wgsl"));
+        validate("physics.wgsl", &src);
+    }
 }
 
 #[cfg(test)]
@@ -1744,5 +1835,103 @@ mod gpu_render_tests {
             return;
         };
         assert_sane("far(100k chunks)", min, max, mean);
+    }
+
+    #[test]
+    fn gpu_physics_sand_falls() {
+        use crate::voxel::{brick_idx, brick_voxel_idx, Brick, MAT_SAND, WORLD_BRICKS_TOTAL};
+        let Some((device, queue)) = headless_device() else {
+            eprintln!("no GPU adapter — skipping GPU physics test");
+            return;
+        };
+        let stride = std::mem::size_of::<Brick>() as u64; // 72
+        let total = WORLD_BRICKS_TOTAL as u64;
+
+        // One sand voxel at the TOP of a brick well above the floor; air below.
+        let bi = brick_idx(0, 10, 0);
+        let vi_top = brick_voxel_idx(0, 3, 0);
+        let vi_mid = brick_voxel_idx(0, 2, 0);
+        let mut brick = Brick::EMPTY;
+        brick.occupancy = 1u64 << vi_top;
+        brick.materials[vi_top as usize] = MAT_SAND;
+
+        // Zero-initialised by wgpu; we only write the one seeded brick.
+        let bricks_in = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("phys in"),
+            size: total * stride,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bricks_out = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("phys out"),
+            size: total * stride,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&bricks_in, bi as u64 * stride, bytemuck::bytes_of(&brick));
+
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("phys bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+            ],
+        });
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("phys bg"), layout: &bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: bricks_in.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: bricks_out.as_entire_binding() },
+            ],
+        });
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("phys pl"), bind_group_layouts: &[&bgl], push_constant_ranges: &[],
+        });
+        let src = format!("{}\n{}", WORLD_CONSTS_WGSL, include_str!("../shaders/physics.wgsl"));
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("physics"), source: wgpu::ShaderSource::Wgsl(src.into()),
+        });
+        let pipe = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("physics"), layout: Some(&pl), module: &module,
+            entry_point: Some("cs_physics"), compilation_options: Default::default(), cache: None,
+        });
+
+        let mut enc = device.create_command_encoder(&Default::default());
+        {
+            let mut cp = enc.begin_compute_pass(&Default::default());
+            cp.set_pipeline(&pipe);
+            cp.set_bind_group(0, &bg, &[]);
+            cp.dispatch_workgroups(((total as u32) + 63) / 64, 1, 1);
+        }
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("phys readback"), size: stride,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        enc.copy_buffer_to_buffer(&bricks_out, bi as u64 * stride, &readback, 0, stride);
+        queue.submit(std::iter::once(enc.finish()));
+
+        let slice = readback.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        device.poll(wgpu::Maintain::Wait);
+        let data = slice.get_mapped_range();
+        let out: Brick = *bytemuck::from_bytes(&data);
+
+        // After one pull step the sand fell exactly one cell: top→air, mid→sand,
+        // and mass is conserved (still exactly one sand voxel in the brick).
+        assert_eq!(out.materials[vi_top as usize], 0, "top should now be air");
+        assert_eq!(out.materials[vi_mid as usize], MAT_SAND, "sand should have fallen one cell");
+        let sand_count = out.materials.iter().filter(|&&m| m == MAT_SAND).count();
+        assert_eq!(sand_count, 1, "sand mass must be conserved");
+        assert_eq!(out.occupancy, 1u64 << vi_mid, "occupancy must track the moved voxel");
+        eprintln!("GPU physics: sand fell {vi_top} -> {vi_mid}, mass conserved");
     }
 }
