@@ -169,6 +169,15 @@ pub struct Renderer {
     compute_pipeline: wgpu::ComputePipeline,
     compute_bg: wgpu::BindGroup,
 
+    // Half-res volumetric (cloud) pass.
+    cloud_bgl: wgpu::BindGroupLayout,
+    cloud_pipeline: wgpu::ComputePipeline,
+    cloud_bg: wgpu::BindGroup,
+    #[allow(dead_code)]
+    cloud_tex: wgpu::Texture,
+    cloud_sampled_view: wgpu::TextureView,
+    cloud_storage_view: wgpu::TextureView,
+
     blit_bgl: wgpu::BindGroupLayout,
     blit_pipeline: wgpu::RenderPipeline,
     blit_bg: wgpu::BindGroup,
@@ -348,6 +357,10 @@ impl Renderer {
             ..Default::default()
         });
 
+        // Half-res cloud target for the volumetric pass (reuses `sampler`).
+        let (cloud_tex, cloud_sampled_view, cloud_storage_view) =
+            create_cloud_texture(&device, width, height);
+
         // -- compute pipeline --
         let compute_bgl = create_compute_bgl(&device);
 
@@ -378,7 +391,25 @@ impl Renderer {
             &device, &compute_bgl, &camera_buf, &bricks_buf,
             &tile_mask_buf, &chunk_mask_buf, &palette_buf, &output_view, &beam_view,
             &tile_dirty_buf, &players_buf, &brick_uniform_buf, &tile_uniform_buf, &l4_mask_buf,
+            &cloud_sampled_view, &sampler,
         );
+
+        // -- half-res cloud pipeline (cs_clouds, same shader module) --
+        let cloud_bgl = create_cloud_bgl(&device);
+        let cloud_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("cloud pl"),
+            bind_group_layouts: &[&cloud_bgl],
+            push_constant_ranges: &[],
+        });
+        let cloud_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("cloud pipeline"),
+            layout: Some(&cloud_pl),
+            module: &compute_shader,
+            entry_point: Some("cs_clouds"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let cloud_bg = make_cloud_bg(&device, &cloud_bgl, &camera_buf, &cloud_storage_view);
 
         // -- beam pipeline (1/8-res coarse pre-pass) --
         let beam_bgl = create_beam_bgl(&device);
@@ -499,6 +530,7 @@ impl Renderer {
             history_tex, history_view, resolve_tex, resolve_view, sampler,
             beam_bgl, beam_pipeline, beam_bg,
             compute_bgl, compute_pipeline, compute_bg,
+            cloud_bgl, cloud_pipeline, cloud_bg, cloud_tex, cloud_sampled_view, cloud_storage_view,
             blit_bgl, blit_pipeline, blit_bg,
             taa_bgl, taa_pipeline, taa_bg,
             taa_reset: true,
@@ -530,12 +562,19 @@ impl Renderer {
         let (htex, hview) = create_history_texture(&self.device, rw, rh);
         self.history_tex = htex;
         self.history_view = hview;
+        let (ctex, csampled, cstorage) = create_cloud_texture(&self.device, rw, rh);
+        self.cloud_tex = ctex;
+        self.cloud_sampled_view = csampled;
+        self.cloud_storage_view = cstorage;
 
         self.compute_bg = make_compute_bg(
             &self.device, &self.compute_bgl, &self.camera_buf, &self.bricks_buf,
             &self.tile_mask_buf, &self.chunk_mask_buf, &self.palette_buf, &self.output_view, &self.beam_view,
             &self.tile_dirty_buf, &self.players_buf, &self.brick_uniform_buf, &self.tile_uniform_buf,
-            &self.l4_mask_buf,
+            &self.l4_mask_buf, &self.cloud_sampled_view, &self.sampler,
+        );
+        self.cloud_bg = make_cloud_bg(
+            &self.device, &self.cloud_bgl, &self.camera_buf, &self.cloud_storage_view,
         );
         self.beam_bg = make_beam_bg(
             &self.device, &self.beam_bgl, &self.camera_buf, &self.chunk_mask_buf, &self.beam_view,
@@ -734,6 +773,18 @@ impl Renderer {
         // swapchain stays in sync), but skip the beam + raymarch compute
         // passes entirely. The output_tex from the prior frame is preserved.
         if any_dirty {
+            // ---- half-res cloud pre-pass ----
+            {
+                let mut cp = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("clouds"),
+                    timestamp_writes: None,
+                });
+                cp.set_pipeline(&self.cloud_pipeline);
+                cp.set_bind_group(0, &self.cloud_bg, &[]);
+                let hx = ((self.size.0 + 1) / 2 + 7) / 8;
+                let hy = ((self.size.1 + 1) / 2 + 7) / 8;
+                cp.dispatch_workgroups(hx, hy, 1);
+            }
             // ---- beam pre-pass at 1/8 resolution ----
             {
                 let mut cp = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -993,8 +1044,77 @@ fn create_compute_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
             storage_ro(9),  // brick_uniform
             storage_ro(10), // tile_uniform
             storage_ro(11), // l4_mask (coarsest pyramid level)
+            wgpu::BindGroupLayoutEntry {
+                binding: 12, // half-res cloud texture (sampled, bilinear upsample)
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 13, // cloud sampler (filtering)
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
         ],
     })
+}
+
+// cs_clouds writes the half-res clouds; its own (tiny) layout: camera + the
+// cloud storage texture. Separate from compute_bgl so the cloud texture is
+// never bound as storage-write and sampled in the same bind group.
+fn create_cloud_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("cloud bgl"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0, // camera
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 14, // cloud_out storage texture
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::StorageTexture {
+                    access: wgpu::StorageTextureAccess::WriteOnly,
+                    format: wgpu::TextureFormat::Rgba16Float,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                },
+                count: None,
+            },
+        ],
+    })
+}
+
+// Half-res cloud texture: (texture, sampled_view, storage_view). Rgba16Float to
+// keep HDR cloud/scatter values.
+fn create_cloud_texture(
+    device: &wgpu::Device, w: u32, h: u32,
+) -> (wgpu::Texture, wgpu::TextureView, wgpu::TextureView) {
+    let hw = (w + 1) / 2;
+    let hh = (h + 1) / 2;
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("cloud tex (half-res)"),
+        size: wgpu::Extent3d { width: hw.max(1), height: hh.max(1), depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba16Float,
+        usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let sampled = tex.create_view(&wgpu::TextureViewDescriptor::default());
+    let storage = tex.create_view(&wgpu::TextureViewDescriptor::default());
+    (tex, sampled, storage)
 }
 
 fn create_beam_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
@@ -1050,6 +1170,8 @@ fn make_compute_bg(
     brick_uniform_buf: &wgpu::Buffer,
     tile_uniform_buf: &wgpu::Buffer,
     l4_mask_buf: &wgpu::Buffer,
+    cloud_sampled_view: &wgpu::TextureView,
+    cloud_sampler: &wgpu::Sampler,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("compute bg"),
@@ -1067,6 +1189,24 @@ fn make_compute_bg(
             wgpu::BindGroupEntry { binding: 9, resource: brick_uniform_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 10, resource: tile_uniform_buf.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 11, resource: l4_mask_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 12, resource: wgpu::BindingResource::TextureView(cloud_sampled_view) },
+            wgpu::BindGroupEntry { binding: 13, resource: wgpu::BindingResource::Sampler(cloud_sampler) },
+        ],
+    })
+}
+
+fn make_cloud_bg(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    camera_buf: &wgpu::Buffer,
+    cloud_storage_view: &wgpu::TextureView,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("cloud bg"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: camera_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 14, resource: wgpu::BindingResource::TextureView(cloud_storage_view) },
         ],
     })
 }
@@ -1250,12 +1390,20 @@ mod gpu_render_tests {
         let (_otex, output_view) = create_output_texture(&device, w, h);
         let output_tex = _otex;
         let (_btex, beam_view) = create_beam_texture(&device, w, h);
+        let (_ctex, cloud_sampled_view, cloud_storage_view) = create_cloud_texture(&device, w, h);
+        let cloud_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("test cloud sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
 
         let bgl = create_compute_bgl(&device);
         let bg = make_compute_bg(
             &device, &bgl, &camera_buf, &bricks_buf, &tile_mask_buf, &chunk_mask_buf,
             &palette_buf, &output_view, &beam_view, &tile_dirty_buf, &players_buf,
             &brick_uniform_buf, &tile_uniform_buf, &l4_mask_buf,
+            &cloud_sampled_view, &cloud_sampler,
         );
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("test pl"),
@@ -1275,6 +1423,22 @@ mod gpu_render_tests {
             compilation_options: Default::default(),
             cache: None,
         });
+        // Half-res cloud pre-pass (validates cs_clouds end to end).
+        let cloud_bgl = create_cloud_bgl(&device);
+        let cloud_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("test cloud pl"),
+            bind_group_layouts: &[&cloud_bgl],
+            push_constant_ranges: &[],
+        });
+        let cloud_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("test cloud pipeline"),
+            layout: Some(&cloud_pl),
+            module: &module,
+            entry_point: Some("cs_clouds"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let cloud_bg = make_cloud_bg(&device, &cloud_bgl, &camera_buf, &cloud_storage_view);
 
         // Readback buffer (bytes_per_row already 256-aligned for w=320).
         let bpr = w * 4;
@@ -1286,6 +1450,12 @@ mod gpu_render_tests {
         });
 
         let mut enc = device.create_command_encoder(&Default::default());
+        {
+            let mut cp = enc.begin_compute_pass(&Default::default());
+            cp.set_pipeline(&cloud_pipeline);
+            cp.set_bind_group(0, &cloud_bg, &[]);
+            cp.dispatch_workgroups(((w + 1) / 2 + 7) / 8, ((h + 1) / 2 + 7) / 8, 1);
+        }
         {
             let mut cp = enc.begin_compute_pass(&Default::default());
             cp.set_pipeline(&pipeline);
@@ -1379,8 +1549,10 @@ mod gpu_render_tests {
             let players = storage(&device, "pl", &vec![0u8; 16 + MAX_REMOTE_PLAYERS * 16]);
             let (_o, ov) = create_output_texture(&device, w, h);
             let (_b, bv) = create_beam_texture(&device, w, h);
+            let (_c, csv, _csw) = create_cloud_texture(&device, w, h);
+            let csamp = device.create_sampler(&wgpu::SamplerDescriptor { mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, ..Default::default() });
             let bgl = create_compute_bgl(&device);
-            let bg = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &ov, &bv, &td, &players, &bu, &tu, &l4);
+            let bg = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &ov, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp);
             let pll = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[&bgl], push_constant_ranges: &[] });
             let src = format!("{}\n{}", WORLD_CONSTS_WGSL, include_str!("../shaders/raymarch.wgsl"));
             let m = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(src.into()) });

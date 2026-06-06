@@ -77,6 +77,13 @@ struct PlayersBuf {
 // The coarsest pyramid level — one bit test skips a 256 region.
 @group(0) @binding(11) var<storage, read> l4_mask: array<u32>;
 
+// Half-res volumetrics: cs_clouds writes the cloud march into cloud_out at half
+// resolution (binding 14); cs_main samples it bilinearly (binding 12 + sampler
+// 13) and composites — ~4x fewer cloud marches on sky-facing views (#14).
+@group(0) @binding(12) var cloud_in: texture_2d<f32>;
+@group(0) @binding(13) var cloud_samp: sampler;
+@group(0) @binding(14) var cloud_out: texture_storage_2d<rgba16float, write>;
+
 fn brick_uniform_mat(bi: i32) -> u32 {
     let w = brick_uniform_packed[bi >> 2];
     let shift = u32(bi & 3) * 8u;
@@ -312,6 +319,46 @@ fn ign(x: f32, y: f32, frame: f32) -> f32 {
 const PROFILE_FLAT: bool = false;
 const PROFILE_NO_L4: bool = false;
 
+// Primary ray direction for a normalized screen uv (0..1). Shared by cs_main
+// (full-res, jittered) and cs_clouds (half-res). aspect uses the full-res
+// resolution ratio, which is identical at half res.
+fn ray_dir_uv(uv: vec2<f32>) -> vec3<f32> {
+    let ndc = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+    let aspect = camera.resolution.x / camera.resolution.y;
+    return normalize(
+        camera.forward
+        + camera.right * (ndc.x * camera.tan_half_fov * aspect)
+        + camera.up    * (ndc.y * camera.tan_half_fov)
+    );
+}
+
+// t at which the ray enters the cloud slab (or a large value if it never does,
+// looking away from / parallel to the slab). Used to reapply terrain occlusion
+// to the precomputed half-res clouds without re-marching.
+fn cloud_slab_near(dir: vec3<f32>) -> f32 {
+    if (abs(dir.y) < 1e-3) { return 1e9; }
+    let inv_dy = 1.0 / dir.y;
+    var t_in  = (CLOUD_BASE - camera.origin.y) * inv_dy;
+    var t_out = (CLOUD_TOP  - camera.origin.y) * inv_dy;
+    if (t_in > t_out) { let tmp = t_in; t_in = t_out; t_out = tmp; }
+    let t_start = max(t_in, 0.0);
+    if (t_out <= t_start) { return 1e9; }
+    return t_start;
+}
+
+// Half-res volumetric pass: march the clouds once per 2×2 block, store into
+// cloud_out. cs_main bilinearly upsamples + composites. No terrain occlusion
+// here (cs_main reapplies it cheaply via cloud_slab_near) — ~4× fewer marches.
+@compute @workgroup_size(8, 8, 1)
+fn cs_clouds(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let half_res = (vec2<u32>(camera.resolution) + vec2<u32>(1u)) / vec2<u32>(2u);
+    if (gid.x >= half_res.x || gid.y >= half_res.y) { return; }
+    let uv = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5)) / vec2<f32>(half_res);
+    let dir = ray_dir_uv(uv);
+    let clouds = render_clouds(camera.origin, dir, 1e9, vec2<f32>(f32(gid.x), f32(gid.y)));
+    textureStore(cloud_out, vec2<i32>(i32(gid.x), i32(gid.y)), clouds);
+}
+
 @compute @workgroup_size(8, 8, 1)
 fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let res = vec2<u32>(camera.resolution);
@@ -331,13 +378,7 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // Sub-pixel jitter for temporal anti-aliasing (zero unless accumulating).
     let uv = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5) + camera.jitter) / camera.resolution;
-    let ndc = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
-    let aspect = camera.resolution.x / camera.resolution.y;
-    let dir = normalize(
-        camera.forward
-        + camera.right * (ndc.x * camera.tan_half_fov * aspect)
-        + camera.up    * (ndc.y * camera.tan_half_fov)
-    );
+    let dir = ray_dir_uv(uv);
 
     // Beam pre-pass: read the coarse first-tile-hit t for this 8×8 block
     // and start the per-pixel ray there. A 16-voxel safety margin (one
@@ -401,10 +442,16 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 
-    // Volumetric clouds — slab raymarch with cone-shadowed sun samples.
-    let t_terrain = select(1e6, hit.t_hit, hit.hit);
-    let clouds = render_clouds(camera.origin, dir, t_terrain, vec2<f32>(f32(gid.x), f32(gid.y)));
-    col = col * (1.0 - clouds.a) + clouds.rgb;
+    // Volumetric clouds — sampled from the half-res cs_clouds pass (bilinear
+    // upsample) instead of marched here. Terrain occlusion is reapplied cheaply:
+    // if the terrain hit is in front of the cloud-slab entry, skip compositing.
+    let uv_cloud = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5)) / camera.resolution;
+    let clouds = textureSampleLevel(cloud_in, cloud_samp, uv_cloud, 0.0);
+    let cloud_near = cloud_slab_near(dir);
+    let cloud_occluded = hit.hit && hit.t_hit < cloud_near;
+    if (!cloud_occluded) {
+        col = col * (1.0 - clouds.a) + clouds.rgb;
+    }
 
     // Volumetric god rays — accumulate sun visibility along the primary ray.
     let t_far = select(200.0, hit.t_hit, hit.hit);
