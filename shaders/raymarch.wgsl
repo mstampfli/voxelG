@@ -471,7 +471,7 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     }
                 }
             }
-            col = shade_cached(hit, camera.origin, dir, pix_jitter, reuse, &light);
+            col = shade(hit, camera.origin, dir, pix_jitter, reuse, &light);
             if (cacheable) {
                 gbuf = vec4<f32>(hitpos_rel, bitcast<f32>(pack2x16float(light)));
             }
@@ -1363,6 +1363,8 @@ fn shade_water_top(hit: Hit, origin: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
     // Per-pixel jitter substitute for shading-of-reflections — derive from
     // hit position since we're not in cs_main scope.
     let jit = fract(p_hit.x * 17.0 + p_hit.z * 23.0 + camera.time * 13.0);
+    // Secondary rays don't use the reprojection cache.
+    var no_cache = vec2<f32>(0.0);
 
     // ---- reflection: primary ray reflected off the perturbed normal ----
     let refl_dir = reflect(dir, n);
@@ -1370,7 +1372,7 @@ fn shade_water_top(hit: Hit, origin: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
     let refl_hit = trace(refl_origin, refl_dir);
     var refl_col: vec3<f32>;
     if (refl_hit.hit) {
-        refl_col = shade(refl_hit, refl_origin, refl_dir, jit);
+        refl_col = shade(refl_hit, refl_origin, refl_dir, jit, false, &no_cache);
     } else {
         refl_col = sky(refl_dir);
     }
@@ -1385,7 +1387,7 @@ fn shade_water_top(hit: Hit, origin: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
     let under = trace_no_water(refr_origin, refr_dir);
     var under_col: vec3<f32>;
     if (under.hit) {
-        under_col = shade(under, refr_origin, refr_dir, jit);
+        under_col = shade(under, refr_origin, refr_dir, jit, false, &no_cache);
     } else {
         under_col = sky(refr_dir) * 0.6;
     }
@@ -1409,7 +1411,7 @@ fn shade_water_top(hit: Hit, origin: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
     let spec = pow(max(0.0, dot(n, h)), 256.0);
     var shadow = 0.0;
     if (sun_intensity(s) > 0.0 && dot(n, s) > 0.0) {
-        shadow = select(1.0, 0.0, trace_any(refl_origin, s));
+        shadow = select(1.0, 0.0, trace_any(refl_origin, s, SHADOW_MAX_DIST));
     }
 
     // ---- shoreline foam: triggered by shallow water (under.t_hit small) ----
@@ -1438,15 +1440,10 @@ fn shade_water_top(hit: Hit, origin: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
 
 // Thin wrapper: full shade with no lighting reuse (used by reflection/refraction
 // secondary rays, which aren't cached).
-fn shade(hit: Hit, origin: vec3<f32>, dir: vec3<f32>, pix_jit: f32) -> vec3<f32> {
-    var dummy = vec2<f32>(0.0);
-    return shade_cached(hit, origin, dir, pix_jit, false, &dummy);
-}
-
 // `reuse_light`: when true, the shadow + AO terms are taken from *light (the
 // reprojected cache) instead of being traced. When false they are computed and
 // written back into *light so the caller can store them for next frame.
-fn shade_cached(
+fn shade(
     hit: Hit, origin: vec3<f32>, dir: vec3<f32>, pix_jit: f32,
     reuse_light: bool, light: ptr<function, vec2<f32>>,
 ) -> vec3<f32> {
@@ -1517,7 +1514,7 @@ fn shade_cached(
         let bitangent = cross(s, tangent);
         let off = (tangent * cos(theta) + bitangent * sin(theta)) * radius;
         let ss = normalize(s + off);
-        shadow_term = select(0.0, 1.0, !trace_any(p_off, ss));
+        shadow_term = select(0.0, 1.0, !trace_any(p_off, ss, SHADOW_MAX_DIST));
     }
     // Hand the freshly-computed terms back so the caller can cache them.
     if (!reuse_light) { *light = vec2<f32>(shadow_term, ao); }
@@ -1539,13 +1536,15 @@ fn shade_glass(hit: Hit, origin: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
     let s = sun_dir();
     let sc = sun_color(s);
     let jit = fract(p_hit.x * 17.0 + p_hit.z * 23.0 + camera.time * 13.0);
+    // Secondary rays don't use the reprojection cache.
+    var no_cache = vec2<f32>(0.0);
 
     let refl_dir = reflect(dir, n);
     let refl_origin = p_hit + n * 0.01;
     let refl_hit = trace(refl_origin, refl_dir);
     var refl_col: vec3<f32>;
     if (refl_hit.hit) {
-        refl_col = shade(refl_hit, refl_origin, refl_dir, jit);
+        refl_col = shade(refl_hit, refl_origin, refl_dir, jit, false, &no_cache);
     } else {
         refl_col = sky(refl_dir);
     }
@@ -1578,7 +1577,7 @@ fn shade_glass(hit: Hit, origin: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
         // Near head-on: dispersion invisible — single trace, save 2/3 cost.
         let under = trace_no_water(refr_origin, refr_dir_g);
         var under_col: vec3<f32>;
-        if (under.hit) { under_col = shade(under, refr_origin, refr_dir_g, jit); }
+        if (under.hit) { under_col = shade(under, refr_origin, refr_dir_g, jit, false, &no_cache); }
         else { under_col = sky(refr_dir_g); }
         let depth = max(0.0, under.t_hit);
         let tint = vec3<f32>(0.05, 0.02, 0.02) * depth;
@@ -1587,9 +1586,9 @@ fn shade_glass(hit: Hit, origin: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
         let ur = trace_no_water(refr_origin, refr_dir_r);
         let ug = trace_no_water(refr_origin, refr_dir_g);
         let ub = trace_no_water(refr_origin, refr_dir_b);
-        var cr = select(sky(refr_dir_r).r, shade(ur, refr_origin, refr_dir_r, jit).r, ur.hit);
-        var cg = select(sky(refr_dir_g).g, shade(ug, refr_origin, refr_dir_g, jit).g, ug.hit);
-        var cb = select(sky(refr_dir_b).b, shade(ub, refr_origin, refr_dir_b, jit).b, ub.hit);
+        var cr = select(sky(refr_dir_r).r, shade(ur, refr_origin, refr_dir_r, jit, false, &no_cache).r, ur.hit);
+        var cg = select(sky(refr_dir_g).g, shade(ug, refr_origin, refr_dir_g, jit, false, &no_cache).g, ug.hit);
+        var cb = select(sky(refr_dir_b).b, shade(ub, refr_origin, refr_dir_b, jit, false, &no_cache).b, ub.hit);
         let depth_g = max(0.0, ug.t_hit);
         let tint = vec3<f32>(0.05, 0.02, 0.02) * depth_g;
         glass_col = vec3<f32>(cr, cg, cb) * exp(-tint);
@@ -1601,7 +1600,7 @@ fn shade_glass(hit: Hit, origin: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
     let spec = pow(max(0.0, dot(n, h_vec)), 200.0);
     var shadow = 0.0;
     if (sun_intensity(s) > 0.0 && dot(n, s) > 0.0) {
-        shadow = select(1.0, 0.0, trace_any(refl_origin, s));
+        shadow = select(1.0, 0.0, trace_any(refl_origin, s, SHADOW_MAX_DIST));
     }
 
     let cos_theta = clamp(dot(-dir, n), 0.0, 1.0);
@@ -1720,7 +1719,9 @@ fn god_rays(origin: vec3<f32>, dir: vec3<f32>, t_far: f32, pix: vec2<f32>) -> ve
     for (var i: i32 = 0; i < N; i = i + 1) {
         let t = (f32(i) + h) * step_t;
         let p = origin + dir * t;
-        if (!trace_any(p + s * 0.5, s)) {
+        // God-ray shafts only need NEARBY occluders — a short occlusion cap lets
+        // the hierarchical trace bail out far sooner than a full shadow ray.
+        if (!trace_any(p + s * 0.5, s, GOD_RAY_OCCL_DIST)) {
             // Distance-weighted contribution: nearer scatter looks brighter.
             sum = sum + exp(-t * 0.008);
         }
@@ -1731,7 +1732,7 @@ fn god_rays(origin: vec3<f32>, dir: vec3<f32>, t_far: f32, pix: vec2<f32>) -> ve
 
 // Stripped-down DDA — same hierarchy as `trace()` but returns the moment we
 // know the ray is occluded. No normal / material work.
-fn trace_any(origin: vec3<f32>, dir: vec3<f32>) -> bool {
+fn trace_any(origin: vec3<f32>, dir: vec3<f32>, max_dist: f32) -> bool {
     // Origin-rebased (see trace() for the rationale).
     let ro = camera.world_origin;
     let org = origin - vec3<f32>(ro);
@@ -1764,7 +1765,7 @@ fn trace_any(origin: vec3<f32>, dir: vec3<f32>) -> bool {
     var slot_v = world_to_slot_voxel(voxel);
     var t_cur = t_enter;
     for (var s: i32 = 0; s < 768; s = s + 1) {
-        if (t_cur > SHADOW_MAX_DIST) { return false; }
+        if (t_cur > max_dist) { return false; }
         let rel = voxel - camera.world_origin;
         if (rel.x < 0 || rel.x >= WORLD_VOXELS_X
          || rel.y < 0 || rel.y >= WORLD_VOXELS_Y
@@ -1941,6 +1942,10 @@ const SHADOW_MAX_DIST: f32 = 480.0;
 // detail is sub-pixel far away). 12 hierarchical lookups/pixel saved on the
 // bulk of the screen.
 const AO_DIST: f32 = 64.0;
+
+// God-ray occlusion cap: shafts only need nearby occluders, so the per-step
+// occlusion test bails out much sooner than a full-length shadow ray.
+const GOD_RAY_OCCL_DIST: f32 = 160.0;
 
 fn trace(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
     var out: Hit;

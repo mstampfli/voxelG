@@ -12,7 +12,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowId};
 
-use glam::{IVec3, Vec3};
+use glam::Vec3;
 
 use crate::camera::Camera;
 use crate::net;
@@ -59,15 +59,6 @@ const JITTER_PATTERN: [[f32; 2]; 8] = [
     [0.375, 0.055_555_6],
     [-0.062_5, 0.388_888_9],
 ];
-
-/// World-voxel offset of the loaded window's lower corner.
-fn world_origin_voxel(world: &World) -> IVec3 {
-    IVec3::new(
-        world.world_origin_chunk.x * voxel::STORAGE_CHUNK_VOXELS as i32,
-        0,
-        world.world_origin_chunk.y * voxel::STORAGE_CHUNK_VOXELS as i32,
-    )
-}
 
 /// Expand a sphere-of-impact into the world (and its persistent edit log). Free
 /// function so it can run while the world Mutex guard is held (no &mut self).
@@ -372,7 +363,7 @@ impl App {
         use winit::event::MouseButton;
         let clicks = std::mem::take(&mut self.pending_clicks);
         let mut world = self.world.lock().unwrap_or_else(|e| e.into_inner());
-        let world_origin = world_origin_voxel(&world);
+        let world_origin = world.world_origin_voxel();
         for button in clicks {
             let Some(hit) = raycast::raycast(
                 self.camera.pos, self.camera.forward(), &world, world_origin,
@@ -433,10 +424,10 @@ impl App {
             if drift.x.abs() >= STREAM_HYSTERESIS || drift.y.abs() >= STREAM_HYSTERESIS {
                 world.shift_origin(target_origin);
             }
-            // Budgeted streaming: clear+dispatch a few queued slots and install
-            // a few finished ones. Generation + the derived-mask computation run
-            // on the worker pool, so the frame never does the heavy work.
-            world.process_streaming(CHUNK_INSTALL_BUDGET);
+            // Install a budgeted number of finished chunks. shift_origin already
+            // cleared + dispatched; generation + derived-mask computation run on
+            // the worker pool, so the frame never does the heavy work.
+            world.install_finished_chunks(CHUNK_INSTALL_BUDGET);
         }
 
         // Raycast queued clicks against the now-settled camera (locks internally).
@@ -508,7 +499,7 @@ impl App {
                 }
                 self.refresh_phase = (self.refresh_phase + 1) % ANIM_REFRESH_SPREAD as u32;
             }
-            let world_origin = world_origin_voxel(&world);
+            let world_origin = world.world_origin_voxel();
             let renderer = self.renderer.as_mut().unwrap();
             renderer.upload_world(&mut world);
             // Mask-only clears from recycled slots (render them as sky now).

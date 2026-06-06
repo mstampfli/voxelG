@@ -459,13 +459,6 @@ impl World {
         }
     }
 
-    /// Per-frame streaming step: install a budgeted number of finished chunks.
-    /// (Clearing + dispatch happen immediately in shift_origin; generation + the
-    /// derived-mask computation run on the worker pool.) Returns installs done.
-    pub fn process_streaming(&mut self, budget: u32) -> u32 {
-        self.install_finished_chunks(budget)
-    }
-
     /// Number of chunk-generation jobs still in flight on the worker pool.
     pub fn pending_gen(&self) -> usize {
         self.in_flight
@@ -497,7 +490,7 @@ impl World {
 
     /// Block until every queued + in-flight generation job has been processed.
     /// Used by tests and "must be fully loaded now" paths; the per-frame loop
-    /// uses the budgeted `process_streaming` instead.
+    /// uses the budgeted `install_finished_chunks` instead.
     pub fn process_pending_gen_blocking(&mut self) {
         while self.in_flight > 0 {
             let (slot, want, data) = match self.gen_res_rx.recv() {

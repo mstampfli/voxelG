@@ -100,11 +100,7 @@ pub struct CameraUniform {
 }
 
 impl CameraUniform {
-    pub fn from_camera(c: &Camera, width: u32, height: u32, time: f32, world_origin_voxel: glam::IVec3) -> Self {
-        Self::with_taa(c, width, height, time, world_origin_voxel, [0.0, 0.0], 0.0)
-    }
-
-    pub fn with_taa(
+    pub fn from_camera(
         c: &Camera,
         width: u32,
         height: u32,

@@ -169,12 +169,11 @@ pub struct Renderer {
     compute_pipeline: wgpu::ComputePipeline,
     compute_bg: wgpu::BindGroup,
 
-    // Half-res volumetric (cloud) pass.
+    // Half-res volumetric (cloud) pass. The texture handle is dropped after
+    // creation — its views keep the GPU resource alive.
     cloud_bgl: wgpu::BindGroupLayout,
     cloud_pipeline: wgpu::ComputePipeline,
     cloud_bg: wgpu::BindGroup,
-    #[allow(dead_code)]
-    cloud_tex: wgpu::Texture,
     cloud_sampled_view: wgpu::TextureView,
     cloud_storage_view: wgpu::TextureView,
 
@@ -276,7 +275,7 @@ impl Renderer {
         surface.configure(&device, &config);
 
         // -- buffers --
-        let camera_init = CameraUniform::from_camera(&Camera::new(), width, height, 0.0, glam::IVec3::ZERO);
+        let camera_init = CameraUniform::from_camera(&Camera::new(), width, height, 0.0, glam::IVec3::ZERO, [0.0, 0.0], 0.0);
         let camera_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("camera"),
             contents: bytemuck::bytes_of(&camera_init),
@@ -369,8 +368,9 @@ impl Renderer {
             ..Default::default()
         });
 
-        // Half-res cloud target for the volumetric pass (reuses `sampler`).
-        let (cloud_tex, cloud_sampled_view, cloud_storage_view) =
+        // Half-res cloud target for the volumetric pass (reuses `sampler`). The
+        // texture handle is dropped; the views keep it alive.
+        let (_, cloud_sampled_view, cloud_storage_view) =
             create_cloud_texture(&device, width, height);
         // Ping-pong lighting G-buffer for the reprojection cache.
         let (light_out_tex, light_out_view) = create_lighting_texture(&device, width, height);
@@ -545,7 +545,7 @@ impl Renderer {
             history_tex, history_view, resolve_tex, resolve_view, sampler,
             beam_bgl, beam_pipeline, beam_bg,
             compute_bgl, compute_pipeline, compute_bg,
-            cloud_bgl, cloud_pipeline, cloud_bg, cloud_tex, cloud_sampled_view, cloud_storage_view,
+            cloud_bgl, cloud_pipeline, cloud_bg, cloud_sampled_view, cloud_storage_view,
             light_out_tex, light_out_view, light_hist_tex, light_hist_view,
             blit_bgl, blit_pipeline, blit_bg,
             taa_bgl, taa_pipeline, taa_bg,
@@ -580,8 +580,7 @@ impl Renderer {
         let (htex, hview) = create_history_texture(&self.device, rw, rh);
         self.history_tex = htex;
         self.history_view = hview;
-        let (ctex, csampled, cstorage) = create_cloud_texture(&self.device, rw, rh);
-        self.cloud_tex = ctex;
+        let (_, csampled, cstorage) = create_cloud_texture(&self.device, rw, rh);
         self.cloud_sampled_view = csampled;
         self.cloud_storage_view = cstorage;
         let (lo_tex, lo_view) = create_lighting_texture(&self.device, rw, rh);
@@ -778,7 +777,7 @@ impl Renderer {
         jitter: [f32; 2],
         taa_blend: f32,
     ) {
-        let mut u = CameraUniform::with_taa(
+        let mut u = CameraUniform::from_camera(
             camera, self.size.0, self.size.1, time, world_origin_voxel, jitter, taa_blend,
         );
         // Lighting reprojection is valid only with a previous frame AND an
@@ -1457,7 +1456,7 @@ mod gpu_render_tests {
         let s = crate::voxel::sample_terrain(cam.pos.x, cam.pos.z, world.seed);
         cam.pos.y = s.h as f32 + 30.0;
         cam.pitch = -0.35;
-        let cu = CameraUniform::from_camera(&cam, w, h, 0.0, wo);
+        let cu = CameraUniform::from_camera(&cam, w, h, 0.0, wo, [0.0, 0.0], 0.0);
 
         let camera_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("camera"),
@@ -1654,7 +1653,7 @@ mod gpu_render_tests {
             let mut cam = Camera::new();
             cam.pos = glam::Vec3::new(256.0, 150.0, 256.0);
             cam.pitch = -0.5;
-            let cu = CameraUniform::from_camera(&cam, w, h, 0.0, glam::IVec3::ZERO);
+            let cu = CameraUniform::from_camera(&cam, w, h, 0.0, glam::IVec3::ZERO, [0.0, 0.0], 0.0);
             let camera_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: None, contents: bytemuck::bytes_of(&cu),
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
