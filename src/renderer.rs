@@ -174,6 +174,9 @@ pub struct Renderer {
     compute_bgl: wgpu::BindGroupLayout,
     compute_pipeline: wgpu::ComputePipeline,
     compute_bg: wgpu::BindGroup,
+    // Deferred transparent pass (#16): shares compute_bgl/compute_bg.
+    transparent_pipeline: wgpu::ComputePipeline,
+    transp_buf: wgpu::Buffer,
 
     // Half-res volumetric (cloud) pass. The texture handle is dropped after
     // creation — its views keep the GPU resource alive.
@@ -245,6 +248,9 @@ impl Renderer {
                 required_features: wgpu::Features::empty(),
                 required_limits: wgpu::Limits {
                     max_storage_buffer_binding_size: 256 << 20, // 256 MB headroom
+                    // Compute pass binds 9 storage buffers (default cap is 8);
+                    // the deferred-transparent record buffer pushed it over.
+                    max_storage_buffers_per_shader_stage: 12,
                     ..wgpu::Limits::default()
                 },
                 memory_hints: wgpu::MemoryHints::Performance,
@@ -389,6 +395,8 @@ impl Renderer {
         // Ping-pong lighting G-buffer for the reprojection cache.
         let (light_out_tex, light_out_view) = create_lighting_texture(&device, width, height);
         let (light_hist_tex, light_hist_view) = create_lighting_texture(&device, width, height);
+        // Deferred transparent records (#16).
+        let transp_buf = create_transp_buf(&device, width, height);
 
         // -- compute pipeline --
         let compute_bgl = create_compute_bgl(&device);
@@ -420,8 +428,18 @@ impl Renderer {
             &device, &compute_bgl, &camera_buf, &bricks_buf,
             &tile_mask_buf, &chunk_mask_buf, &palette_buf, &output_view, &beam_view,
             &tile_dirty_buf, &players_buf, &brick_uniform_buf, &tile_uniform_buf, &l4_mask_buf,
-            &cloud_sampled_view, &sampler, &light_hist_view, &light_out_view,
+            &cloud_sampled_view, &sampler, &light_hist_view, &light_out_view, &transp_buf,
         );
+
+        // -- deferred transparent pipeline (cs_transparent, same module + bgl) --
+        let transparent_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("transparent pipeline"),
+            layout: Some(&compute_pl),
+            module: &compute_shader,
+            entry_point: Some("cs_transparent"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
 
         // -- half-res cloud pipeline (cs_clouds, same shader module) --
         let cloud_bgl = create_cloud_bgl(&device);
@@ -606,6 +624,7 @@ impl Renderer {
             history_tex, history_view, resolve_tex, resolve_view, sampler,
             beam_bgl, beam_pipeline, beam_bg,
             compute_bgl, compute_pipeline, compute_bg,
+            transparent_pipeline, transp_buf,
             bricks_buf_b, physics_pipeline, physics_bg, gpu_physics: gpu_physics_enabled,
             cloud_bgl, cloud_pipeline, cloud_bg, cloud_sampled_view, cloud_storage_view,
             light_out_tex, light_out_view, light_hist_tex, light_hist_view,
@@ -651,13 +670,14 @@ impl Renderer {
         let (lh_tex, lh_view) = create_lighting_texture(&self.device, rw, rh);
         self.light_hist_tex = lh_tex;
         self.light_hist_view = lh_view;
+        self.transp_buf = create_transp_buf(&self.device, rw, rh);
 
         self.compute_bg = make_compute_bg(
             &self.device, &self.compute_bgl, &self.camera_buf, &self.bricks_buf,
             &self.tile_mask_buf, &self.chunk_mask_buf, &self.palette_buf, &self.output_view, &self.beam_view,
             &self.tile_dirty_buf, &self.players_buf, &self.brick_uniform_buf, &self.tile_uniform_buf,
             &self.l4_mask_buf, &self.cloud_sampled_view, &self.sampler,
-            &self.light_hist_view, &self.light_out_view,
+            &self.light_hist_view, &self.light_out_view, &self.transp_buf,
         );
         self.cloud_bg = make_cloud_bg(
             &self.device, &self.cloud_bgl, &self.camera_buf, &self.cloud_storage_view,
@@ -922,6 +942,18 @@ impl Renderer {
                     timestamp_writes: None,
                 });
                 cp.set_pipeline(&self.compute_pipeline);
+                cp.set_bind_group(0, &self.compute_bg, &[]);
+                let gx = (self.size.0 + 7) / 8;
+                let gy = (self.size.1 + 7) / 8;
+                cp.dispatch_workgroups(gx, gy, 1);
+            }
+            // ---- deferred transparent pass (#16): shade water/glass pixels ----
+            {
+                let mut cp = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("transparent"),
+                    timestamp_writes: None,
+                });
+                cp.set_pipeline(&self.transparent_pipeline);
                 cp.set_bind_group(0, &self.compute_bg, &[]);
                 let gx = (self.size.0 + 7) / 8;
                 let gy = (self.size.1 + 7) / 8;
@@ -1227,7 +1259,26 @@ fn create_compute_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
                 },
                 count: None,
             },
+            wgpu::BindGroupLayoutEntry {
+                binding: 17, // transp_buf: deferred transparent records (read_write)
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
         ],
+    })
+}
+
+fn create_transp_buf(device: &wgpu::Device, w: u32, h: u32) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("transp records"),
+        size: (w.max(1) * h.max(1)) as u64 * 16, // vec4<f32> per pixel
+        usage: wgpu::BufferUsages::STORAGE,
+        mapped_at_creation: false,
     })
 }
 
@@ -1363,6 +1414,7 @@ fn make_compute_bg(
     cloud_sampler: &wgpu::Sampler,
     light_in_view: &wgpu::TextureView,
     light_out_view: &wgpu::TextureView,
+    transp_buf: &wgpu::Buffer,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("compute bg"),
@@ -1384,6 +1436,7 @@ fn make_compute_bg(
             wgpu::BindGroupEntry { binding: 13, resource: wgpu::BindingResource::Sampler(cloud_sampler) },
             wgpu::BindGroupEntry { binding: 15, resource: wgpu::BindingResource::TextureView(light_in_view) },
             wgpu::BindGroupEntry { binding: 16, resource: wgpu::BindingResource::TextureView(light_out_view) },
+            wgpu::BindGroupEntry { binding: 17, resource: transp_buf.as_entire_binding() },
         ],
     })
 }
@@ -1517,6 +1570,7 @@ mod gpu_render_tests {
                 required_features: wgpu::Features::empty(),
                 required_limits: wgpu::Limits {
                     max_storage_buffer_binding_size: 256 << 20,
+                    max_storage_buffers_per_shader_stage: 12,
                     ..wgpu::Limits::default()
                 },
                 memory_hints: wgpu::MemoryHints::Performance,
@@ -1600,11 +1654,12 @@ mod gpu_render_tests {
         let bgl = create_compute_bgl(&device);
         let (_ltex, light_in_view) = create_lighting_texture(&device, w, h);
         let (_ltex2, light_out_view) = create_lighting_texture(&device, w, h);
+        let transp_buf = create_transp_buf(&device, w, h);
         let bg = make_compute_bg(
             &device, &bgl, &camera_buf, &bricks_buf, &tile_mask_buf, &chunk_mask_buf,
             &palette_buf, &output_view, &beam_view, &tile_dirty_buf, &players_buf,
             &brick_uniform_buf, &tile_uniform_buf, &l4_mask_buf,
-            &cloud_sampled_view, &cloud_sampler, &light_in_view, &light_out_view,
+            &cloud_sampled_view, &cloud_sampler, &light_in_view, &light_out_view, &transp_buf,
         );
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("test pl"),
@@ -1621,6 +1676,15 @@ mod gpu_render_tests {
             layout: Some(&pl),
             module: &module,
             entry_point: Some("cs_main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        // Deferred transparent pass (validates cs_transparent end to end).
+        let transparent_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("test transparent pipeline"),
+            layout: Some(&pl),
+            module: &module,
+            entry_point: Some("cs_transparent"),
             compilation_options: Default::default(),
             cache: None,
         });
@@ -1689,6 +1753,12 @@ mod gpu_render_tests {
         {
             let mut cp = enc.begin_compute_pass(&Default::default());
             cp.set_pipeline(&pipeline);
+            cp.set_bind_group(0, &bg, &[]);
+            cp.dispatch_workgroups((w + 7) / 8, (h + 7) / 8, 1);
+        }
+        {
+            let mut cp = enc.begin_compute_pass(&Default::default());
+            cp.set_pipeline(&transparent_pipeline);
             cp.set_bind_group(0, &bg, &[]);
             cp.dispatch_workgroups((w + 7) / 8, (h + 7) / 8, 1);
         }
@@ -1783,8 +1853,9 @@ mod gpu_render_tests {
             let csamp = device.create_sampler(&wgpu::SamplerDescriptor { mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, ..Default::default() });
             let (_li, liv) = create_lighting_texture(&device, w, h);
             let (_lo, lov) = create_lighting_texture(&device, w, h);
+            let tpb = create_transp_buf(&device, w, h);
             let bgl = create_compute_bgl(&device);
-            let bg = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &ov, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &liv, &lov);
+            let bg = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &ov, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &liv, &lov, &tpb);
             let pll = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[&bgl], push_constant_ranges: &[] });
             let src = format!("{}\n{}", WORLD_CONSTS_WGSL, include_str!("../shaders/raymarch.wgsl"));
             let m = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(src.into()) });

@@ -99,6 +99,14 @@ struct PlayersBuf {
 @group(0) @binding(15) var light_in: texture_2d<f32>;
 @group(0) @binding(16) var light_out: texture_storage_2d<rgba32float, write>;
 
+// Deferred transparent pass (#16). cs_main records each transparent (water-top /
+// glass) hit here as (t_hit, mat_code, normal_code, flag) and writes a cheap
+// placeholder colour; the separate cs_transparent pass does the expensive
+// reflection/refraction so the opaque-majority warps in cs_main stay coherent
+// (less 8x8 divergence). A read_write storage buffer (not a texture) lets both
+// passes share this binding without a read/write aliasing hazard.
+@group(0) @binding(17) var<storage, read_write> transp_buf: array<vec4<f32>>;
+
 fn brick_uniform_mat(bi: i32) -> u32 {
     let w = brick_uniform_packed[bi >> 2];
     let shift = u32(bi & 3) * 8u;
@@ -381,6 +389,63 @@ fn cs_clouds(@builtin(global_invocation_id) gid: vec3<u32>) {
     textureStore(cloud_out, vec2<i32>(i32(gid.x), i32(gid.y)), clouds);
 }
 
+// Axis-aligned face normal <-> small code, for the deferred transparent buffer.
+fn encode_face_normal(n: vec3<f32>) -> f32 {
+    if (n.x > 0.5) { return 0.0; } else if (n.x < -0.5) { return 1.0; }
+    else if (n.y > 0.5) { return 2.0; } else if (n.y < -0.5) { return 3.0; }
+    else if (n.z > 0.5) { return 4.0; } else { return 5.0; }
+}
+fn decode_face_normal(c: f32) -> vec3<f32> {
+    let i = i32(c + 0.5);
+    if (i == 0) { return vec3<f32>(1.0, 0.0, 0.0); }
+    if (i == 1) { return vec3<f32>(-1.0, 0.0, 0.0); }
+    if (i == 2) { return vec3<f32>(0.0, 1.0, 0.0); }
+    if (i == 3) { return vec3<f32>(0.0, -1.0, 0.0); }
+    if (i == 4) { return vec3<f32>(0.0, 0.0, 1.0); }
+    return vec3<f32>(0.0, 0.0, -1.0);
+}
+
+// Deferred transparent shading pass (#16): runs after cs_main, shades only the
+// pixels cs_main flagged as water-top/glass (the expensive reflection/refraction
+// + dispersion), then re-applies clouds + god-rays to match cs_main's compositing.
+// Opaque/sky pixels early-out, leaving cs_main's output untouched.
+@compute @workgroup_size(8, 8, 1)
+fn cs_transparent(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let res = vec2<i32>(camera.resolution);
+    if (i32(gid.x) >= res.x || i32(gid.y) >= res.y) { return; }
+    let rec = transp_buf[gid.y * u32(res.x) + gid.x];
+    if (rec.w < 0.5) { return; } // not a transparent pixel
+
+    let uv = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5) + camera.jitter) / camera.resolution;
+    let dir = ray_dir_uv(uv);
+
+    var hit: Hit;
+    hit.hit = true;
+    hit.t_hit = rec.x;
+    hit.last_axis = 0;
+    hit.voxel = vec3<i32>(0);
+    var col: vec3<f32>;
+    if (rec.y < 1.5) {
+        hit.mat = MAT_WATER_L8;
+        hit.normal = vec3<f32>(0.0, 1.0, 0.0);
+        col = shade_water_top(hit, camera.origin, dir);
+    } else {
+        hit.mat = MAT_GLASS;
+        hit.normal = decode_face_normal(rec.z);
+        col = shade_glass(hit, camera.origin, dir);
+    }
+
+    // Match cs_main's post-hit compositing for these pixels.
+    let uv_cloud = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5)) / camera.resolution;
+    let clouds = textureSampleLevel(cloud_in, cloud_samp, uv_cloud, 0.0);
+    if (hit.t_hit >= cloud_slab_near(dir)) {
+        col = col * (1.0 - clouds.a) + clouds.rgb;
+    }
+    col += god_rays(camera.origin, dir, hit.t_hit, vec2<f32>(f32(gid.x), f32(gid.y)));
+
+    textureStore(output_tex, vec2<i32>(i32(gid.x), i32(gid.y)), vec4<f32>(col, 1.0));
+}
+
 @compute @workgroup_size(8, 8, 1)
 fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let res = vec2<u32>(camera.resolution);
@@ -436,11 +501,16 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     // G-buffer for the shadow/AO reprojection cache; sentinel pos = never reused.
     var gbuf = vec4<f32>(1e9, 1e9, 1e9, 0.0);
+    // Deferred transparent record (mat_code 0 = opaque/none).
+    var transp = vec4<f32>(0.0, 0.0, 0.0, 0.0);
     if (hit.hit) {
         if (is_water_mat(hit.mat) && hit.normal.y > 0.5) {
-            col = shade_water_top(hit, camera.origin, dir);
+            // Defer the expensive water reflection/refraction to cs_transparent.
+            transp = vec4<f32>(hit.t_hit, 1.0, 0.0, 1.0);
+            col = sky(dir); // cheap placeholder (overwritten by cs_transparent)
         } else if (hit.mat == MAT_GLASS) {
-            col = shade_glass(hit, camera.origin, dir);
+            transp = vec4<f32>(hit.t_hit, 2.0, encode_face_normal(hit.normal), 1.0);
+            col = sky(dir);
         } else {
             // Solid terrain faces have stable (view-independent) shadow + AO, so
             // reproject them from last frame's G-buffer and reuse on a position
@@ -480,6 +550,7 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         col = sky(dir);
     }
     textureStore(light_out, vec2<i32>(i32(gid.x), i32(gid.y)), gbuf);
+    transp_buf[gid.y * u32(res.x) + gid.x] = transp;
 
     // Remote-player markers: each player is a 1.6×2×1.6 box in world coords.
     // Pick the closest hit (player vs terrain) and override colour if a
