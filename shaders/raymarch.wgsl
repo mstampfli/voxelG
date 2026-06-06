@@ -1333,7 +1333,11 @@ fn shade(hit: Hit, origin: vec3<f32>, dir: vec3<f32>, pix_jit: f32) -> vec3<f32>
     }
     // Skip the cube-face AO for sub-voxel sphere hits (foliage). The curved
     // sphere normal already gives rim/falloff that reads as 3D.
-    let ao = select(compute_ao(hit, origin, dir), 1.0, hit.last_axis < 0);
+    // AO (12 hierarchical neighbour lookups) only near the camera — its
+    // contact-shadow detail is invisible far away, so skip it past AO_DIST and
+    // for sub-voxel foliage hits.
+    let skip_ao = hit.last_axis < 0 || hit.t_hit > AO_DIST;
+    let ao = select(compute_ao(hit, origin, dir), 1.0, skip_ao);
 
     // ---- swaying foliage ----
     // Leaves and grass-tops perturb their shading normal with a wind field
@@ -1789,6 +1793,11 @@ const FOLIAGE_NEAR_T: f32 = 72.0;
 // shadows contribute little and are the most expensive secondary rays
 // (checklist: cheaper secondary rays / coarse shadows).
 const SHADOW_MAX_DIST: f32 = 480.0;
+
+// Beyond this distance, skip per-corner ambient occlusion (its contact-shadow
+// detail is sub-pixel far away). 12 hierarchical lookups/pixel saved on the
+// bulk of the screen.
+const AO_DIST: f32 = 64.0;
 
 fn trace(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
     var out: Hit;
