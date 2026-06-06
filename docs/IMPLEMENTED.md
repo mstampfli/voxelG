@@ -132,6 +132,8 @@ engine already clears 100 fps at the current scale).
 **Done (Win B — measured on AC):**
 - Shadow rays 2→1 sample + cloud self-shadow 3→2.
 - AO distance-LOD (skip the 12-tap AO past 64 voxels).
+- Coarse god-rays: `trace_any` now takes a distance cap; god-ray occlusion uses a
+  short `GOD_RAY_OCCL_DIST` so the hierarchical trace bails out far sooner.
 
 **Done (Wins A / C / D — implemented + validated headlessly; benchmark on AC pending):**
 - **Win A — true nested DDA.** The DDA now carries the slot voxel coord and
@@ -150,20 +152,30 @@ engine already clears 100 fps at the current scale).
   cloud-slab depth test for terrain occlusion). ~4× fewer cloud marches on
   sky-facing views.
 
-**Remaining (heaviest rewrites, best done with on-AC validation):**
-- **GPU-compute physics** — `docs/gpu-physics-design.md` (pull-only,
-  double-buffered, integer-only CA). Removes the CPU CA cost, which matters most
-  at 10 cm where there are far more active cells. A research-scale rewrite (bricks
-  GPU-resident, indirect-dispatch active set, readback for raycast/net).
-- **Full reprojection TAA** — accumulate the colour history across motion by
-  reprojecting it (the prev-camera basis + the Win C G-buffer make this a small
-  addition); currently TAA resets on motion.
-- **Transparent/foliage deferred second pass** (#16) — reduce 8×8 divergence
-  further; near-only foliage already removed the worst of it.
+**Done (full-reprojection TAA):** the TAA resolve reprojects each terrain
+pixel's history by its G-buffer world position through the previous-frame camera,
+so a moving camera keeps accumulating AA instead of hard-resetting. Neighbourhood
+clamp rejects ghosting; sky/foliage + chunk-cross frames pass through. Reuses the
+Win C prev-camera + G-buffer. (`taa.wgsl`, gated by `reproject_lighting`.)
 
-The render wins are validated by the headless render test (spawn + far-origin +
-the 2-frame reuse path); traversal/shading perf is to be re-measured on AC with
-`raymarch_timing` (battery throttles the GPU ~14×, so numbers there are moot).
+**Remaining (the two the original docs flagged as research-scale / profiler-gated):**
+- **GPU-compute physics** — `docs/gpu-physics-design.md` (pull-only,
+  double-buffered, integer-only CA). This is a research-scale rewrite: the bricks
+  must become GPU-authoritative with readback for the CPU raycast / net-edit /
+  streaming paths, plus determinism work. Cannot be added incrementally without
+  reworking the data-flow that the working CPU physics depends on — the design
+  doc is the deliverable; implement against it on AC where it can be validated.
+- **Transparent/foliage deferred second pass** (#16) — split foliage/transparent
+  shading into a second coherent pass to cut 8×8 warp divergence. The docs
+  deferred this as "needs a GPU profiler to justify"; near-only foliage already
+  removed the worst divergence. Best done on AC with a profiler so the split is
+  measured, not guessed.
+
+Everything else in this file is implemented. The render wins are validated by the
+headless render test (spawn + far-origin + the 2-frame reuse path) and naga
+shader validation; traversal/shading perf + TAA/cache visual quality are to be
+re-checked on AC with `raymarch_timing` (battery throttles the GPU ~14×, so
+numbers + visuals there are moot).
 
 ## Deliberately deferred (with rationale)
 - Full reprojection/disocclusion TAA (skip tracing reprojectable tiles on motion) —
