@@ -1351,7 +1351,7 @@ mod gpu_render_tests {
             eprintln!("no GPU — skipping");
             return;
         };
-        for &(w, h) in &[(1280u32, 720u32), (640u32, 360u32)] {
+        for &(w, h) in &[(1920u32, 1080u32), (1280u32, 720u32)] {
             let mut world = World::new();
             world.fill_demo_terrain();
             let mut cam = Camera::new();

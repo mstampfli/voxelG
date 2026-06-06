@@ -1364,30 +1364,25 @@ fn shade(hit: Hit, origin: vec3<f32>, dir: vec3<f32>, pix_jit: f32) -> vec3<f32>
     let n_dot_l = max(0.0, dot(n, s));
     var shadow_term = 0.0;
     if (n_dot_l > 0.0 && s_int > 0.0) {
-        // PCF using per-PIXEL jitter — 2 golden-spiral samples (was 4; the
-        // temporal-differential pass averages adjacent frames so the noise
-        // washes out across time anyway, and shadows are the single most
-        // expensive per-pixel cost).
-        let tau = 6.28318530;
+        // ONE jittered shadow ray (was 2). The per-pixel + per-frame jitter
+        // (pix_jit rotates each frame) plus the TAA history accumulation average
+        // the single sample into a soft penumbra over time — at half the cost.
+        // Shadows are the single most expensive per-pixel term, so this is the
+        // biggest shading win.
         let golden = 2.39996323; // 137.5° in radians
         let cone = 0.07;
-        var sum = 0.0;
-        for (var i: i32 = 0; i < 2; i = i + 1) {
-            let theta = (f32(i) + pix_jit) * golden;
-            let radius = cone * sqrt((f32(i) + pix_jit) * 0.5);
-            // Build a tangent frame around the sun direction (s) so the offset
-            // is in the *plane perpendicular to s* — not just in xz. That way
-            // shadows are uniformly soft regardless of sun azimuth.
-            var tangent = normalize(cross(s, vec3<f32>(0.0, 1.0, 0.0)));
-            if (length(cross(s, vec3<f32>(0.0, 1.0, 0.0))) < 0.01) {
-                tangent = vec3<f32>(1.0, 0.0, 0.0);
-            }
-            let bitangent = cross(s, tangent);
-            let off = (tangent * cos(theta) + bitangent * sin(theta)) * radius;
-            let ss = normalize(s + off);
-            if (!trace_any(p_off, ss)) { sum = sum + 1.0; }
+        let theta = pix_jit * golden;
+        let radius = cone * sqrt(pix_jit * 0.5);
+        // Offset in the plane perpendicular to the sun so the penumbra is
+        // uniform regardless of sun azimuth.
+        var tangent = normalize(cross(s, vec3<f32>(0.0, 1.0, 0.0)));
+        if (length(cross(s, vec3<f32>(0.0, 1.0, 0.0))) < 0.01) {
+            tangent = vec3<f32>(1.0, 0.0, 0.0);
         }
-        shadow_term = sum * 0.5;
+        let bitangent = cross(s, tangent);
+        let off = (tangent * cos(theta) + bitangent * sin(theta)) * radius;
+        let ss = normalize(s + off);
+        shadow_term = select(0.0, 1.0, !trace_any(p_off, ss));
     }
 
     let direct = sun_color(s) * (n_dot_l * shadow_term);
@@ -1534,13 +1529,13 @@ fn render_clouds(origin: vec3<f32>, dir: vec3<f32>, t_terrain: f32, pix: vec2<f3
         let d = cloud_density(p, camera.time);
         if (d < 0.01) { continue; }
 
-        // 3 cone samples toward the sun for self-shadowing.
+        // 2 cone samples toward the sun for self-shadowing (TAA accumulates).
         var sun_dens: f32 = 0.0;
-        for (var j: i32 = 1; j <= 3; j = j + 1) {
-            let pj = p + s * f32(j) * 7.0;
+        for (var j: i32 = 1; j <= 2; j = j + 1) {
+            let pj = p + s * f32(j) * 9.0;
             sun_dens = sun_dens + cloud_density(pj, camera.time);
         }
-        let sun_t = exp(-sun_dens * 0.45);
+        let sun_t = exp(-sun_dens * 0.62);
         let local_col = ambient + sc * sun_t * phase;
 
         let sample_t = exp(-d * step_t * 0.14);
