@@ -275,7 +275,10 @@ impl Renderer {
             // capped to the display refresh) and fall back to Fifo (vsync,
             // always supported). We deliberately avoid Immediate — it was the
             // source of the uncapped ~1800 fps idle GPU burn.
-            present_mode: if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
+            present_mode: if std::env::var("VOXELG_UNCAPPED").is_ok()
+                && caps.present_modes.contains(&wgpu::PresentMode::Immediate) {
+                wgpu::PresentMode::Immediate // measurement: no vsync, uncapped
+            } else if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
                 wgpu::PresentMode::Mailbox
             } else {
                 wgpu::PresentMode::Fifo

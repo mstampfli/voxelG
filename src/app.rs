@@ -660,7 +660,10 @@ impl ApplicationHandler for App {
         if self.window.is_none() {
             return;
         }
-        let frame = Duration::from_secs_f64(1.0 / FRAME_CAP_HZ);
+        // VOXELG_UNCAPPED removes the frame-pacing cap for throughput measurement
+        // (pair with the Immediate present mode the renderer selects under it).
+        let cap_hz = if std::env::var("VOXELG_UNCAPPED").is_ok() { 100_000.0 } else { FRAME_CAP_HZ };
+        let frame = Duration::from_secs_f64(1.0 / cap_hz);
         let since = self.last_frame.elapsed();
         if since >= frame {
             self.request_redraw();
