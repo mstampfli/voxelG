@@ -174,6 +174,14 @@ separate `cs_transparent` pass shades only those pixels (reflection / refraction
 dispersion) and re-applies clouds + god-rays. Keeps the opaque-majority warps in
 `cs_main` coherent (less 8×8 divergence) on top of the existing near-only foliage.
 
+**Note — reprojection is static-only.** The Win C shadow/AO cache and the
+full-reprojection TAA run only while the camera is still (where they reproject
+onto themselves exactly); on motion the frame is traced fresh and passed through
+(sharp). Motion reprojection visibly warped the image and the engine has ample
+headroom to trace every moving frame. Future work: tune the motion-reprojection
+math on AC (the warp can't be eyeballed reliably on battery) so the caches can
+also help during movement.
+
 **Everything in this file is now implemented.** The render wins are validated by
 the headless render test (spawn + far-origin + the 2-frame reuse path, which also
 runs the cloud + deferred-transparent passes) and naga shader validation; the GPU
