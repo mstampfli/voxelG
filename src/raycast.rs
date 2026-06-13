@@ -19,6 +19,12 @@ pub struct PickHit {
 const MAX_STEPS: i32 = 4096;
 
 pub fn raycast(camera_world: Vec3, dir: Vec3, world: &World, world_origin: IVec3) -> Option<PickHit> {
+    // Normalize defensively: a near-zero / un-normalized dir would make several
+    // axes hit safe_inv's 1e30 clamp at once and the DDA would never advance.
+    let dir = dir.normalize_or_zero();
+    if dir == Vec3::ZERO {
+        return None;
+    }
     let win_min = Vec3::new(
         world_origin.x as f32,
         world_origin.y as f32,

@@ -19,37 +19,84 @@
 
 use glam::UVec3;
 
-pub const BRICK_DIM: u32 = 4;
-pub const BRICK_VOXELS: u32 = BRICK_DIM * BRICK_DIM * BRICK_DIM;
+use crossbeam_channel::{Receiver, Sender};
 
-pub const WORLD_BRICKS_X: u32 = 128;
-pub const WORLD_BRICKS_Y: u32 = 64;
-pub const WORLD_BRICKS_Z: u32 = 128;
-pub const WORLD_BRICKS_TOTAL: u32 = WORLD_BRICKS_X * WORLD_BRICKS_Y * WORLD_BRICKS_Z;
+/// A request to a background worker: generate this slot's bricks for this world
+/// chunk under this seed. Pure — the worker touches no shared state.
+type GenRequest = (u32, glam::IVec3, u64);
+/// A finished slot from a worker: (slot, world_chunk, data). The worker also
+/// computes the derived per-brick movable + uniform masks and the chunk's 8
+/// tile-uniform flags, so the main-thread install is a cheap copy + bit-set
+/// instead of re-scanning 64 voxels per brick (that rescan was the chunk-load
+/// lag spike — checklist: physics/streaming off the frame thread).
+type GenResult = (u32, glam::IVec3, SlotData);
 
-pub const WORLD_VOXELS_X: u32 = WORLD_BRICKS_X * BRICK_DIM;
-pub const WORLD_VOXELS_Y: u32 = WORLD_BRICKS_Y * BRICK_DIM;
-pub const WORLD_VOXELS_Z: u32 = WORLD_BRICKS_Z * BRICK_DIM;
+/// A generated storage chunk plus everything the install needs, all computed on
+/// the worker thread. `STORAGE_CHUNK_BRICKS³` bricks; `tile_uniform` is the 2³
+/// tiles that tile the chunk.
+pub struct SlotData {
+    pub bricks: Vec<Brick>,
+    pub movable: Vec<u64>,
+    pub brick_uniform: Vec<u8>,
+    pub tile_uniform: [u8; 8],
+}
 
-pub const WORLD_TILES_X: u32 = WORLD_BRICKS_X / 4;
-pub const WORLD_TILES_Y: u32 = WORLD_BRICKS_Y / 4;
-pub const WORLD_TILES_Z: u32 = WORLD_BRICKS_Z / 4;
-pub const WORLD_TILES_TOTAL: u32 = WORLD_TILES_X * WORLD_TILES_Y * WORLD_TILES_Z;
+impl SlotData {
+    /// Compute the derived masks from freshly generated bricks (pure; runs on
+    /// the worker). Brick scratch layout is x + y*8 + z*64 (see gen_slot_bricks).
+    pub fn from_bricks(bricks: Vec<Brick>) -> Self {
+        let n = bricks.len();
+        let mut movable = vec![0u64; n];
+        let mut brick_uniform = vec![0u8; n];
+        for (i, b) in bricks.iter().enumerate() {
+            // movable bits
+            let mut m = 0u64;
+            for v in 0..64usize {
+                m |= (is_movable_mat(b.materials[v]) as u64) << v;
+            }
+            movable[i] = m & b.occupancy;
+            // uniform: fully solid and one material throughout
+            if b.occupancy == !0u64 {
+                let m0 = b.materials[0];
+                if m0 != 0 && b.materials.iter().all(|&x| x == m0) {
+                    brick_uniform[i] = m0;
+                }
+            }
+        }
+        // tile uniform for the chunk's 2x2x2 tiles (each 4x4x4 child bricks).
+        let mut tile_uniform = [0u8; 8];
+        let scb = STORAGE_CHUNK_BRICKS as usize; // 8
+        for dtz in 0..2usize {
+            for dty in 0..2usize {
+                for dtx in 0..2usize {
+                    let first = (dtx * 4) + (dty * 4) * scb + (dtz * 4) * scb * scb;
+                    let m0 = brick_uniform[first];
+                    let mut uniform = m0 != 0;
+                    if uniform {
+                        'scan: for bz in 0..4usize {
+                            for by in 0..4usize {
+                                for bx in 0..4usize {
+                                    let idx = (dtx * 4 + bx) + (dty * 4 + by) * scb + (dtz * 4 + bz) * scb * scb;
+                                    if brick_uniform[idx] != m0 {
+                                        uniform = false;
+                                        break 'scan;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    tile_uniform[dtx + dty * 2 + dtz * 4] = if uniform { m0 } else { 0 };
+                }
+            }
+        }
+        SlotData { bricks, movable, brick_uniform, tile_uniform }
+    }
+}
 
-pub const WORLD_CHUNKS_X: u32 = (WORLD_TILES_X + 3) / 4;
-pub const WORLD_CHUNKS_Y: u32 = (WORLD_TILES_Y + 3) / 4;
-pub const WORLD_CHUNKS_Z: u32 = (WORLD_TILES_Z + 3) / 4;
-pub const WORLD_CHUNKS_TOTAL: u32 = WORLD_CHUNKS_X * WORLD_CHUNKS_Y * WORLD_CHUNKS_Z;
-
-// ---- storage chunks (the "chunked world") ----
-// A storage chunk holds 8x8x8 bricks = 32x32x32 voxels. Generation, dirty
-// tracking, and (eventually) GPU streaming all operate at this granularity.
-pub const STORAGE_CHUNK_BRICKS: u32 = 8;
-pub const STORAGE_CHUNK_VOXELS: u32 = STORAGE_CHUNK_BRICKS * BRICK_DIM;
-pub const WORLD_STORE_CX: u32 = WORLD_BRICKS_X / STORAGE_CHUNK_BRICKS;
-pub const WORLD_STORE_CY: u32 = WORLD_BRICKS_Y / STORAGE_CHUNK_BRICKS;
-pub const WORLD_STORE_CZ: u32 = WORLD_BRICKS_Z / STORAGE_CHUNK_BRICKS;
-pub const WORLD_STORE_CHUNKS: u32 = WORLD_STORE_CX * WORLD_STORE_CY * WORLD_STORE_CZ;
+// World dimensions live in `src/world_dims.rs` so build.rs can generate the
+// matching WGSL constants from the exact same source. Re-export them here so
+// every existing `crate::voxel::WORLD_*` reference keeps working unchanged.
+pub use crate::world_dims::*;
 
 #[inline(always)]
 pub const fn storage_chunk_idx(cx: u32, cy: u32, cz: u32) -> u32 {
@@ -149,6 +196,18 @@ pub const fn chunk_idx(cx: u32, cy: u32, cz: u32) -> u32 {
 }
 
 #[inline(always)]
+pub const fn l4_idx(l4x: u32, l4y: u32, l4z: u32) -> u32 {
+    l4x + l4y * WORLD_L4_X + l4z * WORLD_L4_X * WORLD_L4_Y
+}
+
+/// Bit position of a child chunk inside its L4 cell's u64 (same x + z*4 + y*16
+/// linearisation every level uses).
+#[inline(always)]
+pub const fn chunk_bit_in_l4(lx: u32, ly: u32, lz: u32) -> u32 {
+    lx + lz * 4 + ly * 16
+}
+
+#[inline(always)]
 pub const fn brick_bit_in_tile(lx: u32, ly: u32, lz: u32) -> u32 {
     lx + lz * 4 + ly * 16
 }
@@ -194,6 +253,10 @@ pub struct World {
     pub bricks: Vec<Brick>,
     pub tile_mask: Vec<u64>,
     pub chunk_mask: Vec<u64>,
+    /// L4 occupancy: one u64 per 256³-voxel cell, one bit per child chunk. The
+    /// coarsest pyramid level — lets the DDA skip a 256³ empty region in a
+    /// single bit test (checklist: L4 level).
+    pub l4_mask: Vec<u64>,
     pub movable_mask: Vec<u64>,
     /// Per-brick "this whole brick is one material" hint. 0 = not uniform;
     /// any non-zero value = uniform with that material id. Lets the DDA
@@ -204,6 +267,11 @@ pub struct World {
     pub tile_uniform: Vec<u8>,
     pub active_bricks: Vec<u32>,
     pub dirty_bricks: Vec<u32>,
+    /// Reusable physics scratch buffers (a sorted snapshot of active_bricks and
+    /// the per-tick "touched" set), kept here so the CA tick allocates nothing —
+    /// previously it cloned active_bricks twice per tick (checklist: physics).
+    pub phys_scratch: Vec<u32>,
+    pub phys_touched: Vec<u32>,
     pub all_dirty: bool,
     pub chunk_meta: Vec<ChunkMeta>,
     pub seed: u64,
@@ -215,7 +283,19 @@ pub struct World {
     pub world_origin_chunk: glam::IVec2,
     /// For each slot, the world chunk coord it currently holds. None = stale.
     pub slot_world_chunk: Vec<Option<glam::IVec3>>,
-    pub regen_queue: std::collections::VecDeque<(u32, glam::IVec3)>,
+    /// Tiles whose mask was cleared (slot recycled) without any brick edit, so
+    /// the GPU must re-upload them to render that region as sky immediately. The
+    /// incremental brick-upload path derives its dirty tiles from dirty_bricks,
+    /// which a mask-only clear doesn't touch — hence this side list.
+    pub mask_dirty_tiles: Vec<u32>,
+    /// Async chunk generation. shift_origin sends (slot, world_chunk, seed) to a
+    /// pool of background worker threads; install_finished_chunks pulls finished
+    /// bricks back and stitches them in on the main thread. This keeps the
+    /// expensive noise generation off the frame thread — the chunk-load hitch.
+    gen_req_tx: Sender<GenRequest>,
+    gen_res_rx: Receiver<GenResult>,
+    /// Outstanding (requested but not yet received) generation jobs.
+    in_flight: usize,
     /// Persistent voxel edits keyed by *world* voxel coord. Survives chunk
     /// unload/regen — applied on top of fresh noise when a chunk reloads,
     /// and synced over the network so all clients agree on player builds.
@@ -228,21 +308,53 @@ impl World {
     }
 
     pub fn with_seed(seed: u64) -> Self {
+        // Spawn a small pool of generation workers. Each pulls (slot, chunk,
+        // seed) jobs and pushes back finished bricks; gen_slot_bricks is a pure
+        // function so there is no shared state and no locking.
+        let (gen_req_tx, gen_req_rx) = crossbeam_channel::unbounded::<GenRequest>();
+        let (gen_res_tx, gen_res_rx) = crossbeam_channel::unbounded::<GenResult>();
+        let n_workers = std::thread::available_parallelism()
+            .map(|n| n.get().saturating_sub(2))
+            .unwrap_or(4)
+            .clamp(2, 6);
+        for _ in 0..n_workers {
+            let rx = gen_req_rx.clone();
+            let tx = gen_res_tx.clone();
+            std::thread::Builder::new()
+                .name("chunkgen".into())
+                .spawn(move || {
+                    while let Ok((slot, world_chunk, seed)) = rx.recv() {
+                        let bricks = gen_slot_bricks(world_chunk, seed);
+                        // Compute the derived masks here, off the frame thread.
+                        let data = SlotData::from_bricks(bricks);
+                        if tx.send((slot, world_chunk, data)).is_err() {
+                            break;
+                        }
+                    }
+                })
+                .expect("spawn chunkgen worker");
+        }
         Self {
             bricks: vec![Brick::EMPTY; WORLD_BRICKS_TOTAL as usize],
             tile_mask: vec![0u64; WORLD_TILES_TOTAL as usize],
             chunk_mask: vec![0u64; WORLD_CHUNKS_TOTAL as usize],
+            l4_mask: vec![0u64; WORLD_L4_TOTAL as usize],
             movable_mask: vec![0u64; WORLD_BRICKS_TOTAL as usize],
             brick_uniform: vec![0u8; WORLD_BRICKS_TOTAL as usize],
             tile_uniform: vec![0u8; WORLD_TILES_TOTAL as usize],
             active_bricks: Vec::with_capacity(4096),
             dirty_bricks: Vec::with_capacity(4096),
+            phys_scratch: Vec::with_capacity(4096),
+            phys_touched: Vec::with_capacity(8192),
             all_dirty: true,
             chunk_meta: vec![ChunkMeta { generated: false }; WORLD_STORE_CHUNKS as usize],
             seed,
             world_origin_chunk: glam::IVec2::ZERO,
             slot_world_chunk: vec![None; WORLD_STORE_CHUNKS as usize],
-            regen_queue: std::collections::VecDeque::with_capacity(256),
+            mask_dirty_tiles: Vec::with_capacity(2048),
+            gen_req_tx,
+            gen_res_rx,
+            in_flight: 0,
             edits: std::collections::HashMap::new(),
         }
     }
@@ -332,135 +444,186 @@ impl World {
                     let want = glam::IVec3::new(want_x, cy as i32, want_z);
                     let slot = storage_chunk_idx(cx, cy, cz) as usize;
                     if self.slot_world_chunk[slot] != Some(want) {
-                        self.clear_slot(cx, cy, cz);
+                        // Render this slot as SKY immediately by clearing only its
+                        // mask bits (cheap — no brick zeroing, no 4.7 MB clear
+                        // upload). The stale brick data is simply never read while
+                        // the tile bits are 0, and the async install overwrites it.
+                        self.clear_slot_masks(cx, cy, cz);
                         self.slot_world_chunk[slot] = Some(want);
-                        self.regen_queue.push_back((slot as u32, want));
+                        if self.gen_req_tx.send((slot as u32, want, self.seed)).is_ok() {
+                            self.in_flight += 1;
+                        }
                     }
                 }
             }
         }
     }
 
-    /// Regenerate up to `budget` slots from the queue. Each regenerated slot
-    /// gets the persistent-edit map replayed on top so player builds survive
-    /// the chunk-streaming round-trip.
-    ///
-    /// Noise generation is **parallelised across rayon's thread pool** — each
-    /// worker computes a scratch `Vec<Brick>` for its slot independently
-    /// (pure function of world-chunk coord + seed), then the main thread
-    /// merges results into the flat world array serially. No shared mutable
-    /// state, no locks.
-    pub fn process_regen_queue(&mut self, budget: u32) {
-        use rayon::prelude::*;
-        let seed = self.seed;
-        // Drain budget items from the queue first.
-        let mut batch: Vec<(u32, glam::IVec3)> = Vec::with_capacity(budget as usize);
-        for _ in 0..budget {
-            let Some(item) = self.regen_queue.pop_front() else { break; };
-            batch.push(item);
-        }
-        if batch.is_empty() { return; }
-        // Parallel: each worker generates its slot's bricks into a private
-        // Vec — pure function of (world_chunk, seed), no shared state.
-        let results: Vec<(u32, glam::IVec3, Vec<Brick>)> = batch
-            .par_iter()
-            .map(|&(slot, want)| {
-                let bricks = gen_slot_bricks(want, seed);
-                (slot, want, bricks)
-            })
-            .collect();
-        // Serial merge: stitch each scratch chunk into the flat world array.
-        let mut regenerated_chunks: Vec<glam::IVec3> = Vec::with_capacity(results.len());
-        for (slot, want, scratch) in results {
-            let cx = slot % WORLD_STORE_CX;
-            let cy = (slot / WORLD_STORE_CX) % WORLD_STORE_CY;
-            let cz = slot / (WORLD_STORE_CX * WORLD_STORE_CY);
-            self.apply_slot_bricks(cx, cy, cz, &scratch);
-            regenerated_chunks.push(want);
-        }
-        if !regenerated_chunks.is_empty() && !self.edits.is_empty() {
-            let cv = STORAGE_CHUNK_VOXELS as i32;
-            let origin = self.world_origin_voxel();
-            // Pre-filter into a vec so we don't hold an immutable borrow on
-            // self.edits while calling self.set_voxel.
-            let mut to_apply: Vec<(i32, i32, i32, u8)> = Vec::new();
-            for (&(wx, wy, wz), &mat) in &self.edits {
-                let edit_chunk = glam::IVec3::new(
-                    wx.div_euclid(cv),
-                    wy.div_euclid(cv),
-                    wz.div_euclid(cv),
-                );
-                if regenerated_chunks.contains(&edit_chunk) {
-                    to_apply.push((wx, wy, wz, mat));
-                }
+    /// Number of chunk-generation jobs still in flight on the worker pool.
+    pub fn pending_gen(&self) -> usize {
+        self.in_flight
+    }
+
+    /// Install up to `budget` finished chunks from the worker pool onto the main
+    /// thread (the cheap stitch + edit replay). This is the per-frame upload
+    /// budget: capping installs caps how many bricks get marked dirty (and thus
+    /// uploaded) per frame, so a chunk cross streams in smoothly over several
+    /// frames instead of spiking. Returns the number installed.
+    pub fn install_finished_chunks(&mut self, budget: u32) -> u32 {
+        let mut installed = 0u32;
+        while installed < budget {
+            let (slot, want, data) = match self.gen_res_rx.try_recv() {
+                Ok(r) => r,
+                Err(_) => break,
+            };
+            self.in_flight = self.in_flight.saturating_sub(1);
+            // Discard stale results: the origin may have shifted again while
+            // this slot was generating, reassigning it to a different chunk.
+            if self.slot_world_chunk[slot as usize] != Some(want) {
+                continue;
             }
-            for (wx, wy, wz, mat) in to_apply {
-                let rel_x = wx - origin.x;
-                let rel_y = wy - origin.y;
-                let rel_z = wz - origin.z;
-                if rel_x < 0 || rel_y < 0 || rel_z < 0
-                    || (rel_x as u32) >= WORLD_VOXELS_X
-                    || (rel_y as u32) >= WORLD_VOXELS_Y
-                    || (rel_z as u32) >= WORLD_VOXELS_Z
-                {
-                    continue;
-                }
-                // Toroidal local mapping — must match the shader.
-                let lx = wx.rem_euclid(WORLD_VOXELS_X as i32) as u32;
-                let ly = rel_y as u32;
-                let lz = wz.rem_euclid(WORLD_VOXELS_Z as i32) as u32;
-                self.set_voxel(lx, ly, lz, mat);
+            self.install_slot(slot, want, &data);
+            installed += 1;
+        }
+        installed
+    }
+
+    /// Block until every queued + in-flight generation job has been processed.
+    /// Used by tests and "must be fully loaded now" paths; the per-frame loop
+    /// uses the budgeted `install_finished_chunks` instead.
+    pub fn process_pending_gen_blocking(&mut self) {
+        while self.in_flight > 0 {
+            let (slot, want, data) = match self.gen_res_rx.recv() {
+                Ok(r) => r,
+                Err(_) => break,
+            };
+            self.in_flight = self.in_flight.saturating_sub(1);
+            if self.slot_world_chunk[slot as usize] == Some(want) {
+                self.install_slot(slot, want, &data);
             }
         }
     }
 
-    /// Wipe one slot's voxels (and the corresponding mask bits) so the
-    /// renderer immediately shows sky/air there. The slot stays empty until
-    /// `process_regen_queue` gets to it.
-    fn clear_slot(&mut self, slot_cx: u32, slot_cy: u32, slot_cz: u32) {
-        let x0 = slot_cx * STORAGE_CHUNK_BRICKS;
-        let y0 = slot_cy * STORAGE_CHUNK_BRICKS;
-        let z0 = slot_cz * STORAGE_CHUNK_BRICKS;
+    fn install_slot(&mut self, slot: u32, want: glam::IVec3, data: &SlotData) {
+        let cx = slot % WORLD_STORE_CX;
+        let cy = (slot / WORLD_STORE_CX) % WORLD_STORE_CY;
+        let cz = slot / (WORLD_STORE_CX * WORLD_STORE_CY);
+        self.apply_slot_data(cx, cy, cz, data);
+        self.replay_edits_for_chunk(want);
+    }
+
+    /// Replay persistent edits that fall inside `world_chunk` on top of freshly
+    /// generated terrain, so player builds survive the streaming round-trip.
+    fn replay_edits_for_chunk(&mut self, world_chunk: glam::IVec3) {
+        if self.edits.is_empty() {
+            return;
+        }
+        let cv = STORAGE_CHUNK_VOXELS as i32;
+        let origin = self.world_origin_voxel();
+        // Collect first so we don't hold a borrow on self.edits across set_voxel.
+        let mut to_apply: Vec<(i32, i32, i32, u8)> = Vec::new();
+        for (&(wx, wy, wz), &mat) in &self.edits {
+            if wx.div_euclid(cv) == world_chunk.x
+                && wy.div_euclid(cv) == world_chunk.y
+                && wz.div_euclid(cv) == world_chunk.z
+            {
+                to_apply.push((wx, wy, wz, mat));
+            }
+        }
+        for (wx, wy, wz, mat) in to_apply {
+            let rel_x = wx - origin.x;
+            let rel_y = wy - origin.y;
+            let rel_z = wz - origin.z;
+            if rel_x < 0 || rel_y < 0 || rel_z < 0
+                || (rel_x as u32) >= WORLD_VOXELS_X
+                || (rel_y as u32) >= WORLD_VOXELS_Y
+                || (rel_z as u32) >= WORLD_VOXELS_Z
+            {
+                continue;
+            }
+            let lx = wx.rem_euclid(WORLD_VOXELS_X as i32) as u32;
+            let ly = rel_y as u32;
+            let lz = wz.rem_euclid(WORLD_VOXELS_Z as i32) as u32;
+            self.set_voxel(lx, ly, lz, mat);
+        }
+    }
+
+    /// Make a recycled slot render as SKY immediately, cheaply: clear only its
+    /// hierarchy MASK bits (tile/chunk/L4) + tile-uniform + the slot's movable
+    /// bits. The stale brick voxel data is left untouched (never read while the
+    /// tile bits are 0) and is overwritten when the async install lands — so
+    /// this does no brick zeroing and no big brick upload (it queues just the
+    /// touched tiles for a tiny mask upload). active_bricks may keep stale
+    /// entries but physics skips them (movable == 0).
+    fn clear_slot_masks(&mut self, slot_cx: u32, slot_cy: u32, slot_cz: u32) {
+        let base_bx = slot_cx * STORAGE_CHUNK_BRICKS;
+        let base_by = slot_cy * STORAGE_CHUNK_BRICKS;
+        let base_bz = slot_cz * STORAGE_CHUNK_BRICKS;
+        // Stop physics touching the slot's now-hidden bricks.
         for dz in 0..STORAGE_CHUNK_BRICKS {
             for dy in 0..STORAGE_CHUNK_BRICKS {
                 for dx in 0..STORAGE_CHUNK_BRICKS {
-                    let bi = brick_idx(x0 + dx, y0 + dy, z0 + dz);
-                    let was_nonempty = !self.bricks[bi as usize].is_empty();
-                    self.bricks[bi as usize] = Brick::EMPTY;
-                    self.movable_mask[bi as usize] = 0;
-                    if was_nonempty {
-                        self.refresh_masks_for_brick(x0 + dx, y0 + dy, z0 + dz);
+                    self.movable_mask[brick_idx(base_bx + dx, base_by + dy, base_bz + dz) as usize] = 0;
+                }
+            }
+        }
+        // Clear the slot's 2x2x2 tiles and propagate empties up to chunk + L4.
+        let base_tx = base_bx / 4;
+        let base_ty = base_by / 4;
+        let base_tz = base_bz / 4;
+        for dtz in 0..2u32 {
+            for dty in 0..2u32 {
+                for dtx in 0..2u32 {
+                    let tx = base_tx + dtx;
+                    let ty = base_ty + dty;
+                    let tz = base_tz + dtz;
+                    if tx >= WORLD_TILES_X || ty >= WORLD_TILES_Y || tz >= WORLD_TILES_Z {
+                        continue;
                     }
-                    self.mark_brick_dirty(bi);
+                    let ti = tile_idx(tx, ty, tz);
+                    if self.tile_mask[ti as usize] == 0 {
+                        continue; // already empty
+                    }
+                    self.tile_mask[ti as usize] = 0;
+                    self.tile_uniform[ti as usize] = 0;
+                    self.mask_dirty_tiles.push(ti);
+                    // Clear this tile's bit in its chunk; if the chunk empties,
+                    // clear its L4 bit too.
+                    let (cx, cy, cz) = (tx / 4, ty / 4, tz / 4);
+                    let ci = chunk_idx(cx, cy, cz);
+                    let cprev = self.chunk_mask[ci as usize];
+                    self.chunk_mask[ci as usize] &= !(1u64 << tile_bit_in_chunk(tx & 3, ty & 3, tz & 3));
+                    if cprev != 0 && self.chunk_mask[ci as usize] == 0 {
+                        let li = l4_idx(cx / 4, cy / 4, cz / 4);
+                        self.l4_mask[li as usize] &= !(1u64 << chunk_bit_in_l4(cx & 3, cy & 3, cz & 3));
+                    }
                 }
             }
         }
     }
 
-    /// Apply a precomputed slot's bricks (from `gen_slot_bricks`) into the
-    /// flat world array, refresh masks, mark bricks dirty.
-    fn apply_slot_bricks(&mut self, slot_cx: u32, slot_cy: u32, slot_cz: u32, scratch: &[Brick]) {
+    /// Install a worker-computed slot (bricks + precomputed masks) into the flat
+    /// world arrays. The movable / brick-uniform / tile-uniform values were all
+    /// computed on the worker (SlotData::from_bricks), so the main thread only
+    /// copies + sets mask bits — no 64-voxel rescans. This is what removes the
+    /// chunk-load lag spike.
+    fn apply_slot_data(&mut self, slot_cx: u32, slot_cy: u32, slot_cz: u32, data: &SlotData) {
         let base_bx = slot_cx * STORAGE_CHUNK_BRICKS;
         let base_by = slot_cy * STORAGE_CHUNK_BRICKS;
         let base_bz = slot_cz * STORAGE_CHUNK_BRICKS;
         for dz in 0..STORAGE_CHUNK_BRICKS {
             for dy in 0..STORAGE_CHUNK_BRICKS {
                 for dx in 0..STORAGE_CHUNK_BRICKS {
-                    let scratch_idx =
+                    let idx =
                         (dx + dy * STORAGE_CHUNK_BRICKS + dz * STORAGE_CHUNK_BRICKS * STORAGE_CHUNK_BRICKS)
                             as usize;
                     let bx = base_bx + dx;
                     let by = base_by + dy;
                     let bz = base_bz + dz;
                     let bi = brick_idx(bx, by, bz);
-                    self.bricks[bi as usize] = scratch[scratch_idx];
-                    // Recompute movable_mask.
-                    let b = &self.bricks[bi as usize];
-                    let mut m = 0u64;
-                    for i in 0..64usize {
-                        m |= (is_movable_mat(b.materials[i]) as u64) << i;
-                    }
-                    let new_movable = m & b.occupancy;
+                    self.bricks[bi as usize] = data.bricks[idx];
+                    self.brick_uniform[bi as usize] = data.brick_uniform[idx];
+                    let new_movable = data.movable[idx];
                     let was_movable = self.movable_mask[bi as usize] != 0;
                     self.movable_mask[bi as usize] = new_movable;
                     let is_movable = new_movable != 0;
@@ -474,16 +637,14 @@ impl World {
                         }
                     }
                     self.refresh_masks_for_brick(bx, by, bz);
-                    self.recompute_uniform_for_brick(bi);
                     self.mark_brick_dirty(bi);
                 }
             }
         }
-        // Recompute affected tile_uniform flags. A storage chunk is 8x8x8
-        // bricks = 2x2x2 tiles, so 8 tiles touched per slot.
-        let base_tx = (base_bx) / 4;
-        let base_ty = (base_by) / 4;
-        let base_tz = (base_bz) / 4;
+        // Tile-uniform flags were precomputed for the chunk's 2x2x2 tiles.
+        let base_tx = base_bx / 4;
+        let base_ty = base_by / 4;
+        let base_tz = base_bz / 4;
         for dtz in 0..2u32 {
             for dty in 0..2u32 {
                 for dtx in 0..2u32 {
@@ -491,7 +652,8 @@ impl World {
                     let ty = base_ty + dty;
                     let tz = base_tz + dtz;
                     if tx < WORLD_TILES_X && ty < WORLD_TILES_Y && tz < WORLD_TILES_Z {
-                        self.recompute_uniform_for_tile(tile_idx(tx, ty, tz));
+                        let local = (dtx + dty * 2 + dtz * 4) as usize;
+                        self.tile_uniform[tile_idx(tx, ty, tz) as usize] = data.tile_uniform[local];
                     }
                 }
             }
@@ -664,10 +826,22 @@ impl World {
             let (cx, cy, cz) = (tx / 4, ty / 4, tz / 4);
             let ci = chunk_idx(cx, cy, cz);
             let cbit = tile_bit_in_chunk(tx & 3, ty & 3, tz & 3);
+            let cprev = self.chunk_mask[ci as usize];
             if now == 0 {
                 self.chunk_mask[ci as usize] &= !(1u64 << cbit);
             } else {
                 self.chunk_mask[ci as usize] |= 1u64 << cbit;
+            }
+            let cnow = self.chunk_mask[ci as usize];
+            // Propagate a chunk empty↔non-empty transition up to the L4 level.
+            if (cprev == 0) != (cnow == 0) {
+                let li = l4_idx(cx / 4, cy / 4, cz / 4);
+                let lbit = chunk_bit_in_l4(cx & 3, cy & 3, cz & 3);
+                if cnow == 0 {
+                    self.l4_mask[li as usize] &= !(1u64 << lbit);
+                } else {
+                    self.l4_mask[li as usize] |= 1u64 << lbit;
+                }
             }
         }
     }
@@ -785,6 +959,7 @@ impl World {
     pub fn rebuild_all_masks(&mut self) {
         self.tile_mask.iter_mut().for_each(|m| *m = 0);
         self.chunk_mask.iter_mut().for_each(|m| *m = 0);
+        self.l4_mask.iter_mut().for_each(|m| *m = 0);
         for bz in 0..WORLD_BRICKS_Z {
             for by in 0..WORLD_BRICKS_Y {
                 for bx in 0..WORLD_BRICKS_X {
@@ -804,6 +979,17 @@ impl World {
                         let (cx, cy, cz) = (tx / 4, ty / 4, tz / 4);
                         let ci = chunk_idx(cx, cy, cz) as usize;
                         self.chunk_mask[ci] |= 1u64 << tile_bit_in_chunk(tx & 3, ty & 3, tz & 3);
+                    }
+                }
+            }
+        }
+        for cz in 0..WORLD_CHUNKS_Z {
+            for cy in 0..WORLD_CHUNKS_Y {
+                for cx in 0..WORLD_CHUNKS_X {
+                    let ci = chunk_idx(cx, cy, cz) as usize;
+                    if self.chunk_mask[ci] != 0 {
+                        let li = l4_idx(cx / 4, cy / 4, cz / 4) as usize;
+                        self.l4_mask[li] |= 1u64 << chunk_bit_in_l4(cx & 3, cy & 3, cz & 3);
                     }
                 }
             }
@@ -944,6 +1130,31 @@ impl World {
 
     pub fn dims_voxels(&self) -> UVec3 {
         UVec3::new(WORLD_VOXELS_X, WORLD_VOXELS_Y, WORLD_VOXELS_Z)
+    }
+
+    /// Material at a WORLD voxel coord using the same toroidal slot mapping the
+    /// shader and CPU raycaster use. Returns MAT_AIR if empty or outside the
+    /// loaded window. Single source of truth for "what's at this world voxel".
+    pub fn material_at_world(&self, wx: i32, wy: i32, wz: i32) -> u8 {
+        let origin = self.world_origin_voxel();
+        let rel = glam::IVec3::new(wx - origin.x, wy - origin.y, wz - origin.z);
+        if rel.x < 0 || rel.y < 0 || rel.z < 0
+            || rel.x as u32 >= WORLD_VOXELS_X
+            || rel.y as u32 >= WORLD_VOXELS_Y
+            || rel.z as u32 >= WORLD_VOXELS_Z
+        {
+            return MAT_AIR;
+        }
+        let sx = wx.rem_euclid(WORLD_VOXELS_X as i32) as u32;
+        let sy = rel.y as u32;
+        let sz = wz.rem_euclid(WORLD_VOXELS_Z as i32) as u32;
+        let bi = brick_idx(sx / BRICK_DIM, sy / BRICK_DIM, sz / BRICK_DIM) as usize;
+        let b = &self.bricks[bi];
+        let vi = brick_voxel_idx(sx % BRICK_DIM, sy % BRICK_DIM, sz % BRICK_DIM);
+        if (b.occupancy & (1u64 << vi)) == 0 {
+            return MAT_AIR;
+        }
+        b.materials[vi as usize]
     }
 }
 
