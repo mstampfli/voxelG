@@ -68,18 +68,25 @@ Shading and effects:
 ## Architecture
 
 ```
-src/main.rs            event loop, input, click-to-raycast pipeline, server main loop
+src/main.rs            thin entry point (dispatches to app / server)
+src/lib.rs             crate root / module wiring
+src/app.rs             event loop, input, click-to-raycast pipeline
+src/server.rs          dedicated server loop
 src/renderer.rs        wgpu setup; beam -> raymarch -> blit passes, palette, buffers
 src/voxel.rs           brick/tile/chunk storage, noise terrain, biomes, streaming,
                        uniform-brick/tile compaction, edit log
-src/physics.rs         sand / 8-level water / smoke cellular automata
+src/world_dims.rs      world dimension constants (also emits shaders/world_consts.wgsl)
+src/physics.rs         sand / 8-level water / smoke cellular automata (CPU)
 src/temporal.rs        dirty-brick -> screen-tile projection for partial re-render
 src/raycast.rs         CPU DDA for block picking (destroy/place)
 src/net.rs             TCP client + server over lock-free channels
 src/camera.rs          fly camera
 shaders/beam.wgsl      1/8-resolution first-hit depth pre-pass
 shaders/raymarch.wgsl  primary tracer and all shading (~2000 lines)
+shaders/taa.wgsl       temporal anti-aliasing resolve
+shaders/physics.wgsl   GPU compute port of the cellular-automaton physics (in progress; see docs/gpu-physics-design.md)
 shaders/blit.wgsl      fullscreen-triangle present + crosshair
+shaders/world_consts.wgsl  generated dimension constants (from src/world_dims.rs)
 ```
 
 ## Building and running
