@@ -74,9 +74,7 @@ fn sand_gravity_pass(world: &mut World) {
     active.sort_by_key(|&bi| (bi / WORLD_BRICKS_X) % WORLD_BRICKS_Y);
     for &bi in &active {
         if world.movable_mask[bi as usize] == 0 { continue; }
-        let bx = bi % WORLD_BRICKS_X;
-        let by = (bi / WORLD_BRICKS_X) % WORLD_BRICKS_Y;
-        let bz = bi / (WORLD_BRICKS_X * WORLD_BRICKS_Y);
+        let (bx, by, bz) = brick_coords(bi);
         step_brick_sand_fall(world, bx, by, bz);
     }
     world.phys_scratch = active;
@@ -96,9 +94,7 @@ fn settle_sand(world: &mut World, touched: &mut Vec<u32>) {
             if visited.contains(&bi) { continue; }
             visited.push(bi);
             if world.movable_mask[bi as usize] == 0 { continue; }
-            let bx = bi % WORLD_BRICKS_X;
-            let by = (bi / WORLD_BRICKS_X) % WORLD_BRICKS_Y;
-            let bz = bi / (WORLD_BRICKS_X * WORLD_BRICKS_Y);
+            let (bx, by, bz) = brick_coords(bi);
             step_brick_sand_fall(world, bx, by, bz);
             if by > 0 { touched.push(brick_idx(bx, by - 1, bz)); }
         }
@@ -173,9 +169,7 @@ fn step_brick_sand_fall(world: &mut World, bx: u32, by: u32, bz: u32) {
     for k in 0..count { b2.materials[(moves[k] + 48) as usize] = MAT_SAND; }
     world.movable_mask[below_bi as usize] |= cross << 48;
     if !was_movable {
-        if let Err(pos) = world.active_bricks.binary_search(&below_bi) {
-            world.active_bricks.insert(pos, below_bi);
-        }
+        world.mark_active(below_bi);
     }
     if cur_now_empty && cur_occ != 0 { world.refresh_masks_for_brick(bx, by, bz); }
     if was_empty { world.refresh_masks_for_brick(bx, by - 1, bz); }
@@ -202,9 +196,7 @@ fn step_brick_water(world: &mut World, bi: u32, touched: &mut Vec<u32>) {
     // SURFACE per tick and gains one at the cave's TOP. Every cell along the
     // column stays full at L8 — no dangling L1 sliver mid-fall.
     // ----------------------------------------------------------------
-    let bx = bi % WORLD_BRICKS_X;
-    let by = (bi / WORLD_BRICKS_X) % WORLD_BRICKS_Y;
-    let bz = bi / (WORLD_BRICKS_X * WORLD_BRICKS_Y);
+    let (bx, by, bz) = brick_coords(bi);
     let snap_occ = world.bricks[bi as usize].occupancy;
     let snap_mats: [u8; 64] = world.bricks[bi as usize].materials;
     let snap_movable = world.movable_mask[bi as usize];
@@ -468,9 +460,7 @@ fn step_brick_water(world: &mut World, bi: u32, touched: &mut Vec<u32>) {
 // ---------------- smoke (rises, dissipates) ----------------
 
 fn step_brick_smoke(world: &mut World, bi: u32, frame: u64, touched: &mut Vec<u32>) {
-    let bx = bi % WORLD_BRICKS_X;
-    let by = (bi / WORLD_BRICKS_X) % WORLD_BRICKS_Y;
-    let bz = bi / (WORLD_BRICKS_X * WORLD_BRICKS_Y);
+    let (bx, by, bz) = brick_coords(bi);
 
     let snap_occ = world.bricks[bi as usize].occupancy;
     let mut new_occ = snap_occ;
@@ -536,9 +526,7 @@ fn step_brick_smoke(world: &mut World, bi: u32, frame: u64, touched: &mut Vec<u3
                 }
                 world.movable_mask[up_bi as usize] |= up_bit;
                 if !nb_was_movable {
-                    if let Err(pos) = world.active_bricks.binary_search(&up_bi) {
-                        world.active_bricks.insert(pos, up_bi);
-                    }
+                    world.mark_active(up_bi);
                 }
                 if nb_was_empty {
                     world.refresh_masks_for_brick(bx, by + 1, bz);
@@ -624,15 +612,11 @@ fn cross_apply_water(
         world.movable_mask[nb_bi as usize] |= nb_bit;
     }
     if !nb_was_movable && new_level > 0 {
-        if let Err(pos) = world.active_bricks.binary_search(&nb_bi) {
-            world.active_bricks.insert(pos, nb_bi);
-        }
+        world.mark_active(nb_bi);
     }
     let nb_now_empty = world.bricks[nb_bi as usize].occupancy == 0;
     if nb_was_empty != nb_now_empty {
-        let nbx = nb_bi % WORLD_BRICKS_X;
-        let nby = (nb_bi / WORLD_BRICKS_X) % WORLD_BRICKS_Y;
-        let nbz = nb_bi / (WORLD_BRICKS_X * WORLD_BRICKS_Y);
+        let (nbx, nby, nbz) = brick_coords(nb_bi);
         world.refresh_masks_for_brick(nbx, nby, nbz);
     }
     world.mark_brick_dirty(nb_bi);

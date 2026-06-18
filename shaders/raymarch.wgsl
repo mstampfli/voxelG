@@ -9,40 +9,11 @@
 // hierarchy, each "is this neighbour solid?" lookup is ~3 u32 fetches max
 // (chunk → tile → brick) and most return false at L3/L2 immediately.
 
-struct Camera {
-    origin: vec3<f32>,
-    _pad0: f32,
-    forward: vec3<f32>,
-    _pad1: f32,
-    right: vec3<f32>,
-    _pad2: f32,
-    up: vec3<f32>,
-    tan_half_fov: f32,
-    resolution: vec2<f32>,
-    time: f32,
-    _pad3: f32,
-    world_origin: vec3<i32>,
-    _pad4: i32,
-    jitter: vec2<f32>,
-    taa_blend: f32,
-    reproject_lighting: f32,
-    prev_origin: vec3<f32>,
-    _pad6: f32,
-    prev_forward: vec3<f32>,
-    _pad7: f32,
-    prev_right: vec3<f32>,
-    _pad8: f32,
-    prev_up: vec3<f32>,
-    _pad9: f32,
-};
+// Camera uniform layout is defined in shaders/common.wgsl (shared prelude).
 
 // Toroidal storage: world voxel coords get folded into [0, WORLD_VOXELS_*)
 // for the lookup. As the camera shifts the origin, only the small edge
 // region's slots get reused — the rest of storage stays put.
-fn pos_mod(a: i32, b: i32) -> i32 {
-    let r = a % b;
-    return select(r, r + b, r < 0);
-}
 fn world_to_slot_voxel(wv: vec3<i32>) -> vec3<i32> {
     return vec3<i32>(
         pos_mod(wv.x, WORLD_VOXELS_X),
@@ -323,11 +294,6 @@ struct Hit {
     last_axis: i32,
     t_hit: f32,
 };
-
-fn safe_inv(x: f32) -> f32 {
-    if (abs(x) < 1e-8) { return 1e30; }
-    return 1.0 / x;
-}
 
 // IGN (interleaved gradient noise) — high-quality low-discrepancy per-pixel
 // hash. Used for shadow PCF jitter so adjacent pixels get well-distributed
@@ -1256,21 +1222,20 @@ fn ambient_color() -> vec3<f32> {
 //   ∂h_i/∂z = -A_i · k_i · D_i.z · sin(...)
 //
 // Then normal = normalize(vec3(-Σ∂h/∂x, 1, -Σ∂h/∂z)).
-fn water_normal(p: vec3<f32>, t: f32) -> vec3<f32> {
-    // (dir.x, dir.z, k=2π/λ, A, ω-multiplier, phase)
-    let w1: array<f32, 6> = array<f32, 6>(  1.00,  0.20, 0.60, 0.16, 1.10, 0.0);
-    let w2: array<f32, 6> = array<f32, 6>( -0.55,  0.85, 0.95, 0.10, 1.40, 1.7);
-    let w3: array<f32, 6> = array<f32, 6>(  0.30, -0.95, 1.50, 0.05, 1.90, 3.1);
-    let w4: array<f32, 6> = array<f32, 6>( -0.90, -0.30, 2.40, 0.03, 2.60, 5.2);
+// The 4-wave Gerstner table: (dir.x, dir.z, k=2π/λ, A, ω-multiplier, phase).
+// Shared by water_normal and water_height so they always model the same ocean.
+fn wave_param(i: i32) -> array<f32, 6> {
+    if      (i == 0) { return array<f32, 6>(  1.00,  0.20, 0.60, 0.16, 1.10, 0.0); }
+    else if (i == 1) { return array<f32, 6>( -0.55,  0.85, 0.95, 0.10, 1.40, 1.7); }
+    else if (i == 2) { return array<f32, 6>(  0.30, -0.95, 1.50, 0.05, 1.90, 3.1); }
+    else             { return array<f32, 6>( -0.90, -0.30, 2.40, 0.03, 2.60, 5.2); }
+}
 
+fn water_normal(p: vec3<f32>, t: f32) -> vec3<f32> {
     var dx = 0.0;
     var dz = 0.0;
     for (var i: i32 = 0; i < 4; i = i + 1) {
-        var w: array<f32, 6>;
-        if      (i == 0) { w = w1; }
-        else if (i == 1) { w = w2; }
-        else if (i == 2) { w = w3; }
-        else             { w = w4; }
+        let w = wave_param(i);
         let dirx = w[0];
         let dirz = w[1];
         let k = w[2];
@@ -1287,21 +1252,42 @@ fn water_normal(p: vec3<f32>, t: f32) -> vec3<f32> {
 
 // Vertical height field — used for foam thresholding and caustics.
 fn water_height(p: vec3<f32>, t: f32) -> f32 {
-    let w1: array<f32, 6> = array<f32, 6>(  1.00,  0.20, 0.60, 0.16, 1.10, 0.0);
-    let w2: array<f32, 6> = array<f32, 6>( -0.55,  0.85, 0.95, 0.10, 1.40, 1.7);
-    let w3: array<f32, 6> = array<f32, 6>(  0.30, -0.95, 1.50, 0.05, 1.90, 3.1);
-    let w4: array<f32, 6> = array<f32, 6>( -0.90, -0.30, 2.40, 0.03, 2.60, 5.2);
     var h = 0.0;
     for (var i: i32 = 0; i < 4; i = i + 1) {
-        var w: array<f32, 6>;
-        if      (i == 0) { w = w1; }
-        else if (i == 1) { w = w2; }
-        else if (i == 2) { w = w3; }
-        else             { w = w4; }
+        let w = wave_param(i);
         let phase = (p.x * w[0] + p.z * w[1]) * w[2] - t * w[4] + w[5];
         h = h + w[3] * cos(phase);
     }
     return h;
+}
+
+// Face normal + entry distance for the cell a ray just stepped into. `last_axis`
+// is the axis whose plane we crossed (0/1/2); -1 means we began inside the cell,
+// so fall back to the dominant entry plane from `tmin3`. Extracted so every LOD
+// branch in the tracers computes the hit face the exact same way.
+struct EntryNormal { n: vec3<f32>, t_hit: f32 };
+
+fn entry_normal_and_t(
+    last_axis: i32,
+    step: vec3<i32>,
+    t_max: vec3<f32>,
+    t_delta: vec3<f32>,
+    t_enter: f32,
+    tmin3: vec3<f32>,
+) -> EntryNormal {
+    var r: EntryNormal;
+    r.n = vec3<f32>(0.0);
+    r.t_hit = 0.0;
+    if (last_axis == 0)      { r.n.x = -f32(step.x); r.t_hit = t_max.x - t_delta.x; }
+    else if (last_axis == 1) { r.n.y = -f32(step.y); r.t_hit = t_max.y - t_delta.y; }
+    else if (last_axis == 2) { r.n.z = -f32(step.z); r.t_hit = t_max.z - t_delta.z; }
+    else {
+        r.t_hit = t_enter;
+        if      (tmin3.x >= tmin3.y && tmin3.x >= tmin3.z) { r.n.x = -f32(step.x); }
+        else if (tmin3.y >= tmin3.z)                       { r.n.y = -f32(step.y); }
+        else                                               { r.n.z = -f32(step.z); }
+    }
+    return r;
 }
 
 // Variant of `trace` that treats every water voxel as empty. Used to find
@@ -1385,12 +1371,9 @@ fn trace_no_water(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
         if (brick_voxel_solid(bi, vi)) {
             let m = brick_voxel_material(bi, vi);
             if (!is_transparent_mat(m)) {
-                var n = vec3<f32>(0.0);
-                var t_hit: f32;
-                if (last_axis == 0) { n.x = -f32(step.x); t_hit = t_max.x - t_delta.x; }
-                else if (last_axis == 1) { n.y = -f32(step.y); t_hit = t_max.y - t_delta.y; }
-                else if (last_axis == 2) { n.z = -f32(step.z); t_hit = t_max.z - t_delta.z; }
-                else { t_hit = t_enter; if (tmin3.x >= tmin3.y && tmin3.x >= tmin3.z) { n.x = -f32(step.x); } else if (tmin3.y >= tmin3.z) { n.y = -f32(step.y); } else { n.z = -f32(step.z); } }
+                let en = entry_normal_and_t(last_axis, step, t_max, t_delta, t_enter, tmin3);
+                let n = en.n;
+                let t_hit = en.t_hit;
                 out.hit = true;
                 out.mat = m;
                 out.normal = n;
@@ -2119,17 +2102,9 @@ fn trace(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
         if (t_cur > TILE_LOD_T) {
             let lm = tile_representative_material(ti, tp);
             if (lm != 0u && is_uniform_optimisable(lm)) {
-                var n = vec3<f32>(0.0);
-                var t_hit: f32;
-                if (last_axis == 0)      { n.x = -f32(step.x); t_hit = t_max.x - t_delta.x; }
-                else if (last_axis == 1) { n.y = -f32(step.y); t_hit = t_max.y - t_delta.y; }
-                else if (last_axis == 2) { n.z = -f32(step.z); t_hit = t_max.z - t_delta.z; }
-                else {
-                    t_hit = t_enter;
-                    if      (tmin3.x >= tmin3.y && tmin3.x >= tmin3.z) { n.x = -f32(step.x); }
-                    else if (tmin3.y >= tmin3.z)                       { n.y = -f32(step.y); }
-                    else                                               { n.z = -f32(step.z); }
-                }
+                let en = entry_normal_and_t(last_axis, step, t_max, t_delta, t_enter, tmin3);
+                let n = en.n;
+                let t_hit = en.t_hit;
                 out.hit = true;
                 out.mat = lm;
                 out.normal = n;
@@ -2144,17 +2119,9 @@ fn trace(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
         // Whole 4096-voxel tile is one opaque material — surface at entry face.
         let tum = tile_uniform_mat(ti);
         if (tum != 0u && is_uniform_optimisable(tum)) {
-            var n = vec3<f32>(0.0);
-            var t_hit: f32;
-            if (last_axis == 0)      { n.x = -f32(step.x); t_hit = t_max.x - t_delta.x; }
-            else if (last_axis == 1) { n.y = -f32(step.y); t_hit = t_max.y - t_delta.y; }
-            else if (last_axis == 2) { n.z = -f32(step.z); t_hit = t_max.z - t_delta.z; }
-            else {
-                t_hit = t_enter;
-                if      (tmin3.x >= tmin3.y && tmin3.x >= tmin3.z) { n.x = -f32(step.x); }
-                else if (tmin3.y >= tmin3.z)                       { n.y = -f32(step.y); }
-                else                                               { n.z = -f32(step.z); }
-            }
+            let en = entry_normal_and_t(last_axis, step, t_max, t_delta, t_enter, tmin3);
+            let n = en.n;
+            let t_hit = en.t_hit;
             out.hit = true;
             out.mat = tum;
             out.normal = n;
@@ -2176,17 +2143,9 @@ fn trace(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
         // ---- Fast-skip: uniform 4-voxel brick (one material throughout) ----
         let bum = brick_uniform_mat(bi);
         if (bum != 0u && is_uniform_optimisable(bum)) {
-            var n = vec3<f32>(0.0);
-            var t_hit: f32;
-            if (last_axis == 0)      { n.x = -f32(step.x); t_hit = t_max.x - t_delta.x; }
-            else if (last_axis == 1) { n.y = -f32(step.y); t_hit = t_max.y - t_delta.y; }
-            else if (last_axis == 2) { n.z = -f32(step.z); t_hit = t_max.z - t_delta.z; }
-            else {
-                t_hit = t_enter;
-                if      (tmin3.x >= tmin3.y && tmin3.x >= tmin3.z) { n.x = -f32(step.x); }
-                else if (tmin3.y >= tmin3.z)                       { n.y = -f32(step.y); }
-                else                                               { n.z = -f32(step.z); }
-            }
+            let en = entry_normal_and_t(last_axis, step, t_max, t_delta, t_enter, tmin3);
+            let n = en.n;
+            let t_hit = en.t_hit;
             out.hit = true;
             out.mat = bum;
             out.normal = n;
@@ -2213,17 +2172,9 @@ fn trace(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
             // is foliage (a flower/grass/leaf cube would look wrong); in that
             // case fall through to the per-voxel descent below.
             if (!is_foliage_mat(m)) {
-                var n = vec3<f32>(0.0);
-                var t_hit: f32;
-                if (last_axis == 0)      { n.x = -f32(step.x); t_hit = t_max.x - t_delta.x; }
-                else if (last_axis == 1) { n.y = -f32(step.y); t_hit = t_max.y - t_delta.y; }
-                else if (last_axis == 2) { n.z = -f32(step.z); t_hit = t_max.z - t_delta.z; }
-                else {
-                    t_hit = t_enter;
-                    if      (tmin3.x >= tmin3.y && tmin3.x >= tmin3.z) { n.x = -f32(step.x); }
-                    else if (tmin3.y >= tmin3.z)                      { n.y = -f32(step.y); }
-                    else                                              { n.z = -f32(step.z); }
-                }
+                let en = entry_normal_and_t(last_axis, step, t_max, t_delta, t_enter, tmin3);
+                let n = en.n;
+                let t_hit = en.t_hit;
                 out.hit = true;
                 out.mat = m;
                 out.normal = n;
@@ -2258,23 +2209,9 @@ fn trace(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
             } else if (is_decoration_mat(m)) {
                 // Far decoration → invisible; fall through to the DDA step.
             } else {
-                var n = vec3<f32>(0.0);
-                var t_hit: f32;
-                if (last_axis == 0) {
-                    n.x = -f32(step.x);
-                    t_hit = t_max.x - t_delta.x;
-                } else if (last_axis == 1) {
-                    n.y = -f32(step.y);
-                    t_hit = t_max.y - t_delta.y;
-                } else if (last_axis == 2) {
-                    n.z = -f32(step.z);
-                    t_hit = t_max.z - t_delta.z;
-                } else {
-                    t_hit = t_enter;
-                    if      (tmin3.x >= tmin3.y && tmin3.x >= tmin3.z) { n.x = -f32(step.x); }
-                    else if (tmin3.y >= tmin3.z)                      { n.y = -f32(step.y); }
-                    else                                              { n.z = -f32(step.z); }
-                }
+                let en = entry_normal_and_t(last_axis, step, t_max, t_delta, t_enter, tmin3);
+                let n = en.n;
+                let t_hit = en.t_hit;
                 out.hit = true;
                 out.mat = m;
                 out.normal = n;

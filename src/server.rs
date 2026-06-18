@@ -20,6 +20,19 @@ pub fn run_server(port: u16) -> ! {
 
     const INTEREST_R: f32 = 600.0;
     const INTEREST_R2: f32 = INTEREST_R * INTEREST_R;
+    // Distance interest test: keep a recipient if their pose is unknown, or they
+    // are within INTEREST_R of (ox, oz). Shared by the pose/edit/explode fan-out.
+    let in_range = |states: &std::collections::HashMap<net::PlayerId, ([f32; 3], f32, f32)>,
+                    ox: f32,
+                    oz: f32,
+                    other: net::PlayerId|
+     -> bool {
+        states.get(&other).map_or(true, |s| {
+            let dx = s.0[0] - ox;
+            let dz = s.0[2] - oz;
+            (dx * dx + dz * dz) < INTEREST_R2
+        })
+    };
     log::info!("server: ready");
     loop {
         let (joined, msgs, timed_out) = server.poll();
@@ -52,11 +65,7 @@ pub fn run_server(port: u16) -> ! {
                     let states = player_states.clone();
                     // Pose fan-out over UDP with distance interest management.
                     server.broadcast_pose_filter(sender, pos, yaw, pitch, |other_id| {
-                        states.get(&other_id).map_or(true, |s| {
-                            let dx = s.0[0] - pos[0];
-                            let dz = s.0[2] - pos[2];
-                            (dx * dx + dz * dz) < INTEREST_R2
-                        })
+                        in_range(&states, pos[0], pos[2], other_id)
                     });
                 }
                 net::Message::VoxelEdit { wx, wy, wz, mat, .. } => {
@@ -66,11 +75,7 @@ pub fn run_server(port: u16) -> ! {
                     edit_log.push(edit.clone());
                     let states = player_states.clone();
                     server.broadcast_filter(&edit, |other_id| {
-                        states.get(&other_id).map_or(true, |s| {
-                            let dx = s.0[0] - wx as f32;
-                            let dz = s.0[2] - wz as f32;
-                            (dx * dx + dz * dz) < INTEREST_R2
-                        })
+                        in_range(&states, wx as f32, wz as f32, other_id)
                     });
                 }
                 net::Message::Explode { cx, cy, cz, radius, mat, .. } => {
@@ -80,11 +85,7 @@ pub fn run_server(port: u16) -> ! {
                     edit_log.push(edit.clone());
                     let states = player_states.clone();
                     server.broadcast_filter(&edit, |other_id| {
-                        states.get(&other_id).map_or(true, |s| {
-                            let dx = s.0[0] - cx as f32;
-                            let dz = s.0[2] - cz as f32;
-                            (dx * dx + dz * dz) < INTEREST_R2
-                        })
+                        in_range(&states, cx as f32, cz as f32, other_id)
                     });
                 }
                 net::Message::PlayerLeave { id } => {

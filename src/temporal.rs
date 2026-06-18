@@ -23,9 +23,7 @@ pub fn project_brick_to_tiles(
     tiles_h: u32,
     mask: &mut [u32],
 ) {
-    let bx = bi % WORLD_BRICKS_X;
-    let by = (bi / WORLD_BRICKS_X) % WORLD_BRICKS_Y;
-    let bz = bi / (WORLD_BRICKS_X * WORLD_BRICKS_Y);
+    let (bx, by, bz) = brick_coords(bi);
 
     let slot_cx = bx / STORAGE_CHUNK_BRICKS;
     let slot_cy = by / STORAGE_CHUNK_BRICKS;

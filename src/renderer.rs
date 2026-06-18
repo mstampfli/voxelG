@@ -9,6 +9,11 @@ use winit::window::Window;
 /// single source of truth.
 const WORLD_CONSTS_WGSL: &str = include_str!(concat!(env!("OUT_DIR"), "/world_consts.wgsl"));
 
+/// Shared render-shader prelude (Camera uniform + tiny helpers). Prepended
+/// after the world consts to raymarch/beam/taa so those three carry one
+/// definition instead of a hand-maintained copy each. NOT used by physics/blit.
+const COMMON_WGSL: &str = include_str!("../shaders/common.wgsl");
+
 /// Pack a Vec<u8> into Vec<u32> for storage-buffer upload (WGSL storage
 /// buffers can't directly index u8 arrays; reading byte b of word w via
 /// `(packed[w] >> ((b & 3) * 8)) & 0xFF` is the canonical pattern).
@@ -410,8 +415,9 @@ impl Renderer {
             push_constant_ranges: &[],
         });
         let raymarch_src = format!(
-            "{}\n{}",
+            "{}\n{}\n{}",
             WORLD_CONSTS_WGSL,
+            COMMON_WGSL,
             include_str!("../shaders/raymarch.wgsl")
         );
         let compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -516,8 +522,9 @@ impl Renderer {
             push_constant_ranges: &[],
         });
         let beam_src = format!(
-            "{}\n{}",
+            "{}\n{}\n{}",
             WORLD_CONSTS_WGSL,
+            COMMON_WGSL,
             include_str!("../shaders/beam.wgsl")
         );
         let beam_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -601,7 +608,7 @@ impl Renderer {
             bind_group_layouts: &[&taa_bgl],
             push_constant_ranges: &[],
         });
-        let taa_src = format!("{}\n{}", WORLD_CONSTS_WGSL, include_str!("../shaders/taa.wgsl"));
+        let taa_src = format!("{}\n{}\n{}", WORLD_CONSTS_WGSL, COMMON_WGSL, include_str!("../shaders/taa.wgsl"));
         let taa_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("taa shader"),
             source: wgpu::ShaderSource::Wgsl(taa_src.into()),
@@ -1504,7 +1511,7 @@ mod shader_tests {
     //! validated at runtime when the pipelines are created. The const-prepending
     //! mirrors exactly what `Renderer::new` does, so the validated source is the
     //! source that actually runs.
-    use super::WORLD_CONSTS_WGSL;
+    use super::{WORLD_CONSTS_WGSL, COMMON_WGSL};
 
     fn validate(name: &str, src: &str) {
         let module = naga::front::wgsl::parse_str(src)
@@ -1519,13 +1526,13 @@ mod shader_tests {
 
     #[test]
     fn raymarch_wgsl_valid() {
-        let src = format!("{}\n{}", WORLD_CONSTS_WGSL, include_str!("../shaders/raymarch.wgsl"));
+        let src = format!("{}\n{}\n{}", WORLD_CONSTS_WGSL, COMMON_WGSL, include_str!("../shaders/raymarch.wgsl"));
         validate("raymarch.wgsl", &src);
     }
 
     #[test]
     fn beam_wgsl_valid() {
-        let src = format!("{}\n{}", WORLD_CONSTS_WGSL, include_str!("../shaders/beam.wgsl"));
+        let src = format!("{}\n{}\n{}", WORLD_CONSTS_WGSL, COMMON_WGSL, include_str!("../shaders/beam.wgsl"));
         validate("beam.wgsl", &src);
     }
 
@@ -1536,7 +1543,7 @@ mod shader_tests {
 
     #[test]
     fn taa_wgsl_valid() {
-        let src = format!("{}\n{}", WORLD_CONSTS_WGSL, include_str!("../shaders/taa.wgsl"));
+        let src = format!("{}\n{}\n{}", WORLD_CONSTS_WGSL, COMMON_WGSL, include_str!("../shaders/taa.wgsl"));
         validate("taa.wgsl", &src);
     }
 
@@ -1672,7 +1679,7 @@ mod gpu_render_tests {
             bind_group_layouts: &[&bgl],
             push_constant_ranges: &[],
         });
-        let src = format!("{}\n{}", WORLD_CONSTS_WGSL, include_str!("../shaders/raymarch.wgsl"));
+        let src = format!("{}\n{}\n{}", WORLD_CONSTS_WGSL, COMMON_WGSL, include_str!("../shaders/raymarch.wgsl"));
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("test raymarch"),
             source: wgpu::ShaderSource::Wgsl(src.into()),
@@ -1863,7 +1870,7 @@ mod gpu_render_tests {
             let bgl = create_compute_bgl(&device);
             let bg = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &ov, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &liv, &lov, &tpb);
             let pll = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[&bgl], push_constant_ranges: &[] });
-            let src = format!("{}\n{}", WORLD_CONSTS_WGSL, include_str!("../shaders/raymarch.wgsl"));
+            let src = format!("{}\n{}\n{}", WORLD_CONSTS_WGSL, COMMON_WGSL, include_str!("../shaders/raymarch.wgsl"));
             let m = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(src.into()) });
             let pipe = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: None, layout: Some(&pll), module: &m, entry_point: Some("cs_main"), compilation_options: Default::default(), cache: None });
             // Warm up.

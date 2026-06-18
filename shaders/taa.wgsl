@@ -7,32 +7,7 @@
 // shimmering). On motion the host sets taa_blend = 0, so the current frame
 // passes through unchanged (sharp, no smearing).
 
-struct Camera {
-    origin: vec3<f32>,
-    _pad0: f32,
-    forward: vec3<f32>,
-    _pad1: f32,
-    right: vec3<f32>,
-    _pad2: f32,
-    up: vec3<f32>,
-    tan_half_fov: f32,
-    resolution: vec2<f32>,
-    time: f32,
-    _pad3: f32,
-    world_origin: vec3<i32>,
-    _pad4: i32,
-    jitter: vec2<f32>,
-    taa_blend: f32,
-    reproject_lighting: f32,
-    prev_origin: vec3<f32>,
-    _pad6: f32,
-    prev_forward: vec3<f32>,
-    _pad7: f32,
-    prev_right: vec3<f32>,
-    _pad8: f32,
-    prev_up: vec3<f32>,
-    _pad9: f32,
-};
+// Camera uniform layout is defined in shaders/common.wgsl (shared prelude).
 
 @group(0) @binding(0) var<uniform> camera: Camera;
 @group(0) @binding(1) var current_tex: texture_2d<f32>;

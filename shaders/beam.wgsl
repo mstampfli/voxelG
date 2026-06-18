@@ -6,29 +6,7 @@
 // per-pixel and skips the ray forward to that t — eliminating the cost of
 // crawling through empty sky/underground from the camera.
 
-struct Camera {
-    origin: vec3<f32>,
-    _pad0: f32,
-    forward: vec3<f32>,
-    _pad1: f32,
-    right: vec3<f32>,
-    _pad2: f32,
-    up: vec3<f32>,
-    tan_half_fov: f32,
-    resolution: vec2<f32>,
-    time: f32,
-    _pad3: f32,
-    world_origin: vec3<i32>,
-    _pad4: i32,
-    jitter: vec2<f32>,
-    taa_blend: f32,
-    _pad5: f32,
-};
-
-fn pos_mod(a: i32, b: i32) -> i32 {
-    let r = a % b;
-    return select(r, r + b, r < 0);
-}
+// Camera uniform layout is defined in shaders/common.wgsl (shared prelude).
 
 @group(0) @binding(0) var<uniform> camera: Camera;
 @group(0) @binding(1) var<storage, read> chunk_mask: array<u32>;
@@ -47,11 +25,6 @@ fn chunk_has_child(ci: i32, child_lin: i32) -> bool {
         return (chunk_mask[base] & (1u << u32(child_lin))) != 0u;
     }
     return (chunk_mask[base + 1] & (1u << u32(child_lin - 32))) != 0u;
-}
-
-fn safe_inv(x: f32) -> f32 {
-    if (abs(x) < 1e-8) { return 1e30; }
-    return 1.0 / x;
 }
 
 @compute @workgroup_size(8, 8, 1)

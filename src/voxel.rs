@@ -49,19 +49,8 @@ impl SlotData {
         let mut movable = vec![0u64; n];
         let mut brick_uniform = vec![0u8; n];
         for (i, b) in bricks.iter().enumerate() {
-            // movable bits
-            let mut m = 0u64;
-            for v in 0..64usize {
-                m |= (is_movable_mat(b.materials[v]) as u64) << v;
-            }
-            movable[i] = m & b.occupancy;
-            // uniform: fully solid and one material throughout
-            if b.occupancy == !0u64 {
-                let m0 = b.materials[0];
-                if m0 != 0 && b.materials.iter().all(|&x| x == m0) {
-                    brick_uniform[i] = m0;
-                }
-            }
+            movable[i] = brick_movable_mask(b);
+            brick_uniform[i] = brick_uniform_of(b);
         }
         // tile uniform for the chunk's 2x2x2 tiles (each 4x4x4 child bricks).
         let mut tile_uniform = [0u8; 8];
@@ -185,6 +174,16 @@ pub const fn brick_idx(bx: u32, by: u32, bz: u32) -> u32 {
     bx + by * WORLD_BRICKS_X + bz * WORLD_BRICKS_X * WORLD_BRICKS_Y
 }
 
+/// Inverse of [`brick_idx`]: linear brick index → (bx, by, bz). Kept next to
+/// the forward fn so the two can't drift.
+#[inline(always)]
+pub const fn brick_coords(bi: u32) -> (u32, u32, u32) {
+    let bx = bi % WORLD_BRICKS_X;
+    let by = (bi / WORLD_BRICKS_X) % WORLD_BRICKS_Y;
+    let bz = bi / (WORLD_BRICKS_X * WORLD_BRICKS_Y);
+    (bx, by, bz)
+}
+
 #[inline(always)]
 pub const fn tile_idx(tx: u32, ty: u32, tz: u32) -> u32 {
     tx + ty * WORLD_TILES_X + tz * WORLD_TILES_X * WORLD_TILES_Y
@@ -193,6 +192,61 @@ pub const fn tile_idx(tx: u32, ty: u32, tz: u32) -> u32 {
 #[inline(always)]
 pub const fn chunk_idx(cx: u32, cy: u32, cz: u32) -> u32 {
     cx + cy * WORLD_CHUNKS_X + cz * WORLD_CHUNKS_X * WORLD_CHUNKS_Y
+}
+
+/// Movable-voxel mask for a brick: bit i set iff voxel i is occupied AND its
+/// material is movable. Single source for every movable_mask rebuild.
+#[inline]
+pub fn brick_movable_mask(b: &Brick) -> u64 {
+    let mut m = 0u64;
+    for i in 0..64usize {
+        m |= (is_movable_mat(b.materials[i]) as u64) << i;
+    }
+    m & b.occupancy
+}
+
+/// A brick is uniform iff fully solid and every voxel shares one nonzero
+/// material; returns that material (0 = not uniform).
+#[inline]
+pub fn brick_uniform_of(b: &Brick) -> u8 {
+    if b.occupancy != !0u64 {
+        return 0;
+    }
+    let m0 = b.materials[0];
+    if m0 == 0 {
+        return 0;
+    }
+    for i in 1..(BRICK_VOXELS as usize) {
+        if b.materials[i] != m0 {
+            return 0;
+        }
+    }
+    m0
+}
+
+/// A tile is uniform iff all 64 child bricks are uniform with the same
+/// material. `brick_uniform` is the world's per-brick uniform array; `ti` the
+/// linear tile index. Returns that material (0 = not uniform).
+#[inline]
+pub fn tile_uniform_of(brick_uniform: &[u8], ti: u32) -> u8 {
+    let tx = ti % WORLD_TILES_X;
+    let ty = (ti / WORLD_TILES_X) % WORLD_TILES_Y;
+    let tz = ti / (WORLD_TILES_X * WORLD_TILES_Y);
+    let (bx0, by0, bz0) = (tx * 4, ty * 4, tz * 4);
+    let m0 = brick_uniform[brick_idx(bx0, by0, bz0) as usize];
+    if m0 == 0 {
+        return 0;
+    }
+    for dz in 0..4 {
+        for dy in 0..4 {
+            for dx in 0..4 {
+                if brick_uniform[brick_idx(bx0 + dx, by0 + dy, bz0 + dz) as usize] != m0 {
+                    return 0;
+                }
+            }
+        }
+    }
+    m0
 }
 
 #[inline(always)]
@@ -623,19 +677,7 @@ impl World {
                     let bi = brick_idx(bx, by, bz);
                     self.bricks[bi as usize] = data.bricks[idx];
                     self.brick_uniform[bi as usize] = data.brick_uniform[idx];
-                    let new_movable = data.movable[idx];
-                    let was_movable = self.movable_mask[bi as usize] != 0;
-                    self.movable_mask[bi as usize] = new_movable;
-                    let is_movable = new_movable != 0;
-                    if was_movable != is_movable {
-                        if is_movable {
-                            if let Err(pos) = self.active_bricks.binary_search(&bi) {
-                                self.active_bricks.insert(pos, bi);
-                            }
-                        } else if let Ok(pos) = self.active_bricks.binary_search(&bi) {
-                            self.active_bricks.remove(pos);
-                        }
-                    }
+                    self.set_movable(bi, data.movable[idx]);
                     self.refresh_masks_for_brick(bx, by, bz);
                     self.mark_brick_dirty(bi);
                 }
@@ -746,24 +788,8 @@ impl World {
                     let by = local_y0 / BRICK_DIM + dy;
                     let bz = local_z0 / BRICK_DIM + dz;
                     let bi = brick_idx(bx, by, bz);
-                    let b = &self.bricks[bi as usize];
-                    let mut m = 0u64;
-                    for i in 0..64usize {
-                        m |= (is_movable_mat(b.materials[i]) as u64) << i;
-                    }
-                    let new_movable = m & b.occupancy;
-                    let was_movable = self.movable_mask[bi as usize] != 0;
-                    self.movable_mask[bi as usize] = new_movable;
-                    let is_movable = new_movable != 0;
-                    if was_movable != is_movable {
-                        if is_movable {
-                            if let Err(pos) = self.active_bricks.binary_search(&bi) {
-                                self.active_bricks.insert(pos, bi);
-                            }
-                        } else if let Ok(pos) = self.active_bricks.binary_search(&bi) {
-                            self.active_bricks.remove(pos);
-                        }
-                    }
+                    let new_movable = brick_movable_mask(&self.bricks[bi as usize]);
+                    self.set_movable(bi, new_movable);
                     self.refresh_masks_for_brick(bx, by, bz);
                     self.mark_brick_dirty(bi);
                 }
@@ -771,24 +797,43 @@ impl World {
         }
     }
 
-    pub fn recompute_movable_for_brick(&mut self, bi: u32) {
-        let b = &self.bricks[bi as usize];
-        let mut m = 0u64;
-        for i in 0..64usize {
-            let movable = is_movable_mat(b.materials[i]) as u64;
-            m |= movable << i;
+    /// Insert `bi` into the sorted `active_bricks` list if absent. Single
+    /// keeper of the "active_bricks stays sorted" invariant that the rest of
+    /// the engine relies on for `binary_search`.
+    #[inline]
+    pub fn mark_active(&mut self, bi: u32) {
+        if let Err(pos) = self.active_bricks.binary_search(&bi) {
+            self.active_bricks.insert(pos, bi);
         }
+    }
+
+    /// Remove `bi` from the sorted `active_bricks` list if present.
+    #[inline]
+    pub fn unmark_active(&mut self, bi: u32) {
+        if let Ok(pos) = self.active_bricks.binary_search(&bi) {
+            self.active_bricks.remove(pos);
+        }
+    }
+
+    /// Set `movable_mask[bi]` and keep `active_bricks` in sync with the
+    /// empty↔movable transition.
+    #[inline]
+    pub fn set_movable(&mut self, bi: u32, new_movable: u64) {
         let was_movable = self.movable_mask[bi as usize] != 0;
-        let new_mask = m & b.occupancy;
-        self.movable_mask[bi as usize] = new_mask;
-        let is_movable = new_mask != 0;
+        self.movable_mask[bi as usize] = new_movable;
+        let is_movable = new_movable != 0;
         if was_movable != is_movable {
             if is_movable {
-                self.active_bricks.push(bi);
-            } else if let Ok(pos) = self.active_bricks.binary_search(&bi) {
-                self.active_bricks.remove(pos);
+                self.mark_active(bi);
+            } else {
+                self.unmark_active(bi);
             }
         }
+    }
+
+    pub fn recompute_movable_for_brick(&mut self, bi: u32) {
+        let new_mask = brick_movable_mask(&self.bricks[bi as usize]);
+        self.set_movable(bi, new_mask);
     }
 
     pub fn rebuild_active_bricks(&mut self) {
@@ -869,53 +914,13 @@ impl World {
 
     /// Recompute brick_uniform[bi] from the brick's current contents.
     pub fn recompute_uniform_for_brick(&mut self, bi: u32) {
-        let b = &self.bricks[bi as usize];
-        // Uniform if: every voxel is occupied AND every material is identical.
-        if b.occupancy != !0u64 {
-            self.brick_uniform[bi as usize] = 0;
-            return;
-        }
-        let m0 = b.materials[0];
-        if m0 == 0 {
-            self.brick_uniform[bi as usize] = 0;
-            return;
-        }
-        for i in 1..(BRICK_VOXELS as usize) {
-            if b.materials[i] != m0 {
-                self.brick_uniform[bi as usize] = 0;
-                return;
-            }
-        }
-        self.brick_uniform[bi as usize] = m0;
+        self.brick_uniform[bi as usize] = brick_uniform_of(&self.bricks[bi as usize]);
     }
 
     /// Recompute tile_uniform[ti] from its 64 child bricks. Tile is uniform
     /// iff every child brick is uniform with the same material.
     pub fn recompute_uniform_for_tile(&mut self, ti: u32) {
-        let tx = ti % WORLD_TILES_X;
-        let ty = (ti / WORLD_TILES_X) % WORLD_TILES_Y;
-        let tz = ti / (WORLD_TILES_X * WORLD_TILES_Y);
-        let bx0 = tx * 4;
-        let by0 = ty * 4;
-        let bz0 = tz * 4;
-        let first_bi = brick_idx(bx0, by0, bz0);
-        let m0 = self.brick_uniform[first_bi as usize];
-        if m0 == 0 {
-            self.tile_uniform[ti as usize] = 0;
-            return;
-        }
-        for dz in 0..4 {
-            for dy in 0..4 {
-                for dx in 0..4 {
-                    let bi = brick_idx(bx0 + dx, by0 + dy, bz0 + dz);
-                    if self.brick_uniform[bi as usize] != m0 {
-                        self.tile_uniform[ti as usize] = 0;
-                        return;
-                    }
-                }
-            }
-        }
-        self.tile_uniform[ti as usize] = m0;
+        self.tile_uniform[ti as usize] = tile_uniform_of(&self.brick_uniform, ti);
     }
 
     /// Recompute ALL uniform flags from current brick contents. Use after
@@ -923,37 +928,13 @@ impl World {
     pub fn rebuild_all_uniform(&mut self) {
         use rayon::prelude::*;
         let bricks = &self.bricks;
-        self.brick_uniform = bricks.par_iter().map(|b| {
-            if b.occupancy != !0u64 { return 0u8; }
-            let m0 = b.materials[0];
-            if m0 == 0 { return 0u8; }
-            for i in 1..(BRICK_VOXELS as usize) {
-                if b.materials[i] != m0 { return 0u8; }
-            }
-            m0
-        }).collect();
+        self.brick_uniform = bricks.par_iter().map(brick_uniform_of).collect();
         // Tiles depend on the brick_uniform array we just computed.
         let bu = &self.brick_uniform;
-        self.tile_uniform = (0..WORLD_TILES_TOTAL as usize).into_par_iter().map(|ti| {
-            let tx = (ti as u32) % WORLD_TILES_X;
-            let ty = ((ti as u32) / WORLD_TILES_X) % WORLD_TILES_Y;
-            let tz = (ti as u32) / (WORLD_TILES_X * WORLD_TILES_Y);
-            let bx0 = tx * 4;
-            let by0 = ty * 4;
-            let bz0 = tz * 4;
-            let first_bi = brick_idx(bx0, by0, bz0);
-            let m0 = bu[first_bi as usize];
-            if m0 == 0 { return 0u8; }
-            for dz in 0..4 {
-                for dy in 0..4 {
-                    for dx in 0..4 {
-                        let bi = brick_idx(bx0 + dx, by0 + dy, bz0 + dz);
-                        if bu[bi as usize] != m0 { return 0u8; }
-                    }
-                }
-            }
-            m0
-        }).collect();
+        self.tile_uniform = (0..WORLD_TILES_TOTAL as u32)
+            .into_par_iter()
+            .map(|ti| tile_uniform_of(bu, ti))
+            .collect();
     }
 
     pub fn rebuild_all_masks(&mut self) {
@@ -1044,12 +1025,7 @@ impl World {
         self.rebuild_all_masks();
         self.rebuild_all_uniform();
         for bi in 0..WORLD_BRICKS_TOTAL {
-            let b = &self.bricks[bi as usize];
-            let mut m = 0u64;
-            for i in 0..64usize {
-                m |= (is_movable_mat(b.materials[i]) as u64) << i;
-            }
-            self.movable_mask[bi as usize] = m & b.occupancy;
+            self.movable_mask[bi as usize] = brick_movable_mask(&self.bricks[bi as usize]);
         }
         self.rebuild_active_bricks();
         self.all_dirty = true;
@@ -1264,9 +1240,12 @@ pub fn sample_terrain(wx: f32, wz: f32, seed: u64) -> TerrainSample {
     let mountain_h = fbm_2d(wpx * 0.009, wpz * 0.009, 5).max(0.0).powf(1.15)
         * mountain_amp * 110.0;
 
-    // Ravines — rare (threshold 0.97, was 0.95).
-    let ravine_n = ridge_noise_2d(wpx * 0.012, wpz * 0.012);
-    let ravine_cut = ((ravine_n - 0.97).max(0.0) * 20.0).min(1.0) * 6.0;
+    // Ravines DISABLED. They use the same ridge-noise mechanism as rivers and
+    // carve thin winding channels that dip below sea level and fill with water,
+    // reading as rivers. Cut forced to 0; uncomment the two lines to restore.
+    // let ravine_n = ridge_noise_2d(wpx * 0.012, wpz * 0.012);
+    // let ravine_cut = ((ravine_n - 0.97).max(0.0) * 20.0).min(1.0) * 6.0;
+    let ravine_cut = 0.0_f32;
 
     // Sea level raised (38 → 64) AND world ceiling doubled (192 → 256) so
     // lakes/seas have real depth and mountains still loom above with
