@@ -107,7 +107,7 @@ use crate::voxel::{
     MAT_WOOD, MAT_LEAVES, MAT_SNOW, MAT_LAVA, MAT_ICE, MAT_GLASS,
     MAT_COAL, MAT_IRON, MAT_GOLD, MAT_DIAMOND,
     MAT_WOOD_BIRCH, MAT_WOOD_PINE, MAT_LEAVES_BIRCH, MAT_LEAVES_PINE, MAT_LEAVES_AUTUMN,
-    MAT_SMOKE, MAT_FIRE, MAT_FLOWER, MAT_TALL_GRASS,
+    MAT_SMOKE, MAT_FIRE, MAT_FLOWER, MAT_TALL_GRASS, MAT_CACTUS,
 };
 
 #[repr(C)]
@@ -156,6 +156,7 @@ fn default_palette() -> [PaletteEntry; PALETTE_SIZE] {
     p[MAT_FIRE as usize]    = PaletteEntry([1.60, 0.60, 0.10, 1.0]);
     p[MAT_FLOWER as usize]      = PaletteEntry([1.10, 0.35, 0.65, 1.0]);
     p[MAT_TALL_GRASS as usize]  = PaletteEntry([0.38, 0.70, 0.25, 1.0]);
+    p[MAT_CACTUS as usize]      = PaletteEntry([0.28, 0.50, 0.30, 1.0]);
     p
 }
 

@@ -133,6 +133,7 @@ pub const MAT_SMOKE: u8 = 28;
 pub const MAT_FIRE: u8 = 29;
 pub const MAT_FLOWER: u8 = 30;
 pub const MAT_TALL_GRASS: u8 = 31;
+pub const MAT_CACTUS: u8 = 32;
 
 #[inline(always)]
 pub fn is_leaf_mat(m: u8) -> bool {
@@ -1491,8 +1492,11 @@ fn trees_for_chunk(chunk_xz: glam::IVec2, seed: u64, sea_level: u32) -> Vec<Tree
         let local_h = fbm_2d((wx as f32 + s_x) * 0.0008 + 100.0,
                              (wz as f32 + s_z) * 0.0008 + 100.0, 3);
         let local_biome = pick_biome(local_t, local_h, h_terrain as u32, sea_level);
-        if matches!(local_biome, Biome::Desert | Biome::Beach) { continue; }
-        let ttype = local_biome.tree_type(h);
+        let ttype = match local_biome {
+            Biome::Beach => continue,        // bare sand, no vegetation
+            Biome::Desert => 4,              // cactus
+            _ => local_biome.tree_type(h),
+        };
         out.push(TreeSpec { base_x: wx, base_y: h_terrain + 1, base_z: wz, ttype, hash: h });
     }
     out
@@ -1554,6 +1558,29 @@ fn paint_tree(
                 paint_sphere(bricks, cmin, cmax, end, 2, MAT_LEAVES_BIRCH);
             }
             paint_sphere(bricks, cmin, cmax, trunk_top, 3, MAT_LEAVES_BIRCH);
+        }
+        // Cactus (saguaro): thick column + 0-2 arms that go out then bend up.
+        4 => {
+            let col_h = 8 + (h % 8) as i32; // 8..15
+            let top = base + glam::IVec3::new(0, col_h, 0);
+            paint_line(bricks, cmin, cmax, base, top, 1, MAT_CACTUS);
+            let n_arms = (h % 3) as i32; // 0, 1 or 2
+            for a in 0..n_arms {
+                let angle = (a as f32 / n_arms.max(1) as f32) * std::f32::consts::TAU
+                    + branch_jitter(h, a as u32, 5) * 0.8;
+                let out = 2 + (h.wrapping_mul(a as u32 + 1) % 3) as i32; // 2..4 out
+                let sy = base.y + (col_h as f32 * (0.4 + 0.2 * a as f32)) as i32;
+                let arm_base = glam::IVec3::new(base.x, sy, base.z);
+                let elbow = glam::IVec3::new(
+                    base.x + (angle.cos() * out as f32) as i32,
+                    sy,
+                    base.z + (angle.sin() * out as f32) as i32,
+                );
+                let arm_h = 3 + (h.wrapping_mul(a as u32 + 3) % 4) as i32; // 3..6 up
+                let arm_top = elbow + glam::IVec3::new(0, arm_h, 0);
+                paint_line(bricks, cmin, cmax, arm_base, elbow, 1, MAT_CACTUS);
+                paint_line(bricks, cmin, cmax, elbow, arm_top, 1, MAT_CACTUS);
+            }
         }
         // Oak / autumn: wider canopy, a few branches.
         _ => {
@@ -1706,11 +1733,12 @@ impl Biome {
         match self {
             Biome::Jungle => 1.2,   // very dense
             Biome::Forest => 0.55,  // dense
-            Biome::Tundra => 0.18,  // scattered pines
-            Biome::Plains => 0.08,  // mostly empty, occasional oak
-            Biome::Mountain => 0.07,
-            Biome::Savanna => 0.04, // very rare
-            _ => 0.0,
+            Biome::Tundra => 0.30,  // scattered pines (denser)
+            Biome::Plains => 0.20,  // occasional oaks/birch (was ~empty)
+            Biome::Mountain => 0.14,
+            Biome::Savanna => 0.14, // sparse acacia-like
+            Biome::Desert => 0.20,  // cacti
+            _ => 0.0,               // Beach
         }
     }
     /// Elevation contribution — mountains are noticeably taller, jungles are
