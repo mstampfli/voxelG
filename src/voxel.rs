@@ -1467,12 +1467,16 @@ fn trees_for_chunk(chunk_xz: glam::IVec2, seed: u64, sea_level: u32) -> Vec<Tree
     let n_candidates = (density * 5.0).round() as u32;
     if n_candidates == 0 { return Vec::new(); }
 
-    // Patch noise — clearings AND dense thickets within the same biome.
-    // Maps fbm ∈ [-1, 1] → [0, 2]: bottom 40% is a clearing (0 trees),
-    // the rest scales linearly up to 2x the biome's base density. Forest
-    // biome ends up with grove + glade patterns instead of uniform cover.
-    let patch_raw = fbm_2d(cx_center * 0.0035, cz_center * 0.0035, 2);
-    let patch_mul = ((patch_raw + 0.4).max(0.0) * 1.6).min(2.0);
+    // Patch noise — clearings AND dense thickets within the same biome (gives
+    // trees grove/glade clustering). Cacti want an EVEN scatter, so deserts
+    // skip it and use a flat multiplier so every desert chunk gets the same
+    // count instead of thicket-and-clearing clumps.
+    let patch_mul = if matches!(biome, Biome::Desert) {
+        1.0
+    } else {
+        let patch_raw = fbm_2d(cx_center * 0.0035, cz_center * 0.0035, 2);
+        ((patch_raw + 0.4).max(0.0) * 1.6).min(2.0)
+    };
     let n = ((n_candidates as f32) * patch_mul) as u32;
     if n == 0 { return Vec::new(); }
 
@@ -1493,8 +1497,9 @@ fn trees_for_chunk(chunk_xz: glam::IVec2, seed: u64, sea_level: u32) -> Vec<Tree
                              (wz as f32 + s_z) * 0.0008 + 100.0, 3);
         let local_biome = pick_biome(local_t, local_h, h_terrain as u32, sea_level);
         let ttype = match local_biome {
-            Biome::Beach => continue,        // bare sand, no vegetation
-            Biome::Desert => 4,              // cactus
+            // Sandy / arid biomes read as desert — no leafy trees there.
+            Biome::Beach | Biome::Savanna => continue,
+            Biome::Desert => 4, // cacti, scattered across the desert
             _ => local_biome.tree_type(h),
         };
         out.push(TreeSpec { base_x: wx, base_y: h_terrain + 1, base_z: wz, ttype, hash: h });
@@ -1561,25 +1566,36 @@ fn paint_tree(
         }
         // Cactus (saguaro): thick column + 0-2 arms that go out then bend up.
         4 => {
-            let col_h = 8 + (h % 8) as i32; // 8..15
+            // Small bodied saguaro: a 2-wide column (between the too-thin
+            // 1-wide and the too-chunky 3-wide). Arms branch low and rise to
+            // just below the top so the silhouette reads at this small scale.
+            // Thin saguaro: 1-wide trunk + 1-wide arms branching PERPENDICULAR
+            // (the layout still reads 3D, not coplanar) with a gap to the trunk.
+            let col_h = 3 + (h % 6) as i32; // 3..8 (wide height variation)
             let top = base + glam::IVec3::new(0, col_h, 0);
-            paint_line(bricks, cmin, cmax, base, top, 1, MAT_CACTUS);
+            paint_line(bricks, cmin, cmax, base, top, 0, MAT_CACTUS);
             let n_arms = (h % 3) as i32; // 0, 1 or 2
+            let sets: [[(i32, i32); 2]; 4] = [
+                [(1, 0), (0, 1)],
+                [(-1, 0), (0, -1)],
+                [(0, 1), (-1, 0)],
+                [(0, -1), (1, 0)],
+            ];
+            let set = sets[(h & 3) as usize];
             for a in 0..n_arms {
-                let angle = (a as f32 / n_arms.max(1) as f32) * std::f32::consts::TAU
-                    + branch_jitter(h, a as u32, 5) * 0.8;
-                let out = 2 + (h.wrapping_mul(a as u32 + 1) % 3) as i32; // 2..4 out
-                let sy = base.y + (col_h as f32 * (0.4 + 0.2 * a as f32)) as i32;
-                let arm_base = glam::IVec3::new(base.x, sy, base.z);
-                let elbow = glam::IVec3::new(
-                    base.x + (angle.cos() * out as f32) as i32,
-                    sy,
-                    base.z + (angle.sin() * out as f32) as i32,
-                );
-                let arm_h = 3 + (h.wrapping_mul(a as u32 + 3) % 4) as i32; // 3..6 up
-                let arm_top = elbow + glam::IVec3::new(0, arm_h, 0);
-                paint_line(bricks, cmin, cmax, arm_base, elbow, 1, MAT_CACTUS);
-                paint_line(bricks, cmin, cmax, elbow, arm_top, 1, MAT_CACTUS);
+                let (dx, dz) = set[a as usize % 2];
+                let sy = base.y + (col_h as f32 * 0.4) as i32;
+                let arm_top = base.y + (col_h as f32 * 0.9) as i32;
+                let ax = base.x + dx * 2; // 2 out → a 1-voxel gap to the thin trunk
+                let az = base.z + dz * 2;
+                // Elbow bridging trunk → arm at the branch height.
+                paint_line(bricks, cmin, cmax,
+                    glam::IVec3::new(base.x, sy, base.z),
+                    glam::IVec3::new(ax, sy, az), 0, MAT_CACTUS);
+                // Vertical arm, gapped from the trunk.
+                paint_line(bricks, cmin, cmax,
+                    glam::IVec3::new(ax, sy, az),
+                    glam::IVec3::new(ax, arm_top, az), 0, MAT_CACTUS);
             }
         }
         // Oak / autumn: wider canopy, a few branches.
@@ -1736,8 +1752,8 @@ impl Biome {
             Biome::Tundra => 0.30,  // scattered pines (denser)
             Biome::Plains => 0.20,  // occasional oaks/birch (was ~empty)
             Biome::Mountain => 0.14,
-            Biome::Savanna => 0.14, // sparse acacia-like
-            Biome::Desert => 0.20,  // cacti
+            Biome::Savanna => 0.0,  // sandy — reads as desert, keep it bare
+            Biome::Desert => 0.20,  // ~1 per chunk, evenly scattered (flat patch_mul)
             _ => 0.0,               // Beach
         }
     }
