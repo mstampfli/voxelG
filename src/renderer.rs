@@ -63,10 +63,45 @@ fn upload_packed_word_spans(
     });
 }
 
+/// Project element indices `src` to their packed-u32 word indices (deduped via
+/// `scratch`) and re-pack + upload only those words of the byte `table`. Shared
+/// by the brick-uniform and tile-uniform incremental uploads.
+fn upload_words_for(
+    scratch: &mut Vec<u32>, src: &[u32], table: &[u8], queue: &wgpu::Queue, buf: &wgpu::Buffer,
+) {
+    scratch.clear();
+    for &x in src {
+        let w = x >> 2;
+        if scratch.last() != Some(&w) { scratch.push(w); }
+    }
+    upload_packed_word_spans(scratch, table, queue, buf);
+}
+
+/// Project a set of tile indices up to their parent chunks (via `scratch`, which
+/// is sorted+deduped) and DMA the touched chunk_mask runs. Does NOT refresh L4 —
+/// the caller decides that.
+fn upload_chunks_for_tiles(
+    scratch: &mut Vec<u32>, tiles: &[u32], chunk_mask: &[u64], queue: &wgpu::Queue, buf: &wgpu::Buffer,
+) {
+    scratch.clear();
+    for &t in tiles {
+        let tx = t % WORLD_TILES_X;
+        let ty = (t / WORLD_TILES_X) % WORLD_TILES_Y;
+        let tz = t / (WORLD_TILES_X * WORLD_TILES_Y);
+        scratch.push(chunk_idx(tx / 4, ty / 4, tz / 4));
+    }
+    scratch.sort_unstable();
+    scratch.dedup();
+    upload_spans(scratch, |s, e| {
+        let slice = &chunk_mask[s as usize..=e as usize];
+        queue.write_buffer(buf, s as u64 * 8, bytemuck::cast_slice(slice));
+    });
+}
+
 use crate::camera::{Camera, CameraUniform};
 use crate::voxel::{
-    Brick, World, WORLD_BRICKS_X, WORLD_BRICKS_Y, WORLD_TILES_X, WORLD_TILES_Y,
-    tile_idx, chunk_idx,
+    Brick, World, WORLD_TILES_X, WORLD_TILES_Y,
+    tile_idx, chunk_idx, brick_coords,
     MAT_AIR, MAT_SAND, MAT_GRASS, MAT_DIRT, MAT_STONE,
     MAT_WATER_L1, MAT_WATER_L8,
     MAT_WOOD, MAT_LEAVES, MAT_SNOW, MAT_LAVA, MAT_ICE, MAT_GLASS,
@@ -471,16 +506,8 @@ impl Renderer {
         let physics_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("physics bgl"),
             entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0, visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1, visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None },
-                    count: None,
-                },
+                bgl_storage(0, true),
+                bgl_storage(1, false),
             ],
         });
         let physics_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -744,23 +771,15 @@ impl Renderer {
         //    is the table the DDA's uniform-skip reads, and it was previously
         //    NEVER refreshed incrementally, so streamed chunks rendered with
         //    stale skip data.
-        self.dirty_words_scratch.clear();
-        for &b in &world.dirty_bricks {
-            let w = b >> 2;
-            if self.dirty_words_scratch.last() != Some(&w) {
-                self.dirty_words_scratch.push(w);
-            }
-        }
-        upload_packed_word_spans(
-            &self.dirty_words_scratch, &world.brick_uniform, &self.queue, &self.brick_uniform_buf,
+        upload_words_for(
+            &mut self.dirty_words_scratch, &world.dirty_bricks, &world.brick_uniform,
+            &self.queue, &self.brick_uniform_buf,
         );
 
         // 3. Tiles touched by the dirty bricks → tile_mask (u64) + tile_uniform.
         self.dirty_tiles_scratch.clear();
         for &b in &world.dirty_bricks {
-            let bx = b % WORLD_BRICKS_X;
-            let by = (b / WORLD_BRICKS_X) % WORLD_BRICKS_Y;
-            let bz = b / (WORLD_BRICKS_X * WORLD_BRICKS_Y);
+            let (bx, by, bz) = brick_coords(b);
             self.dirty_tiles_scratch.push(tile_idx(bx / 4, by / 4, bz / 4));
         }
         self.dirty_tiles_scratch.sort_unstable();
@@ -769,31 +788,16 @@ impl Renderer {
             let slice = &world.tile_mask[s as usize..=e as usize];
             self.queue.write_buffer(&self.tile_mask_buf, s as u64 * 8, bytemuck::cast_slice(slice));
         });
-        self.dirty_words_scratch.clear();
-        for &t in &self.dirty_tiles_scratch {
-            let w = t >> 2;
-            if self.dirty_words_scratch.last() != Some(&w) {
-                self.dirty_words_scratch.push(w);
-            }
-        }
-        upload_packed_word_spans(
-            &self.dirty_words_scratch, &world.tile_uniform, &self.queue, &self.tile_uniform_buf,
+        upload_words_for(
+            &mut self.dirty_words_scratch, &self.dirty_tiles_scratch, &world.tile_uniform,
+            &self.queue, &self.tile_uniform_buf,
         );
 
         // 4. Chunks touched by those tiles → chunk_mask (u64).
-        self.dirty_chunks_scratch.clear();
-        for &t in &self.dirty_tiles_scratch {
-            let tx = t % WORLD_TILES_X;
-            let ty = (t / WORLD_TILES_X) % WORLD_TILES_Y;
-            let tz = t / (WORLD_TILES_X * WORLD_TILES_Y);
-            self.dirty_chunks_scratch.push(chunk_idx(tx / 4, ty / 4, tz / 4));
-        }
-        self.dirty_chunks_scratch.sort_unstable();
-        self.dirty_chunks_scratch.dedup();
-        upload_spans(&self.dirty_chunks_scratch, |s, e| {
-            let slice = &world.chunk_mask[s as usize..=e as usize];
-            self.queue.write_buffer(&self.chunk_mask_buf, s as u64 * 8, bytemuck::cast_slice(slice));
-        });
+        upload_chunks_for_tiles(
+            &mut self.dirty_chunks_scratch, &self.dirty_tiles_scratch, &world.chunk_mask,
+            &self.queue, &self.chunk_mask_buf,
+        );
         // L4 mask is only a handful of u64s — if any chunk changed, just push
         // the whole thing.
         if !self.dirty_chunks_scratch.is_empty() {
@@ -816,29 +820,14 @@ impl Renderer {
             let slice = &world.tile_mask[s as usize..=e as usize];
             self.queue.write_buffer(&self.tile_mask_buf, s as u64 * 8, bytemuck::cast_slice(slice));
         });
-        self.dirty_words_scratch.clear();
-        for &t in &world.mask_dirty_tiles {
-            let w = t >> 2;
-            if self.dirty_words_scratch.last() != Some(&w) {
-                self.dirty_words_scratch.push(w);
-            }
-        }
-        upload_packed_word_spans(
-            &self.dirty_words_scratch, &world.tile_uniform, &self.queue, &self.tile_uniform_buf,
+        upload_words_for(
+            &mut self.dirty_words_scratch, &world.mask_dirty_tiles, &world.tile_uniform,
+            &self.queue, &self.tile_uniform_buf,
         );
-        self.dirty_chunks_scratch.clear();
-        for &t in &world.mask_dirty_tiles {
-            let tx = t % WORLD_TILES_X;
-            let ty = (t / WORLD_TILES_X) % WORLD_TILES_Y;
-            let tz = t / (WORLD_TILES_X * WORLD_TILES_Y);
-            self.dirty_chunks_scratch.push(chunk_idx(tx / 4, ty / 4, tz / 4));
-        }
-        self.dirty_chunks_scratch.sort_unstable();
-        self.dirty_chunks_scratch.dedup();
-        upload_spans(&self.dirty_chunks_scratch, |s, e| {
-            let slice = &world.chunk_mask[s as usize..=e as usize];
-            self.queue.write_buffer(&self.chunk_mask_buf, s as u64 * 8, bytemuck::cast_slice(slice));
-        });
+        upload_chunks_for_tiles(
+            &mut self.dirty_chunks_scratch, &world.mask_dirty_tiles, &world.chunk_mask,
+            &self.queue, &self.chunk_mask_buf,
+        );
         self.queue.write_buffer(&self.l4_mask_buf, 0, bytemuck::cast_slice(&world.l4_mask));
         world.mask_dirty_tiles.clear();
     }
@@ -1085,56 +1074,11 @@ fn create_taa_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("taa bgl"),
         entries: &[
-            wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 1, // current (raymarch output)
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
-                },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 2, // history
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
-                },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 3, // resolve out
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::StorageTexture {
-                    access: wgpu::StorageTextureAccess::WriteOnly,
-                    format: wgpu::TextureFormat::Rgba8Unorm,
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 4, // hit G-buffer (for reprojection motion vectors)
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
-                },
-                count: None,
-            },
+            bgl_uniform(0),
+            bgl_tex(1, false), // current (raymarch output)
+            bgl_tex(2, false), // history
+            bgl_storage_tex(3, wgpu::TextureFormat::Rgba8Unorm), // resolve out
+            bgl_tex(4, false), // hit G-buffer (reprojection motion vectors)
         ],
     })
 }
@@ -1182,18 +1126,11 @@ fn create_beam_texture(device: &wgpu::Device, w: u32, h: u32) -> (wgpu::Texture,
 /// the headless render test so the two can never drift. Binding order matches
 /// `make_compute_bg` and the `@group(0) @binding(N)` declarations in
 /// shaders/raymarch.wgsl.
-fn create_compute_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
-    let storage_ro = |binding: u32| wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility: wgpu::ShaderStages::COMPUTE,
-        ty: wgpu::BindingType::Buffer {
-            ty: wgpu::BufferBindingType::Storage { read_only: true },
-            has_dynamic_offset: false,
-            min_binding_size: None,
-        },
-        count: None,
-    };
-    let uniform = |binding: u32| wgpu::BindGroupLayoutEntry {
+// Shared BindGroupLayoutEntry builders for the COMPUTE-stage layouts, so each
+// create_*_bgl below lists its bindings instead of repeating the descriptor
+// boilerplate. (create_compute_bgl previously carried two of these as locals.)
+fn bgl_uniform(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
         binding,
         visibility: wgpu::ShaderStages::COMPUTE,
         ty: wgpu::BindingType::Buffer {
@@ -1202,86 +1139,78 @@ fn create_compute_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
             min_binding_size: None,
         },
         count: None,
-    };
+    }
+}
+
+fn bgl_storage(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    }
+}
+
+fn bgl_tex(binding: u32, filterable: bool) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
+fn bgl_storage_tex(binding: u32, format: wgpu::TextureFormat) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::StorageTexture {
+            access: wgpu::StorageTextureAccess::WriteOnly,
+            format,
+            view_dimension: wgpu::TextureViewDimension::D2,
+        },
+        count: None,
+    }
+}
+
+fn bgl_sampler(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+        count: None,
+    }
+}
+
+fn create_compute_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("compute bgl"),
         entries: &[
-            uniform(0),    // camera
-            storage_ro(1), // bricks
-            storage_ro(2), // tile_mask
-            storage_ro(3), // chunk_mask
-            uniform(4),    // palette
-            wgpu::BindGroupLayoutEntry {
-                binding: 5, // output storage texture
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::StorageTexture {
-                    access: wgpu::StorageTextureAccess::WriteOnly,
-                    format: wgpu::TextureFormat::Rgba8Unorm,
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 6, // beam depth texture
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
-                },
-                count: None,
-            },
-            storage_ro(7),  // tile_dirty
-            storage_ro(8),  // players
-            storage_ro(9),  // brick_uniform
-            storage_ro(10), // tile_uniform
-            storage_ro(11), // l4_mask (coarsest pyramid level)
-            wgpu::BindGroupLayoutEntry {
-                binding: 12, // half-res cloud texture (sampled, bilinear upsample)
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
-                },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 13, // cloud sampler (filtering)
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 15, // light_in: previous-frame lighting G-buffer (textureLoad)
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
-                },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 16, // light_out: this-frame lighting G-buffer (storage write)
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::StorageTexture {
-                    access: wgpu::StorageTextureAccess::WriteOnly,
-                    format: wgpu::TextureFormat::Rgba32Float,
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 17, // transp_buf: deferred transparent records (read_write)
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: false },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
+            bgl_uniform(0),       // camera
+            bgl_storage(1, true), // bricks
+            bgl_storage(2, true), // tile_mask
+            bgl_storage(3, true), // chunk_mask
+            bgl_uniform(4),       // palette
+            bgl_storage_tex(5, wgpu::TextureFormat::Rgba8Unorm), // output
+            bgl_tex(6, false),    // beam depth texture
+            bgl_storage(7, true),  // tile_dirty
+            bgl_storage(8, true),  // players
+            bgl_storage(9, true),  // brick_uniform
+            bgl_storage(10, true), // tile_uniform
+            bgl_storage(11, true), // l4_mask (coarsest pyramid level)
+            bgl_tex(12, true),     // half-res cloud texture (bilinear upsample)
+            bgl_sampler(13),       // cloud sampler (filtering)
+            bgl_tex(15, false),    // light_in: previous-frame lighting G-buffer
+            bgl_storage_tex(16, wgpu::TextureFormat::Rgba32Float), // light_out
+            bgl_storage(17, false), // transp_buf: deferred transparent records (rw)
         ],
     })
 }
@@ -1324,26 +1253,8 @@ fn create_cloud_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("cloud bgl"),
         entries: &[
-            wgpu::BindGroupLayoutEntry {
-                binding: 0, // camera
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 14, // cloud_out storage texture
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::StorageTexture {
-                    access: wgpu::StorageTextureAccess::WriteOnly,
-                    format: wgpu::TextureFormat::Rgba16Float,
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                },
-                count: None,
-            },
+            bgl_uniform(0), // camera
+            bgl_storage_tex(14, wgpu::TextureFormat::Rgba16Float), // cloud_out
         ],
     })
 }
@@ -1374,36 +1285,9 @@ fn create_beam_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("beam bgl"),
         entries: &[
-            wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 1,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: true },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 2,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::StorageTexture {
-                    access: wgpu::StorageTextureAccess::WriteOnly,
-                    format: wgpu::TextureFormat::R32Float,
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                },
-                count: None,
-            },
+            bgl_uniform(0),
+            bgl_storage(1, true),
+            bgl_storage_tex(2, wgpu::TextureFormat::R32Float),
         ],
     })
 }
@@ -1957,16 +1841,8 @@ mod gpu_render_tests {
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("phys bgl"),
             entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0, visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1, visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None },
-                    count: None,
-                },
+                super::bgl_storage(0, true),
+                super::bgl_storage(1, false),
             ],
         });
         let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {

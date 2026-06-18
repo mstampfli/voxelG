@@ -1292,16 +1292,32 @@ fn entry_normal_and_t(
 
 // Variant of `trace` that treats every water voxel as empty. Used to find
 // what lies *beneath* a water surface for refraction-style transparency.
-fn trace_no_water(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
-    var out: Hit;
-    out.hit = false;
-    out.mat = 0u;
-    out.normal = vec3<f32>(0.0);
-    out.voxel = vec3<i32>(0);
-    out.last_axis = -1;
-    out.t_hit = 0.0;
+// Shared DDA setup state produced by dda_init() and unpacked by every tracer.
+// `valid` is false when the ray misses the world AABB entirely.
+struct DdaInit {
+    valid: bool,
+    ro: vec3<i32>,
+    org: vec3<f32>,
+    inv_dir: vec3<f32>,
+    step: vec3<i32>,
+    t_delta: vec3<f32>,
+    tmin3: vec3<f32>,
+    t_enter: f32,
+    voxel: vec3<i32>,
+    t_max: vec3<f32>,
+    slot_v: vec3<i32>,
+};
 
-    // Origin-rebased (see trace() for the rationale).
+// Origin-rebased traversal setup, shared by trace / trace_no_water / trace_any.
+// The integer voxel grid stays in ABSOLUTE world coords (so cell alignment and
+// the toroidal slot lookup are unchanged), but every FLOAT computation is done
+// relative to the window corner `ro`. At large world coords `f32(voxel)-origin`
+// catastrophically cancels (the "sky through hills" bug); `f32(voxel - ro) -
+// (origin - ro)` keeps both operands small and exact. The ray parameter t is a
+// distance, unchanged by the rebase.
+fn dda_init(origin: vec3<f32>, dir: vec3<f32>) -> DdaInit {
+    var d: DdaInit;
+    d.valid = false;
     let ro = camera.world_origin;
     let org = origin - vec3<f32>(ro);
     let dims = vec3<f32>(f32(WORLD_VOXELS_X), f32(WORLD_VOXELS_Y), f32(WORLD_VOXELS_Z));
@@ -1312,7 +1328,7 @@ fn trace_no_water(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
     let tmax3 = max(t0, t1);
     let t_enter = max(max(tmin3.x, tmin3.y), max(tmin3.z, 0.0));
     let t_exit = min(min(tmax3.x, tmax3.y), tmax3.z);
-    if (t_enter >= t_exit || t_exit < 0.0) { return out; }
+    if (t_enter >= t_exit || t_exit < 0.0) { return d; }
 
     let bias = 1e-3;
     var p = org + dir * (t_enter + bias);
@@ -1320,17 +1336,89 @@ fn trace_no_water(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
     let step = vec3<i32>(sign(dir));
     let t_delta = abs(inv_dir);
 
-    var voxel = vec3<i32>(floor(p)) + ro;
+    let voxel = vec3<i32>(floor(p)) + ro;
     let vl0 = voxel - ro;
     var t_max: vec3<f32>;
     if (step.x > 0) { t_max.x = (f32(vl0.x + 1) - org.x) * inv_dir.x; } else { t_max.x = (f32(vl0.x) - org.x) * inv_dir.x; }
     if (step.y > 0) { t_max.y = (f32(vl0.y + 1) - org.y) * inv_dir.y; } else { t_max.y = (f32(vl0.y) - org.y) * inv_dir.y; }
     if (step.z > 0) { t_max.z = (f32(vl0.z + 1) - org.z) * inv_dir.z; } else { t_max.z = (f32(vl0.z) - org.z) * inv_dir.z; }
 
-    var last_axis: i32 = -1;
+    d.valid = true;
+    d.ro = ro;
+    d.org = org;
+    d.inv_dir = inv_dir;
+    d.step = step;
+    d.t_delta = t_delta;
+    d.tmin3 = tmin3;
+    d.t_enter = t_enter;
+    d.voxel = voxel;
+    d.t_max = t_max;
     // Slot voxel tracked incrementally (avoids the two per-step pos_mod folds —
-    // checklist #10). skip_to_cell resyncs it after a jump.
-    var slot_v = world_to_slot_voxel(voxel);
+    // checklist #10); skip_to_cell resyncs it after a jump, dda_step folds it.
+    d.slot_v = world_to_slot_voxel(voxel);
+    return d;
+}
+
+// One DDA cell advance: step the axis with the nearest t_max, fold slot_v
+// toroidally on x/z, and record which axis we crossed. Identical inner loop for
+// all three tracers (trace_no_water ignores the t_cur it writes).
+fn dda_step(
+    voxel: ptr<function, vec3<i32>>,
+    slot_v: ptr<function, vec3<i32>>,
+    t_max: ptr<function, vec3<f32>>,
+    t_cur: ptr<function, f32>,
+    last_axis: ptr<function, i32>,
+    step: vec3<i32>,
+    t_delta: vec3<f32>,
+) {
+    if ((*t_max).x < (*t_max).y && (*t_max).x < (*t_max).z) {
+        *t_cur = (*t_max).x;
+        (*voxel).x = (*voxel).x + step.x;
+        (*slot_v).x = (*slot_v).x + step.x;
+        if ((*slot_v).x >= WORLD_VOXELS_X) { (*slot_v).x = (*slot_v).x - WORLD_VOXELS_X; }
+        else if ((*slot_v).x < 0) { (*slot_v).x = (*slot_v).x + WORLD_VOXELS_X; }
+        (*t_max).x = (*t_max).x + t_delta.x;
+        *last_axis = 0;
+    } else if ((*t_max).y < (*t_max).z) {
+        *t_cur = (*t_max).y;
+        (*voxel).y = (*voxel).y + step.y;
+        (*slot_v).y = (*slot_v).y + step.y;
+        (*t_max).y = (*t_max).y + t_delta.y;
+        *last_axis = 1;
+    } else {
+        *t_cur = (*t_max).z;
+        (*voxel).z = (*voxel).z + step.z;
+        (*slot_v).z = (*slot_v).z + step.z;
+        if ((*slot_v).z >= WORLD_VOXELS_Z) { (*slot_v).z = (*slot_v).z - WORLD_VOXELS_Z; }
+        else if ((*slot_v).z < 0) { (*slot_v).z = (*slot_v).z + WORLD_VOXELS_Z; }
+        (*t_max).z = (*t_max).z + t_delta.z;
+        *last_axis = 2;
+    }
+}
+
+fn trace_no_water(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
+    var out: Hit;
+    out.hit = false;
+    out.mat = 0u;
+    out.normal = vec3<f32>(0.0);
+    out.voxel = vec3<i32>(0);
+    out.last_axis = -1;
+    out.t_hit = 0.0;
+
+    let init = dda_init(origin, dir);
+    if (!init.valid) { return out; }
+    let ro = init.ro;
+    let org = init.org;
+    let inv_dir = init.inv_dir;
+    let step = init.step;
+    let t_delta = init.t_delta;
+    let tmin3 = init.tmin3;
+    let t_enter = init.t_enter;
+    var voxel = init.voxel;
+    var t_max = init.t_max;
+    var slot_v = init.slot_v;
+    var last_axis: i32 = -1;
+    var t_cur: f32 = t_enter;
     for (var s: i32 = 0; s < 1024; s = s + 1) {
         let rel = voxel - camera.world_origin;
         if (rel.x < 0 || rel.x >= WORLD_VOXELS_X
@@ -1385,26 +1473,7 @@ fn trace_no_water(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
             // Water cell — fall through to the regular step so we keep going.
         }
 
-        if (t_max.x < t_max.y && t_max.x < t_max.z) {
-            voxel.x = voxel.x + step.x;
-            slot_v.x = slot_v.x + step.x;
-            if (slot_v.x >= WORLD_VOXELS_X) { slot_v.x = slot_v.x - WORLD_VOXELS_X; }
-            else if (slot_v.x < 0) { slot_v.x = slot_v.x + WORLD_VOXELS_X; }
-            t_max.x = t_max.x + t_delta.x;
-            last_axis = 0;
-        } else if (t_max.y < t_max.z) {
-            voxel.y = voxel.y + step.y;
-            slot_v.y = slot_v.y + step.y;
-            t_max.y = t_max.y + t_delta.y;
-            last_axis = 1;
-        } else {
-            voxel.z = voxel.z + step.z;
-            slot_v.z = slot_v.z + step.z;
-            if (slot_v.z >= WORLD_VOXELS_Z) { slot_v.z = slot_v.z - WORLD_VOXELS_Z; }
-            else if (slot_v.z < 0) { slot_v.z = slot_v.z + WORLD_VOXELS_Z; }
-            t_max.z = t_max.z + t_delta.z;
-            last_axis = 2;
-        }
+        dda_step(&voxel, &slot_v, &t_max, &t_cur, &last_axis, step, t_delta);
     }
     return out;
 }
@@ -1787,36 +1856,18 @@ fn god_rays(origin: vec3<f32>, dir: vec3<f32>, t_far: f32, pix: vec2<f32>) -> ve
 // Stripped-down DDA — same hierarchy as `trace()` but returns the moment we
 // know the ray is occluded. No normal / material work.
 fn trace_any(origin: vec3<f32>, dir: vec3<f32>, max_dist: f32) -> bool {
-    // Origin-rebased (see trace() for the rationale).
-    let ro = camera.world_origin;
-    let org = origin - vec3<f32>(ro);
-    let dims = vec3<f32>(f32(WORLD_VOXELS_X), f32(WORLD_VOXELS_Y), f32(WORLD_VOXELS_Z));
-    let inv_dir = vec3<f32>(safe_inv(dir.x), safe_inv(dir.y), safe_inv(dir.z));
-    let t0 = (vec3<f32>(0.0) - org) * inv_dir;
-    let t1 = (dims - org) * inv_dir;
-    let tmin3 = min(t0, t1);
-    let tmax3 = max(t0, t1);
-    let t_enter = max(max(tmin3.x, tmin3.y), max(tmin3.z, 0.0));
-    let t_exit = min(min(tmax3.x, tmax3.y), tmax3.z);
-    if (t_enter >= t_exit || t_exit < 0.0) { return false; }
-
-    let bias = 1e-3;
-    var p = org + dir * (t_enter + bias);
-    p = clamp(p, vec3<f32>(0.01), dims - vec3<f32>(0.01));
-    let step = vec3<i32>(sign(dir));
-    let t_delta = abs(inv_dir);
-
-    var voxel = vec3<i32>(floor(p)) + ro;
-    let vl0 = voxel - ro;
-    var t_max: vec3<f32>;
-    if (step.x > 0) { t_max.x = (f32(vl0.x + 1) - org.x) * inv_dir.x; } else { t_max.x = (f32(vl0.x) - org.x) * inv_dir.x; }
-    if (step.y > 0) { t_max.y = (f32(vl0.y + 1) - org.y) * inv_dir.y; } else { t_max.y = (f32(vl0.y) - org.y) * inv_dir.y; }
-    if (step.z > 0) { t_max.z = (f32(vl0.z + 1) - org.z) * inv_dir.z; } else { t_max.z = (f32(vl0.z) - org.z) * inv_dir.z; }
-
+    let init = dda_init(origin, dir);
+    if (!init.valid) { return false; }
+    let ro = init.ro;
+    let org = init.org;
+    let inv_dir = init.inv_dir;
+    let step = init.step;
+    let t_delta = init.t_delta;
+    let t_enter = init.t_enter;
+    var voxel = init.voxel;
+    var t_max = init.t_max;
+    var slot_v = init.slot_v;
     var last_axis: i32 = -1;
-    // Slot voxel tracked incrementally (avoids the two per-step pos_mod folds —
-    // checklist #10). skip_to_cell resyncs it after a jump.
-    var slot_v = world_to_slot_voxel(voxel);
     var t_cur = t_enter;
     for (var s: i32 = 0; s < 768; s = s + 1) {
         if (t_cur > max_dist) { return false; }
@@ -1873,29 +1924,7 @@ fn trace_any(origin: vec3<f32>, dir: vec3<f32>, max_dist: f32) -> bool {
             }
         }
 
-        if (t_max.x < t_max.y && t_max.x < t_max.z) {
-            t_cur = t_max.x;
-            voxel.x = voxel.x + step.x;
-            slot_v.x = slot_v.x + step.x;
-            if (slot_v.x >= WORLD_VOXELS_X) { slot_v.x = slot_v.x - WORLD_VOXELS_X; }
-            else if (slot_v.x < 0) { slot_v.x = slot_v.x + WORLD_VOXELS_X; }
-            t_max.x = t_max.x + t_delta.x;
-            last_axis = 0;
-        } else if (t_max.y < t_max.z) {
-            t_cur = t_max.y;
-            voxel.y = voxel.y + step.y;
-            slot_v.y = slot_v.y + step.y;
-            t_max.y = t_max.y + t_delta.y;
-            last_axis = 1;
-        } else {
-            t_cur = t_max.z;
-            voxel.z = voxel.z + step.z;
-            slot_v.z = slot_v.z + step.z;
-            if (slot_v.z >= WORLD_VOXELS_Z) { slot_v.z = slot_v.z - WORLD_VOXELS_Z; }
-            else if (slot_v.z < 0) { slot_v.z = slot_v.z + WORLD_VOXELS_Z; }
-            t_max.z = t_max.z + t_delta.z;
-            last_axis = 2;
-        }
+        dda_step(&voxel, &slot_v, &t_max, &t_cur, &last_axis, step, t_delta);
     }
     return false;
 }
@@ -2010,45 +2039,19 @@ fn trace(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
     out.last_axis = -1;
     out.t_hit = 0.0;
 
-    // ---- Origin-rebased traversal (checklist: rebase to window-relative) ----
-    // The integer voxel grid stays in ABSOLUTE world coords (so cell alignment
-    // and the toroidal slot lookup are unchanged), but every FLOAT computation
-    // is done relative to the window corner `ro`. At large world coords
-    // `f32(voxel) - origin` catastrophically cancels (the "sky through hills"
-    // bug + the 1e-2 bias hack); `f32(voxel - ro) - (origin - ro)` keeps both
-    // operands small and exact. The ray parameter t is a distance, unchanged by
-    // the rebase.
-    let ro = camera.world_origin;
-    let org = origin - vec3<f32>(ro);
-    let dims = vec3<f32>(f32(WORLD_VOXELS_X), f32(WORLD_VOXELS_Y), f32(WORLD_VOXELS_Z));
-    let inv_dir = vec3<f32>(safe_inv(dir.x), safe_inv(dir.y), safe_inv(dir.z));
-
-    let t0 = (vec3<f32>(0.0) - org) * inv_dir;
-    let t1 = (dims - org) * inv_dir;
-    let tmin3 = min(t0, t1);
-    let tmax3 = max(t0, t1);
-    let t_enter = max(max(tmin3.x, tmin3.y), max(tmin3.z, 0.0));
-    let t_exit = min(min(tmax3.x, tmax3.y), tmax3.z);
-    if (t_enter >= t_exit || t_exit < 0.0) { return out; }
-
-    let bias = 1e-3;
-    var p = org + dir * (t_enter + bias);
-    p = clamp(p, vec3<f32>(0.01), dims - vec3<f32>(0.01));
-
-    let step = vec3<i32>(sign(dir));
-    let t_delta = abs(inv_dir);
-
-    var voxel = vec3<i32>(floor(p)) + ro;
-    let vl0 = voxel - ro;
-    var t_max: vec3<f32>;
-    if (step.x > 0) { t_max.x = (f32(vl0.x + 1) - org.x) * inv_dir.x; } else { t_max.x = (f32(vl0.x) - org.x) * inv_dir.x; }
-    if (step.y > 0) { t_max.y = (f32(vl0.y + 1) - org.y) * inv_dir.y; } else { t_max.y = (f32(vl0.y) - org.y) * inv_dir.y; }
-    if (step.z > 0) { t_max.z = (f32(vl0.z + 1) - org.z) * inv_dir.z; } else { t_max.z = (f32(vl0.z) - org.z) * inv_dir.z; }
-
+    let init = dda_init(origin, dir);
+    if (!init.valid) { return out; }
+    let ro = init.ro;
+    let org = init.org;
+    let inv_dir = init.inv_dir;
+    let step = init.step;
+    let t_delta = init.t_delta;
+    let tmin3 = init.tmin3;
+    let t_enter = init.t_enter;
+    var voxel = init.voxel;
+    var t_max = init.t_max;
+    var slot_v = init.slot_v;
     var last_axis: i32 = -1;
-    // Slot voxel tracked incrementally (avoids the two per-step pos_mod folds —
-    // checklist #10). skip_to_cell resyncs it after a jump.
-    var slot_v = world_to_slot_voxel(voxel);
     var t_cur: f32 = t_enter;
     let max_steps: i32 = 1024;
     for (var s: i32 = 0; s < max_steps; s = s + 1) {
@@ -2222,29 +2225,7 @@ fn trace(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
             }
         }
 
-        if (t_max.x < t_max.y && t_max.x < t_max.z) {
-            t_cur = t_max.x;
-            voxel.x = voxel.x + step.x;
-            slot_v.x = slot_v.x + step.x;
-            if (slot_v.x >= WORLD_VOXELS_X) { slot_v.x = slot_v.x - WORLD_VOXELS_X; }
-            else if (slot_v.x < 0) { slot_v.x = slot_v.x + WORLD_VOXELS_X; }
-            t_max.x = t_max.x + t_delta.x;
-            last_axis = 0;
-        } else if (t_max.y < t_max.z) {
-            t_cur = t_max.y;
-            voxel.y = voxel.y + step.y;
-            slot_v.y = slot_v.y + step.y;
-            t_max.y = t_max.y + t_delta.y;
-            last_axis = 1;
-        } else {
-            t_cur = t_max.z;
-            voxel.z = voxel.z + step.z;
-            slot_v.z = slot_v.z + step.z;
-            if (slot_v.z >= WORLD_VOXELS_Z) { slot_v.z = slot_v.z - WORLD_VOXELS_Z; }
-            else if (slot_v.z < 0) { slot_v.z = slot_v.z + WORLD_VOXELS_Z; }
-            t_max.z = t_max.z + t_delta.z;
-            last_axis = 2;
-        }
+        dda_step(&voxel, &slot_v, &t_max, &t_cur, &last_axis, step, t_delta);
     }
     return out;
 }
