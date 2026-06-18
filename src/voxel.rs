@@ -1275,6 +1275,12 @@ pub fn sample_terrain(wx: f32, wz: f32, seed: u64) -> TerrainSample {
     let sea_level: f32 = 64.0;
     let base_h = sea_level + 8.0 + base + mountain_h - ravine_cut;
 
+    // Rivers DISABLED. The noise-blend river carve is kept below (commented)
+    // so it can be restored: uncomment the block, then derive `h` from
+    // `h_blended` and `is_river` from `actual_strength` as in the bottom two
+    // lines of the block. With it off, terrain comes straight from `base_h`
+    // and no column is ever flagged a river (oceans still fill via water_top).
+    /*
     // Rivers via SMOOTH BLEND with strict low-elevation gating. Rivers only
     // appear where terrain is naturally near sea level; they smoothly blend
     // the bed down so water (always at sea_level) shows in the channel.
@@ -1297,9 +1303,10 @@ pub fn sample_terrain(wx: f32, wz: f32, seed: u64) -> TerrainSample {
     // base_h naturally.
     let bed_target = sea_level - 3.0;
     let h_blended = base_h * (1.0 - actual_strength) + bed_target * actual_strength;
-    let h = h_blended.clamp(2.0, (WORLD_VOXELS_Y - 1) as f32);
+    */
+    let h = base_h.clamp(2.0, (WORLD_VOXELS_Y - 1) as f32);
     let h_i = h as i32;
-    let is_river = actual_strength > 0.0 && h_i < sea_level as i32;
+    let is_river = false;
 
     // Single GLOBAL water level. Anywhere terrain dips below sea_level (ocean
     // or river) fills with water to sea_level. Cannot overflow because every
