@@ -1709,72 +1709,158 @@ mod gpu_render_tests {
         assert!(mean > 0.05 && mean < 0.95, "[{label}] implausible mean luma {mean:.3}");
     }
 
-    /// Time the raymarch dispatch at a given resolution from a high downward
-    /// camera (the worst case: most of the screen is terrain). Run with
+    /// Time the raymarch + deferred-transparent dispatches at 1920x1080 for
+    /// three scenarios: a high terrain overview, a water-heavy view, and a
+    /// foliage-heavy view (found by scanning the demo world), so water and
+    /// foliage shader changes can be A/B'd headlessly. Run with
     /// `cargo test --lib raymarch_timing -- --nocapture --ignored`.
     #[test]
     #[ignore]
     fn raymarch_timing() {
+        use crate::voxel::{is_water_mat, is_leaf_mat};
         let Some((device, queue)) = headless_device() else {
             eprintln!("no GPU — skipping");
             return;
         };
-        for &(w, h) in &[(1920u32, 1080u32), (1280u32, 720u32)] {
-            let mut world = World::new();
-            world.fill_demo_terrain();
+        let (w, h) = (1920u32, 1080u32);
+        let mut world = World::new();
+        world.fill_demo_terrain();
+
+        // Scan 32x32-column cells (columns sampled at stride 4) for the densest
+        // water cell (topmost solid is water) and the densest leaf cell, so the
+        // scenario cameras deterministically frame what they claim to measure.
+        let cells = 512 / 32;
+        let mut best_water = (0usize, glam::IVec2::ZERO);
+        let mut best_leaf = (0usize, glam::IVec2::ZERO);
+        for cz in 0..cells {
+            for cx in 0..cells {
+                let (mut water_n, mut leaf_n) = (0usize, 0usize);
+                for dz in (0..32).step_by(4) {
+                    for dx in (0..32).step_by(4) {
+                        let (x, z) = (cx * 32 + dx, cz * 32 + dz);
+                        for y in (1..200).rev() {
+                            let m = world.material_at_world(x, y, z);
+                            if m == MAT_AIR { continue; }
+                            if is_water_mat(m) { water_n += 1; }
+                            break;
+                        }
+                        for y in 60..140 {
+                            if is_leaf_mat(world.material_at_world(x, y, z)) { leaf_n += 1; }
+                        }
+                    }
+                }
+                let c = glam::IVec2::new(cx * 32 + 16, cz * 32 + 16);
+                if water_n > best_water.0 { best_water = (water_n, c); }
+                if leaf_n > best_leaf.0 { best_leaf = (leaf_n, c); }
+            }
+        }
+        // Surface height under the foliage cell for camera placement.
+        let leaf_ground = (1..200)
+            .rev()
+            .find(|&y| world.material_at_world(best_leaf.1.x, y, best_leaf.1.y) != MAT_AIR)
+            .unwrap_or(80);
+        eprintln!(
+            "scenario anchors: water cell {:?} ({} cols), leaf cell {:?} ({} voxels, ground y={})",
+            best_water.1, best_water.0, best_leaf.1, best_leaf.0, leaf_ground
+        );
+
+        let mk_cam = |pos: glam::Vec3, pitch: f32| {
             let mut cam = Camera::new();
-            cam.pos = glam::Vec3::new(256.0, 150.0, 256.0);
-            cam.pitch = -0.5;
-            let cu = CameraUniform::from_camera(&cam, w, h, 0.0, glam::IVec3::ZERO, [0.0, 0.0], 0.0);
-            let camera_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: None, contents: bytemuck::bytes_of(&cu),
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            });
-            let bricks_buf = storage(&device, "b", bytemuck::cast_slice(&world.bricks));
-            let tm = storage(&device, "tm", bytemuck::cast_slice(&world.tile_mask));
-            let cm = storage(&device, "cm", bytemuck::cast_slice(&world.chunk_mask));
-            let l4 = storage(&device, "l4", bytemuck::cast_slice(&world.l4_mask));
-            let bu = storage(&device, "bu", bytemuck::cast_slice(&pack_u8_to_u32(&world.brick_uniform)));
-            let tu = storage(&device, "tu", bytemuck::cast_slice(&pack_u8_to_u32(&world.tile_uniform)));
-            let palette = default_palette();
-            let palette_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: None, contents: bytemuck::cast_slice(&palette),
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            });
-            let tw = (w + 7) / 8; let th = (h + 7) / 8;
-            let words = ((tw * th) as usize + 31) / 32;
-            let td = storage(&device, "td", bytemuck::cast_slice(&vec![u32::MAX; words]));
-            let players = storage(&device, "pl", &vec![0u8; 16 + MAX_REMOTE_PLAYERS * 16]);
-            let (_o, ov) = create_output_texture(&device, w, h);
-            let (_b, bv) = create_beam_texture(&device, w, h);
-            let (_c, csv, _csw) = create_cloud_texture(&device, w, h);
-            let csamp = device.create_sampler(&wgpu::SamplerDescriptor { mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, ..Default::default() });
-            let (_li, liv) = create_lighting_texture(&device, w, h);
-            let (_lo, lov) = create_lighting_texture(&device, w, h);
-            let tpb = create_transp_buf(&device, w, h);
-            let bgl = create_compute_bgl(&device);
-            let bg = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &ov, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &liv, &lov, &tpb);
-            let pll = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[&bgl], push_constant_ranges: &[] });
-            let src = format!("{}\n{}\n{}", WORLD_CONSTS_WGSL, COMMON_WGSL, include_str!("../shaders/raymarch.wgsl"));
-            let m = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(src.into()) });
-            let pipe = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: None, layout: Some(&pll), module: &m, entry_point: Some("cs_main"), compilation_options: Default::default(), cache: None });
+            cam.pos = pos;
+            cam.pitch = pitch;
+            cam
+        };
+        let clampi = |v: i32| (v.max(48).min(464)) as f32;
+        let scenarios = [
+            ("terrain", mk_cam(glam::Vec3::new(256.0, 150.0, 256.0), -0.5)),
+            (
+                "water",
+                mk_cam(
+                    glam::Vec3::new(clampi(best_water.1.x), 86.0, clampi(best_water.1.y) - 40.0),
+                    -0.45,
+                ),
+            ),
+            (
+                "foliage",
+                mk_cam(
+                    glam::Vec3::new(
+                        clampi(best_leaf.1.x),
+                        leaf_ground as f32 + 14.0,
+                        clampi(best_leaf.1.y) - 30.0,
+                    ),
+                    -0.35,
+                ),
+            ),
+        ];
+
+        // World buffers are shared across scenarios; only the camera changes.
+        let cu0 = CameraUniform::from_camera(&scenarios[0].1, w, h, 0.0, glam::IVec3::ZERO, [0.0, 0.0], 0.0);
+        let camera_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None, contents: bytemuck::bytes_of(&cu0),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let bricks_buf = storage(&device, "b", bytemuck::cast_slice(&world.bricks));
+        let tm = storage(&device, "tm", bytemuck::cast_slice(&world.tile_mask));
+        let cm = storage(&device, "cm", bytemuck::cast_slice(&world.chunk_mask));
+        let l4 = storage(&device, "l4", bytemuck::cast_slice(&world.l4_mask));
+        let bu = storage(&device, "bu", bytemuck::cast_slice(&pack_u8_to_u32(&world.brick_uniform)));
+        let tu = storage(&device, "tu", bytemuck::cast_slice(&pack_u8_to_u32(&world.tile_uniform)));
+        let palette = default_palette();
+        let palette_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None, contents: bytemuck::cast_slice(&palette),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let tw = (w + 7) / 8; let th = (h + 7) / 8;
+        let words = ((tw * th) as usize + 31) / 32;
+        let td = storage(&device, "td", bytemuck::cast_slice(&vec![u32::MAX; words]));
+        let players = storage(&device, "pl", &vec![0u8; 16 + MAX_REMOTE_PLAYERS * 16]);
+        let (_o, ov) = create_output_texture(&device, w, h);
+        let (_b, bv) = create_beam_texture(&device, w, h);
+        let (_c, csv, _csw) = create_cloud_texture(&device, w, h);
+        let csamp = device.create_sampler(&wgpu::SamplerDescriptor { mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, ..Default::default() });
+        let (_li, liv) = create_lighting_texture(&device, w, h);
+        let (_lo, lov) = create_lighting_texture(&device, w, h);
+        let tpb = create_transp_buf(&device, w, h);
+        let bgl = create_compute_bgl(&device);
+        let bg = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &ov, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &liv, &lov, &tpb);
+        let pll = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[&bgl], push_constant_ranges: &[] });
+        let src = format!("{}\n{}\n{}", WORLD_CONSTS_WGSL, COMMON_WGSL, include_str!("../shaders/raymarch.wgsl"));
+        let m = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(src.into()) });
+        let pipe = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: None, layout: Some(&pll), module: &m, entry_point: Some("cs_main"), compilation_options: Default::default(), cache: None });
+        let pipe_transp = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: None, layout: Some(&pll), module: &m, entry_point: Some("cs_transparent"), compilation_options: Default::default(), cache: None });
+
+        for (name, cam) in &scenarios {
+            let cu = CameraUniform::from_camera(cam, w, h, 0.0, glam::IVec3::ZERO, [0.0, 0.0], 0.0);
+            queue.write_buffer(&camera_buf, 0, bytemuck::bytes_of(&cu));
+            let encode_frame = || {
+                let mut e = device.create_command_encoder(&Default::default());
+                {
+                    let mut cp = e.begin_compute_pass(&Default::default());
+                    cp.set_pipeline(&pipe);
+                    cp.set_bind_group(0, &bg, &[]);
+                    cp.dispatch_workgroups(tw, th, 1);
+                }
+                {
+                    let mut cp = e.begin_compute_pass(&Default::default());
+                    cp.set_pipeline(&pipe_transp);
+                    cp.set_bind_group(0, &bg, &[]);
+                    cp.dispatch_workgroups(tw, th, 1);
+                }
+                e.finish()
+            };
             // Warm up.
             for _ in 0..5 {
-                let mut e = device.create_command_encoder(&Default::default());
-                { let mut cp = e.begin_compute_pass(&Default::default()); cp.set_pipeline(&pipe); cp.set_bind_group(0, &bg, &[]); cp.dispatch_workgroups(tw, th, 1); }
-                queue.submit(std::iter::once(e.finish()));
+                queue.submit(std::iter::once(encode_frame()));
             }
             device.poll(wgpu::Maintain::Wait);
             let n = 60;
             let t0 = std::time::Instant::now();
             for _ in 0..n {
-                let mut e = device.create_command_encoder(&Default::default());
-                { let mut cp = e.begin_compute_pass(&Default::default()); cp.set_pipeline(&pipe); cp.set_bind_group(0, &bg, &[]); cp.dispatch_workgroups(tw, th, 1); }
-                queue.submit(std::iter::once(e.finish()));
+                queue.submit(std::iter::once(encode_frame()));
             }
             device.poll(wgpu::Maintain::Wait);
             let ms = t0.elapsed().as_secs_f64() * 1000.0 / n as f64;
-            eprintln!("raymarch {w}x{h}: {ms:.2} ms/frame  (~{:.0} fps GPU-bound)", 1000.0 / ms);
+            eprintln!("raymarch+transp [{name}] {w}x{h}: {ms:.2} ms/frame  (~{:.0} fps GPU-bound)", 1000.0 / ms);
         }
     }
 
