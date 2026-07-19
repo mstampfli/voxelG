@@ -30,24 +30,26 @@ Traversal and performance:
 
 Shading and effects:
 
-- **Water**: real sub-voxel plate geometry — each surface water voxel renders a plate whose height comes
-  from one four-wave Gerstner sample per 4×4 cluster, snapped to sixteenth-voxel steps, with orientation
-  quantised to horizontal or an exact 30° tilt along ±x/±z; height differences between clusters read as
-  small vertical water walls (blocky faceted waves that actually displace, and one shared normal per
-  plate keeps the deferred secondary rays warp-coherent). Schlick Fresnel mixes a traced reflection with
-  a Snell-refracted trace beneath the surface (η = 1/1.33); Beer-Lambert per-channel absorption,
-  shoreline foam from underwater hit distance gated by wave crests, a caustic approximation, specular
-  sun glints, and a separate absorption post-effect when the camera is submerged. Plates respect the
-  physics fill level (L1-L8) of each voxel.
+- **Water**: real sub-voxel displaced geometry — each surface water voxel renders a planar facet sampled
+  from a continuous four-wave Gerstner spectrum at the cell's own centre (swell λ26, sea λ13, chop λ7 and
+  λ3.5 voxels), so neighbouring facets line up sub-pixel and the surface reads as traveling wavefronts
+  with real parallax and silhouettes. Shading uses the exact per-pixel field normal; vertical water walls
+  appear only at shores, waterfalls and physics level differences. Schlick Fresnel mixes a traced
+  reflection with a Snell-refracted trace beneath the surface (η = 1/1.33); Beer-Lambert per-channel
+  absorption, shoreline foam from underwater hit distance gated by wave crests, a caustic approximation,
+  specular sun glints, and a separate absorption post-effect when the camera is submerged. Facets respect
+  the physics fill level (L1-L8) of each voxel.
 - **Glass**: Fresnel reflection plus per-channel refraction for chromatic dispersion (n = 1.48/1.50/1.52),
   total-internal-reflection fallback to the reflected ray, distance-compounding tint; the 3-trace
   dispersion path is gated to grazing angles.
 - **Foliage**, resolved sub-voxel inside the DDA with hand-authored pixel art (`src/sprites.rs`, ASCII
   art encoded to 2-bit texels): rigid cube leaves with authored 16×16 cutout masks tested on entry and
-  exit faces (dense/light/pine variants, hash-picked mirror flips), tall grass and flowers (poppy,
-  daisy) as crossed quads carrying authored sprites that shear with one global wind field. Leaf hits are
-  stable axis faces, so they receive cube ambient occlusion and reuse the reprojected lighting cache;
-  grass blocks render dirt sides with a ragged grass fringe.
+  exit faces (dense/light/pine variants, hash-picked mirror flips), plus — within 56 voxels — oriented
+  single-leaf sprite cards floating inside each leaf voxel that ride the wind on per-card phases (visible
+  individual leaves with real geometric sway). Tall grass and flowers (poppy, daisy) are crossed quads
+  carrying authored sprites, sheared by the wind in shared world space so the X always intersects. Leaf
+  face hits are stable axis faces, so they receive cube ambient occlusion and reuse the reprojected
+  lighting cache; grass blocks render dirt sides with a ragged grass fringe.
 - **Lighting**: day/night sun cycle with sunset scattering, sun disc, halo and stars; single-sample
   golden-angle PCF soft shadows jittered with interleaved gradient noise (TAA accumulates the penumbra);
   bit-test ambient occlusion bilinearly interpolated across the hit face.
