@@ -674,82 +674,142 @@ fn leaf_tone_tint(val: u32, scale: f32) -> vec3<f32> {
     return vec3<f32>(b * scale);
 }
 
-// ---------- LEAVES: merged canopy blobs (the actual Allumeria look) ---------
-// Verified against Allumeria promo screenshots: their crowns are smooth
-// ROUNDED masses — lumpy organic balls with clumpy bright/dark leaf texture
-// and a soft light gradient across the whole crown. No cube edges anywhere.
-// Here every leaf voxel renders as a SPHERE (radius 0.9, slightly jittered
-// and wind-swayed) so neighbouring leaf voxels merge into one lumpy blob;
-// worldgen already places leaves in spherical crowns, so the union of balls
-// IS the broccoli-tree silhouette. The smooth sphere normal gives the crown
-// its shading gradient for free; world-space clump noise bands the surface
-// into bright lit tufts / mid leaves / dark crevices.
-fn leaf_blob_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u32) -> SubHit {
+// ---------- LEAVES: Motschen's Better Leaves, ported exactly ----------------
+// Geometry and texture from "Motschen's Better Leaves Lite"
+// (github.com/TeamMidnightDust/BetterLeavesLite, MIT): every leaf block is a
+// cutout CUBE whose faces sample the CENTRE 16x16 of the pack's pre-rounded
+// 32x32 tuft texture, PLUS two big double-sided diagonal quads (2.0 x 1.75
+// blocks, rotated 22.5 and -45 degrees about Y, one slightly off-centre)
+// carrying the FULL round ragged tuft. Four variants (the pack's blockstate
+// y-rotations 0/90/180/270) are picked per block by hash. The huge
+// overhanging tufts from every block interleave into dense bushy canopies.
+fn tuft_texel(x: u32, y: u32) -> u32 {
+    let bit = (y * 32u + x) * 2u;
+    let w = sprites[128u + (bit >> 5u)]; // BL_TUFT_WORD_OFFSET = 128
+    return (w >> (bit & 31u)) & 3u;
+}
+// Tuft tones: 1 = dark, 2 = mid, 3 = bright (greyscale in the pack, tinted
+// by the leaf palette colour here just like Minecraft's biome tint).
+fn tuft_tone(val: u32, scale: f32) -> vec3<f32> {
+    var b = 0.92;
+    if (val == 1u) { b = 0.60; }
+    if (val == 3u) { b = 1.24; }
+    return vec3<f32>(b * scale);
+}
+
+fn leaf_bl_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u32) -> SubHit {
     var out: SubHit;
     out.hit = false;
     out.color_tint = vec3<f32>(1.0);
     let voxel_min = vec3<f32>(f32(voxel.x), f32(voxel.y), f32(voxel.z));
+    let inv_dir = vec3<f32>(safe_inv(dir.x), safe_inv(dir.y), safe_inv(dir.z));
+    let t0 = (voxel_min - origin) * inv_dir;
+    let t1 = (voxel_min + vec3<f32>(1.0) - origin) * inv_dir;
+    let tmin = min(t0, t1);
+    let tmax = max(t0, t1);
+    let t_enter = max(max(tmin.x, tmin.y), max(tmin.z, 0.0));
+    let t_exit = min(min(tmax.x, tmax.y), tmax.z);
+    if (t_enter >= t_exit) { return out; }
+
     let vh = hash3f(voxel_min);
+    let vox_shade = 0.90 + fract(vh * 32.0) * 0.20;
+    // The pack's four blockstate rotations, picked per block.
+    let yrot = floor(vh * 4.0) * 1.5707963;
+    let phase = voxel_min.x * 0.31 + voxel_min.z * 0.41 + vh * 6.28;
+    let wind = wind_offset(voxel_min, phase, 0.06);
 
-    // Blob centre: cell centre, organically jittered, riding the wind.
-    let jit = (vec3<f32>(fract(vh * 13.0), fract(vh * 29.0), fract(vh * 53.0)) - vec3<f32>(0.5)) * 0.10;
-    let w = wind_offset(voxel_min, vh * 6.28, 0.05);
-    let bob = 0.03 * sin(camera.time * 1.3 + vh * 6.28);
-    let c = voxel_min + vec3<f32>(0.5) + jit + vec3<f32>(w.x, bob, w.y);
-    // Radius covers the cell's corners (sqrt(3)/2 = 0.866) so dense canopies
-    // have no pinholes; the overlap between neighbours makes the lumps merge.
-    let r = 0.90;
+    var best_t: f32 = 1e30;
+    var best_n = vec3<f32>(0.0, 1.0, 0.0);
+    var tint = vec3<f32>(1.0);
 
-    let oc = origin - c;
-    let b_half = dot(oc, dir);
-    let disc = b_half * b_half - (dot(oc, oc) - r * r);
-    if (disc <= 0.0) { return out; }
-    let t = -b_half - sqrt(disc);
-    // t <= 0: the ray starts inside this blob (canopy interior) — let it fall
-    // through; it will hit a neighbouring blob's surface from outside.
-    if (t <= 0.0) { return out; }
-
-    let p = origin + dir * t;
-    let sphere_n = (p - c) / r;
-
-    // Crown-smooth normal: the gradient of leaf occupancy around this voxel
-    // approximates the CANOPY surface normal, so the crown shades as one
-    // rounded mass instead of per-voxel bubbles. Isolated bushes (zero
-    // gradient) keep the plain sphere normal.
-    var g = vec3<f32>(0.0);
-    g.x = f32(is_foliage_mat(voxel_material_at(voxel + vec3<i32>(1, 0, 0))))
-        - f32(is_foliage_mat(voxel_material_at(voxel - vec3<i32>(1, 0, 0))));
-    g.y = f32(is_foliage_mat(voxel_material_at(voxel + vec3<i32>(0, 1, 0))))
-        - f32(is_foliage_mat(voxel_material_at(voxel - vec3<i32>(0, 1, 0))));
-    g.z = f32(is_foliage_mat(voxel_material_at(voxel + vec3<i32>(0, 0, 1))))
-        - f32(is_foliage_mat(voxel_material_at(voxel - vec3<i32>(0, 0, 1))));
-    var n = sphere_n;
-    if (dot(g, g) > 0.5) {
-        n = normalize(sphere_n * 0.25 - normalize(g) * 0.75);
+    // ---- the two big diagonal tuft quads ----
+    // Quad 0: 22.5deg through the block centre. Quad 1: -45deg, off-centre
+    // (the pack rotates it about origin (1,0,3)/16 with rect centre x=9.5/16).
+    let t_lo = max(t_enter - 1.3, 0.0);
+    let t_hi = t_exit + 1.3;
+    for (var q: i32 = 0; q < 2; q = q + 1) {
+        let ang = select(0.3926991, -0.7853982, q == 1) + yrot;
+        let ca = cos(ang);
+        let sa = sin(ang);
+        var c = voxel_min + vec3<f32>(0.5, 0.5, 0.5);
+        if (q == 1) {
+            c = voxel_min + vec3<f32>(0.0625 + 0.531 * ca, 0.5, 0.1875 - 0.531 * sa);
+        }
+        let n = vec3<f32>(sa, 0.0, ca);
+        let denom = dot(dir, n);
+        if (abs(denom) < 1e-4) { continue; }
+        let t = dot(c - origin, n) / denom;
+        if (t <= t_lo || t >= min(t_hi, best_t)) { continue; }
+        let lp = origin + dir * t - c;
+        let lv = lp.y;
+        if (abs(lv) > 0.875) { continue; }
+        var lu = lp.x * ca - lp.z * sa;
+        if (abs(lu) > 1.0) { continue; }
+        // Gentle waving-mod shear, stronger toward the tuft's top.
+        lu = lu - (wind.x * ca - wind.y * sa) * (lv / 1.75 + 0.5);
+        let tx = u32(clamp((lu * 0.5 + 0.5) * 32.0, 0.0, 31.0));
+        let ty = u32(clamp(2.0 + (lv / 1.75 + 0.5) * 28.0, 0.0, 31.0));
+        let val = tuft_texel(tx, ty);
+        if (val == 0u) { continue; }
+        best_t = t;
+        best_n = select(n, -n, denom > 0.0);
+        tint = tuft_tone(val, vox_shade);
     }
 
-    // REAL leaves: the authored leaf mosaic (distinct oval leaves with dark
-    // outlines and bright tips), triplanar-projected on the canopy surface.
-    let an = abs(sphere_n);
-    var uv: vec2<f32>;
-    if (an.y > an.x && an.y > an.z) { uv = p.xz; }
-    else if (an.x > an.z)           { uv = p.zy; }
-    else                            { uv = p.xy; }
-    // Per-voxel pattern offset breaks the world-grid alignment of the mosaic
-    // (without it the gaps line up into visible polka-dot rows).
-    let mu = fract(uv * 2.0 + vec2<f32>(fract(vh * 7.0), fract(vh * 23.0)));
-    let val = sprite_texel(SPR_LEAF_FACE, u32(mu.x * 16.0), u32(mu.y * 16.0));
-    var band = 1.05;                     // leaf body
-    if (val == 0u) { band = 0.55; }      // shadow gap between leaves
-    else if (val == 2u) { band = 0.72; } // dark outline side
-    else if (val == 3u) { band = 1.42; } // lit tip
-    // Per-voxel lump variation so the crown isn't one flat green.
-    let vox_shade = 0.90 + fract(vh * 32.0) * 0.20;
+    // ---- the cutout cube faces (centre 16x16 of the tuft) ----
+    var entry_axis: i32 = 0;
+    if (tmin.x >= tmin.y && tmin.x >= tmin.z) { entry_axis = 0; }
+    else if (tmin.y >= tmin.z) { entry_axis = 1; }
+    else { entry_axis = 2; }
+    if (t_enter < best_t) {
+        let lp_e = origin + dir * t_enter - voxel_min;
+        var uv_e: vec2<f32>;
+        if (entry_axis == 0) { uv_e = vec2<f32>(lp_e.z, lp_e.y); }
+        else if (entry_axis == 1) { uv_e = vec2<f32>(lp_e.x, lp_e.z); }
+        else { uv_e = vec2<f32>(lp_e.x, lp_e.y); }
+        let val = tuft_texel(8u + u32(clamp(uv_e.x * 16.0, 0.0, 15.0)),
+                             8u + u32(clamp(uv_e.y * 16.0, 0.0, 15.0)));
+        if (val != 0u) {
+            var n = vec3<f32>(0.0);
+            if (entry_axis == 0) { n.x = select(1.0, -1.0, dir.x > 0.0); }
+            else if (entry_axis == 1) { n.y = select(1.0, -1.0, dir.y > 0.0); }
+            else { n.z = select(1.0, -1.0, dir.z > 0.0); }
+            best_t = t_enter;
+            best_n = n;
+            tint = tuft_tone(val, vox_shade);
+        }
+    }
+    if (best_t >= 1e29) {
+        // Entry face was a hole and no quad caught the ray: try the exit
+        // face (interior faces read a shade darker).
+        var exit_axis: i32 = 0;
+        if (tmax.x <= tmax.y && tmax.x <= tmax.z) { exit_axis = 0; }
+        else if (tmax.y <= tmax.z) { exit_axis = 1; }
+        else { exit_axis = 2; }
+        let lp_x = origin + dir * t_exit - voxel_min;
+        var uv_x: vec2<f32>;
+        if (exit_axis == 0) { uv_x = vec2<f32>(lp_x.z, lp_x.y); }
+        else if (exit_axis == 1) { uv_x = vec2<f32>(lp_x.x, lp_x.z); }
+        else { uv_x = vec2<f32>(lp_x.x, lp_x.y); }
+        let val = tuft_texel(8u + u32(clamp(uv_x.x * 16.0, 0.0, 15.0)),
+                             8u + u32(clamp(uv_x.y * 16.0, 0.0, 15.0)));
+        if (val != 0u) {
+            var n = vec3<f32>(0.0);
+            if (exit_axis == 0) { n.x = select(-1.0, 1.0, dir.x > 0.0); }
+            else if (exit_axis == 1) { n.y = select(-1.0, 1.0, dir.y > 0.0); }
+            else { n.z = select(-1.0, 1.0, dir.z > 0.0); }
+            best_t = t_exit;
+            best_n = n;
+            tint = tuft_tone(val, vox_shade * 0.78);
+        }
+    }
 
-    out.hit = true;
-    out.t_hit = t;
-    out.normal = n;
-    out.color_tint = vec3<f32>(band * vox_shade);
+    if (best_t < 1e29) {
+        out.hit = true;
+        out.t_hit = best_t;
+        out.normal = best_n;
+        out.color_tint = tint;
+    }
     return out;
 }
 
@@ -852,7 +912,7 @@ fn foliage_subvoxel(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u3
     if (mat == MAT_TALL_GRASS || mat == MAT_FLOWER) {
         hit = sprite_cross_hit(voxel, origin, dir, mat);
     } else {
-        hit = leaf_blob_hit(voxel, origin, dir, mat);
+        hit = leaf_bl_hit(voxel, origin, dir, mat);
     }
     return hit;
 }

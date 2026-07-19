@@ -193,6 +193,56 @@ const ART: [[&str; SPRITE_DIM]; 8] = [
     ],
 ];
 
+
+// ---------------------------------------------------------------------------
+// Better Leaves tuft (32x32): ported from "Motschen's Better Leaves Lite"
+// (github.com/TeamMidnightDust/BetterLeavesLite, MIT License, (c) Motschen) —
+// the pre-rounded ragged leaf tuft its big diagonal quads carry. Converted
+// from oak_leaves.png: '.' = transparent, o/#/* = dark/mid/bright leaf pixels
+// (the original is grayscale and tinted in-game, exactly like our palette
+// tint). The block faces sample the CENTRE 16x16 of this texture.
+pub const BL_TUFT_DIM: usize = 32;
+/// 32x32 texels x 2 bits = 64 u32 words.
+pub const BL_TUFT_WORDS: usize = BL_TUFT_DIM * BL_TUFT_DIM * 2 / 32;
+/// Word offset of the tuft inside the encoded atlas (after the 16x16 sprites).
+pub const BL_TUFT_WORD_OFFSET: usize = 8 * SPRITE_WORDS;
+
+#[rustfmt::skip]
+const BL_TUFT: [&str; BL_TUFT_DIM] = [
+        "...............#................",
+        "............o.o##..##...........",
+        ".........#....###*.#...*........",
+        ".........#oo....#*.##...*.......",
+        ".....*.*###.##..*.oo#*.*.##.....",
+        "....*##*#*.*#oo..o.#*##*#*.*....",
+        ".....#*.*.*#*#..##..*#*.*..#....",
+        ".....*.##.***..ooo#..*.##.***...",
+        "...#..*#oo.*.##.##o#..*#oo.*....",
+        "..#..*#*#...oo##.###.*#*#...oo..",
+        "..#..***..##.###*.#..***..##..#.",
+        "......*..##oo.*#*o....*..##oo.*.",
+        "...o##..####..#*...o##..####....",
+        ".o..o##.###..*#ooo..o##.###..*#.",
+        ".##.###*##.o*#*#.##.###*##.o*#*.",
+        ".o##.*###oo.***.oo##.*###oo.**..",
+        ".#.##.##*#.oo*##.####.##*#.oo*#.",
+        "..#.#.*#*...ooo##.###.*#*....oo.",
+        ".*.#...*.##.o.###*.#...*.##.o.#.",
+        ".*.##...*#oo...*#*.##...*#oo....",
+        "...o#*.*###.##..*.oo#*.*###.##..",
+        "...#*##*#*.*#oo..o.#*##*#*.*#o..",
+        "....*#*.*.*#*#..##..*#*.*.*#*#..",
+        "..#..*.##.***..ooo#..*.##.**....",
+        "...#..*#oo.*.##.##o#..*#oo.*....",
+        ".....*#*#...oo##.###.*#*#.......",
+        "......**..##.###*.#..***..##....",
+        "......*..##oo.*#*o....*..##.....",
+        "........####..#*...o##...#......",
+        "........###..*.ooo..o##.........",
+        ".........#..*#*..#..#...........",
+        ".............*..o..#............",
+];
+
 /// Encode all sprites into the flat u32 word array the shader indexes.
 /// Texel (x, y) of sprite s lives at bit `(y*16 + x) * 2` of word block
 /// `s * SPRITE_WORDS`.
@@ -219,6 +269,24 @@ pub fn encoded() -> Vec<u32> {
             }
         }
     }
+    // Append the 32x32 Better Leaves tuft after the 16x16 sprites.
+    debug_assert_eq!(out.len(), BL_TUFT_WORD_OFFSET);
+    out.extend(std::iter::repeat(0u32).take(BL_TUFT_WORDS));
+    for (row, line) in BL_TUFT.iter().enumerate() {
+        assert_eq!(line.len(), BL_TUFT_DIM, "tuft row {row} width");
+        let y = BL_TUFT_DIM - 1 - row;
+        for (x, ch) in line.bytes().enumerate() {
+            let v = match ch {
+                b'.' => 0u32,
+                b'o' => 1, // NOTE: tuft uses 1 = dark, 2 = mid, 3 = bright
+                b'#' => 2,
+                b'*' => 3,
+                _ => panic!("tuft row {row}: bad char '{}'", ch as char),
+            };
+            let bit = (y * BL_TUFT_DIM + x) * 2;
+            out[BL_TUFT_WORD_OFFSET + bit / 32] |= v << (bit % 32);
+        }
+    }
     out
 }
 
@@ -235,7 +303,7 @@ mod tests {
     #[test]
     fn encodes_all_sprites() {
         let w = encoded();
-        assert_eq!(w.len(), 8 * SPRITE_WORDS);
+        assert_eq!(w.len(), 8 * SPRITE_WORDS + BL_TUFT_WORDS);
     }
 
     /// The leaf mosaic needs enough leaf coverage that the gaps read as
@@ -245,6 +313,33 @@ mod tests {
         let w = encoded();
         let o = opacity(&w, SPR_LEAF_FACE);
         assert!((0.60..=0.85).contains(&o), "leaf mosaic coverage: {o}");
+    }
+
+    /// The ported Better Leaves tuft: right size, round (transparent
+    /// corners), and roughly the original's ~46% coverage.
+    #[test]
+    fn better_leaves_tuft_intact() {
+        let w = encoded();
+        assert_eq!(w.len(), BL_TUFT_WORD_OFFSET + BL_TUFT_WORDS);
+        let tex = |x: usize, y: usize| -> u32 {
+            let bit = (y * BL_TUFT_DIM + x) * 2;
+            (w[BL_TUFT_WORD_OFFSET + bit / 32] >> (bit % 32)) & 3
+        };
+        for (x, y) in [(0, 0), (31, 0), (0, 31), (31, 31)] {
+            assert_eq!(tex(x, y), 0, "tuft corner ({x},{y}) must be clear");
+        }
+        let n: usize = (0..32)
+            .flat_map(|y| (0..32).map(move |x| (x, y)))
+            .filter(|&(x, y)| tex(x, y) != 0)
+            .count();
+        let cov = n as f32 / 1024.0;
+        assert!((0.40..=0.55).contains(&cov), "tuft coverage {cov}");
+        // Centre 16x16 (used by the cube faces) must be mostly opaque.
+        let nc: usize = (8..24)
+            .flat_map(|y| (8..24).map(move |x| (x, y)))
+            .filter(|&(x, y)| tex(x, y) != 0)
+            .count();
+        assert!(nc as f32 / 256.0 > 0.60, "tuft centre too sparse: {nc}");
     }
 
     #[test]

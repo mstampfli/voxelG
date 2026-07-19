@@ -1870,7 +1870,7 @@ mod gpu_render_tests {
         let mut forest_mid = Camera::new();
         forest_mid.pos = glam::Vec3::new(
             clamp_anchor(leaf_c.x),
-            leaf_ground as f32 + 9.0,
+            leaf_ground as f32 + 16.0,
             clamp_anchor(leaf_c.y) - 32.0,
         );
         forest_mid.pitch = -0.08;
