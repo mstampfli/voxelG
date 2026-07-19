@@ -32,9 +32,13 @@ struct Camera {
 };
 
 // Floored modulo for toroidal world-coord folding (result always in [0, b)).
+// Signed `%` must never see a negative operand here: naga emits OpSRem without
+// VK_KHR_maintenance8, and Vulkan makes OpSRem on negatives POISON (NVIDIA
+// returns the unsigned-style remainder, so a `select(r, r+b, r<0)` fixup never
+// fires). Both `%` below therefore only ever run on non-negative values.
 fn pos_mod(a: i32, b: i32) -> i32 {
-    let r = a % b;
-    return select(r, r + b, r < 0);
+    if (a >= 0) { return a % b; }
+    return (b - 1) - ((-1 - a) % b);
 }
 
 // Reciprocal that won't blow up on a near-zero ray component.
