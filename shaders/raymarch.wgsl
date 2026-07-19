@@ -393,7 +393,7 @@ fn cs_transparent(@builtin(global_invocation_id) gid: vec3<u32>) {
     var col: vec3<f32>;
     if (rec.y < 1.5) {
         hit.mat = MAT_WATER_L8;
-        hit.normal = vec3<f32>(0.0, 1.0, 0.0);
+        hit.normal = decode_water_normal(rec.z);
         col = shade_water_top(hit, camera.origin, dir);
     } else {
         hit.mat = MAT_GLASS;
@@ -447,7 +447,15 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // render an opaque wall in our face.
     let cam_voxel_chk = vec3<i32>(floor(camera.origin));
     let cam_mat_chk = voxel_material_at(cam_voxel_chk);
-    let cam_in_water = is_water_mat(cam_mat_chk);
+    var cam_in_water = is_water_mat(cam_mat_chk);
+    if (cam_in_water && !is_water_mat(voxel_material_at(cam_voxel_chk + vec3<i32>(0, 1, 0)))) {
+        // Surface cell: the eye is only underwater if it's below the plate.
+        let lf = f32(cam_mat_chk - MAT_WATER_L1 + 1u) * 0.125;
+        let plate = water_plate_for_cell(cam_voxel_chk, lf);
+        let lp = camera.origin - vec3<f32>(f32(cam_voxel_chk.x), f32(cam_voxel_chk.y), f32(cam_voxel_chk.z));
+        let s = plate.h + plate.slope.x * (lp.x - 0.5) + plate.slope.y * (lp.z - 0.5);
+        cam_in_water = lp.y <= s;
+    }
     var hit: Hit;
     if (cam_in_water) {
         // Skip beam-skip when underwater — beam pre-pass doesn't know about
@@ -470,9 +478,10 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Deferred transparent record (mat_code 0 = opaque/none).
     var transp = vec4<f32>(0.0, 0.0, 0.0, 0.0);
     if (hit.hit) {
-        if (is_water_mat(hit.mat) && hit.normal.y > 0.5) {
-            // Defer the expensive water reflection/refraction to cs_transparent.
-            transp = vec4<f32>(hit.t_hit, 1.0, 0.0, 1.0);
+        if (is_water_mat(hit.mat)) {
+            // Defer ALL water (plates, walls, undersides) to cs_transparent.
+            // The quantised plate/face normal travels in the record code.
+            transp = vec4<f32>(hit.t_hit, 1.0, encode_water_normal(hit.normal), 1.0);
             col = sky(dir); // cheap placeholder (overwritten by cs_transparent)
         } else if (hit.mat == MAT_GLASS) {
             transp = vec4<f32>(hit.t_hit, 2.0, encode_face_normal(hit.normal), 1.0);
@@ -1231,34 +1240,148 @@ fn wave_param(i: i32) -> array<f32, 6> {
     else             { return array<f32, 6>( -0.90, -0.30, 2.40, 0.03, 2.60, 5.2); }
 }
 
-fn water_normal(p: vec3<f32>, t: f32) -> vec3<f32> {
+// Height + gradient of the 4-wave Gerstner field in one loop:
+// returns (h, dh/dx, dh/dz). The amplitudes sum to 0.34 (see wave_param).
+fn water_field(xz: vec2<f32>, t: f32) -> vec3<f32> {
+    var h = 0.0;
     var dx = 0.0;
     var dz = 0.0;
     for (var i: i32 = 0; i < 4; i = i + 1) {
         let w = wave_param(i);
-        let dirx = w[0];
-        let dirz = w[1];
-        let k = w[2];
-        let A = w[3];
-        let om = w[4];
-        let ph = w[5];
-        let phase = (p.x * dirx + p.z * dirz) * k - t * om + ph;
-        let s = sin(phase);
-        dx = dx - A * k * dirx * s;
-        dz = dz - A * k * dirz * s;
+        let phase = (xz.x * w[0] + xz.y * w[1]) * w[2] - t * w[4] + w[5];
+        h = h + w[3] * cos(phase);
+        let s = w[3] * w[2] * sin(phase);
+        dx = dx - s * w[0];
+        dz = dz - s * w[1];
     }
-    return normalize(vec3<f32>(-dx, 1.0, -dz));
+    return vec3<f32>(h, dx, dz);
 }
 
-// Vertical height field — used for foam thresholding and caustics.
-fn water_height(p: vec3<f32>, t: f32) -> f32 {
-    var h = 0.0;
-    for (var i: i32 = 0; i < 4; i = i + 1) {
-        let w = wave_param(i);
-        let phase = (p.x * w[0] + p.z * w[1]) * w[2] - t * w[4] + w[5];
-        h = h + w[3] * cos(phase);
+// ---------- VOXEL WATER: clustered plates instead of a smooth fake normal ----
+// The water surface is real sub-voxel geometry: every water voxel with air
+// above renders a flat plate inside its cell. Plates are grouped into
+// WATER_CLUSTER x WATER_CLUSTER clusters that share ONE Gerstner sample —
+// one quantised height (WATER_STEP increments) and ONE quantised orientation:
+// horizontal, or tilted exactly 30 degrees along +-x / +-z. Between clusters
+// the height differences show as small vertical water walls. The result is
+// blocky faceted waves that actually displace (parallax, real silhouettes)
+// instead of a smooth normal painted on a flat plane, and every pixel of a
+// cluster reflects/refracts with the SAME normal, so the deferred secondary
+// rays stay warp-coherent.
+const WATER_DETAIL_T: f32 = 96.0;      // beyond this, water is a plain cube top
+const WATER_CLUSTER: f32 = 4.0;        // plate size in voxels (1.0 = per-voxel)
+const WATER_STEP: f32 = 1.0 / 16.0;    // plate heights snap to sixteenths
+const WATER_BASE: f32 = 0.58;          // resting surface height in the cell
+const WATER_AMP: f32 = 0.12;           // wave amplitude (cell fraction)
+const WATER_TILT: f32 = 0.57735027;    // tan(30 deg): the only non-flat slope
+const WATER_TILT_MIN_GRAD: f32 = 0.09; // gradient below this = flat plate
+
+struct WaterPlate {
+    h: f32,           // surface height at THIS cell's centre (cell fraction)
+    slope: vec2<f32>, // (dh/dx, dh/dz); at most one axis non-zero: 0 or +-tan30
+}
+
+fn water_plate_for_cell(voxel: vec3<i32>, level_frac: f32) -> WaterPlate {
+    // One wave sample per cluster, taken at the cluster centre.
+    let cxz = floor(vec2<f32>(f32(voxel.x), f32(voxel.z)) / WATER_CLUSTER);
+    let cc = (cxz + vec2<f32>(0.5)) * WATER_CLUSTER;
+    let f = water_field(cc, camera.time);
+    // Quantised plate height: snapping to WATER_STEP makes the plate rise in
+    // discrete ticks — deliberately chunky, like the rest of the world.
+    let amp = clamp(f.x * (WATER_AMP / 0.34), -WATER_AMP, WATER_AMP);
+    let h_plate = WATER_BASE + floor(amp / WATER_STEP + 0.5) * WATER_STEP;
+    // Quantised orientation: flat unless the Gerstner gradient clearly picks
+    // a dominant axis, then exactly 30 degrees along that axis.
+    var slope = vec2<f32>(0.0);
+    if (max(abs(f.y), abs(f.z)) > WATER_TILT_MIN_GRAD) {
+        if (abs(f.y) >= abs(f.z)) { slope.x = sign(f.y) * WATER_TILT; }
+        else                      { slope.y = sign(f.z) * WATER_TILT; }
     }
-    return h;
+    // Continue the cluster plane to this cell's centre. Cells where the plane
+    // would poke out of the cell go flat at a clamped height (terraced cluster
+    // edges) so the in-cell facet always stays inside [0, 1].
+    let vc = vec2<f32>(f32(voxel.x) + 0.5, f32(voxel.z) + 0.5);
+    var h_cell = h_plate + dot(slope, vc - cc);
+    let margin = 0.5 * (abs(slope.x) + abs(slope.y)) + 0.04;
+    if (h_cell < margin || h_cell > 1.0 - margin) {
+        h_cell = clamp(h_cell, 0.06, 0.94);
+        slope = vec2<f32>(0.0);
+    }
+    var p: WaterPlate;
+    p.h = h_cell * level_frac;         // partial (physics) water scales down
+    p.slope = slope * level_frac;
+    return p;
+}
+
+struct WaterSubHit {
+    hit: bool,
+    t_hit: f32,
+    normal: vec3<f32>,
+};
+
+// Sub-voxel water surface for one cell the DDA landed in. `entry_n`/`t_entry`
+// describe the cell's entry face, `t_exit` the exit crossing. Misses (ray
+// passes above the plate) fall through to the next DDA cell.
+fn water_subvoxel(
+    voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, m: u32,
+    entry_n: vec3<f32>, t_entry: f32, t_exit: f32,
+) -> WaterSubHit {
+    var out: WaterSubHit;
+    out.hit = false;
+    // Interior cell (more water above): a plain cube. Its exposed faces are
+    // vertical water walls / undersides.
+    if (is_water_mat(voxel_material_at(voxel + vec3<i32>(0, 1, 0)))) {
+        out.hit = true;
+        out.t_hit = t_entry;
+        out.normal = entry_n;
+        return out;
+    }
+    let level_frac = f32(m - MAT_WATER_L1 + 1u) * 0.125;
+    let plate = water_plate_for_cell(voxel, level_frac);
+    let vmin = vec3<f32>(f32(voxel.x), f32(voxel.y), f32(voxel.z));
+    let p0 = origin + dir * t_entry - vmin;
+    // Local plate surface: S(xz) = h + slope . (xz - cell centre).
+    let s0 = plate.h + plate.slope.x * (p0.x - 0.5) + plate.slope.y * (p0.z - 0.5);
+    if (p0.y <= s0 + 1e-4) {
+        // Entered below the waterline: the entry face IS the water surface —
+        // a side wall between plates / at the shore, or the underside.
+        out.hit = true;
+        out.t_hit = t_entry;
+        out.normal = entry_n;
+        return out;
+    }
+    // Entered above the plate: intersect the plane inside the cell.
+    let denom = dir.y - plate.slope.x * dir.x - plate.slope.y * dir.z;
+    if (denom < -1e-6) {
+        let s = (p0.y - s0) / (-denom);
+        if (t_entry + s < t_exit) {
+            out.hit = true;
+            out.t_hit = t_entry + s;
+            out.normal = normalize(vec3<f32>(-plate.slope.x, 1.0, -plate.slope.y));
+            return out;
+        }
+    }
+    return out;
+}
+
+// Water normals are quantised (6 axis faces + 4 tilted plates), so the
+// deferred transparent record can carry them exactly in one float code.
+fn encode_water_normal(n: vec3<f32>) -> f32 {
+    if (n.y > 0.5 && n.y < 0.999) {
+        if (n.x < -0.05) { return 6.0; }
+        if (n.x >  0.05) { return 7.0; }
+        if (n.z < -0.05) { return 8.0; }
+        if (n.z >  0.05) { return 9.0; }
+    }
+    return encode_face_normal(n);
+}
+fn decode_water_normal(c: f32) -> vec3<f32> {
+    let i = i32(c + 0.5);
+    if (i == 6) { return vec3<f32>(-0.5, 0.8660254, 0.0); }
+    if (i == 7) { return vec3<f32>( 0.5, 0.8660254, 0.0); }
+    if (i == 8) { return vec3<f32>(0.0, 0.8660254, -0.5); }
+    if (i == 9) { return vec3<f32>(0.0, 0.8660254,  0.5); }
+    return decode_face_normal(c);
 }
 
 // Face normal + entry distance for the cell a ray just stepped into. `last_axis`
@@ -1480,7 +1603,10 @@ fn trace_no_water(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
 
 fn shade_water_top(hit: Hit, origin: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
     let p_hit = origin + dir * hit.t_hit;
-    let n = water_normal(p_hit, camera.time);
+    // The plate/wall normal is real (quantised) geometry now — shading uses it
+    // directly instead of a per-pixel Gerstner fake. Every pixel of a plate
+    // shares one normal, so the secondary rays below stay warp-coherent.
+    let n = hit.normal;
     let s = sun_dir();
     let sc = sun_color(s);
     // Per-pixel jitter substitute for shading-of-reflections — derive from
@@ -1489,10 +1615,14 @@ fn shade_water_top(hit: Hit, origin: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
     // Secondary rays don't use the reprojection cache.
     var no_cache = vec2<f32>(0.0);
 
-    // ---- reflection: primary ray reflected off the perturbed normal ----
+    // ---- reflection off the plate ----
+    // trace_no_water: the reflection origin sits INSIDE the water cell (the
+    // plate is below the cube top), so a plain trace would hit the very cell
+    // it started in. Skipping water also keeps the reflection showing terrain
+    // and sky rather than the surface's own neighbouring plates.
     let refl_dir = reflect(dir, n);
     let refl_origin = p_hit + n * 0.01;
-    let refl_hit = trace(refl_origin, refl_dir);
+    let refl_hit = trace_no_water(refl_origin, refl_dir);
     var refl_col: vec3<f32>;
     if (refl_hit.hit) {
         refl_col = shade(refl_hit, refl_origin, refl_dir, jit, false, &no_cache);
@@ -1534,7 +1664,12 @@ fn shade_water_top(hit: Hit, origin: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
     let spec = pow(max(0.0, dot(n, h)), 256.0);
     var shadow = 0.0;
     if (sun_intensity(s) > 0.0 && dot(n, s) > 0.0) {
-        shadow = select(1.0, 0.0, trace_any(refl_origin, s, SHADOW_MAX_DIST));
+        // The hit sits inside the water cell (plate below the cube top), and
+        // water voxels count as solid for trace_any — a shadow ray from p_hit
+        // would self-occlude. Lift the origin to just above the cell's top
+        // face: the column above a surface cell is air by construction.
+        let glint_origin = vec3<f32>(p_hit.x, floor(p_hit.y) + 1.001, p_hit.z);
+        shadow = select(1.0, 0.0, trace_any(glint_origin, s, SHADOW_MAX_DIST));
     }
 
     // ---- shoreline foam: triggered by shallow water (under.t_hit small) ----
@@ -1543,7 +1678,7 @@ fn shade_water_top(hit: Hit, origin: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
     var foam = 0.0;
     if (under.hit && under.t_hit < 2.5) {
         let shore = 1.0 - clamp(under.t_hit / 2.5, 0.0, 1.0);
-        let crest = clamp(water_height(p_hit, camera.time) * 4.0 + 0.5, 0.0, 1.0);
+        let crest = clamp(water_field(p_hit.xz, camera.time).x * 4.0 + 0.5, 0.0, 1.0);
         foam = shore * crest * 0.85;
     }
 
@@ -2211,6 +2346,21 @@ fn trace(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
                 // cutout missed → fall through to the DDA step below.
             } else if (is_decoration_mat(m)) {
                 // Far decoration → invisible; fall through to the DDA step.
+            } else if (is_water_mat(m) && t_cur <= WATER_DETAIL_T) {
+                // Near water: sub-voxel plate surface. A miss means the ray
+                // passed above the plate — keep stepping.
+                let en = entry_normal_and_t(last_axis, step, t_max, t_delta, t_enter, tmin3);
+                let t_exit_cell = min(t_max.x, min(t_max.y, t_max.z));
+                let wh = water_subvoxel(voxel, origin, dir, m, en.n, en.t_hit, t_exit_cell);
+                if (wh.hit) {
+                    out.hit = true;
+                    out.mat = m;
+                    out.normal = wh.normal;
+                    out.voxel = voxel;
+                    out.last_axis = -1; // sub-voxel hit (water is always deferred)
+                    out.t_hit = wh.t_hit;
+                    return out;
+                }
             } else {
                 let en = entry_normal_and_t(last_axis, step, t_max, t_delta, t_enter, tmin3);
                 let n = en.n;
