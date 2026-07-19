@@ -618,6 +618,7 @@ const MAT_LEAVES_PINE:     u32 = 26u;
 const MAT_LEAVES_AUTUMN:   u32 = 27u;
 const MAT_FLOWER:          u32 = 30u;
 const MAT_TALL_GRASS:      u32 = 31u;
+const MAT_LEAF_FRINGE:     u32 = 33u;
 
 fn is_water_mat(m: u32) -> bool {
     return m >= MAT_WATER_L1 && m <= MAT_WATER_L8;
@@ -632,14 +633,19 @@ fn is_uniform_optimisable(m: u32) -> bool {
 fn is_foliage_mat(m: u32) -> bool {
     return m == MAT_LEAVES || m == MAT_LEAVES_BIRCH
         || m == MAT_LEAVES_PINE || m == MAT_LEAVES_AUTUMN
-        || m == MAT_FLOWER || m == MAT_TALL_GRASS;
+        || m == MAT_FLOWER || m == MAT_TALL_GRASS
+        || m == MAT_LEAF_FRINGE;
+}
+fn is_leaf_block_mat(m: u32) -> bool {
+    return m == MAT_LEAVES || m == MAT_LEAVES_BIRCH
+        || m == MAT_LEAVES_PINE || m == MAT_LEAVES_AUTUMN;
 }
 // Ground decoration (single sub-voxel sprites). Far away these must NOT be
 // drawn as solid cubes (that's the "pink flower blocks" bug) — they vanish
 // instead. Leaves, by contrast, stay solid cubes far away so tree canopies
 // don't disappear.
 fn is_decoration_mat(m: u32) -> bool {
-    return m == MAT_FLOWER || m == MAT_TALL_GRASS;
+    return m == MAT_FLOWER || m == MAT_TALL_GRASS || m == MAT_LEAF_FRINGE;
 }
 
 struct SubHit {
@@ -697,6 +703,96 @@ fn tuft_tone(val: u32, scale: f32) -> vec3<f32> {
     return vec3<f32>(b * scale);
 }
 
+// The two big diagonal tuft quads of one leaf block (Better Leaves model:
+// 2.3 x 2.0 blocks — the pack geometry scaled up ~15% per user taste — at
+// 22.5 / -45 degrees plus the block hash 90-degree rotation, quad 1 slightly
+// off-centre). Tested over [t_lo, t_hi] so both the owning cell and the
+// surrounding fringe cells can render their part of the quads.
+fn leaf_bl_quads(voxel_min: vec3<f32>, origin: vec3<f32>, dir: vec3<f32>, t_lo: f32, t_hi: f32) -> SubHit {
+    var out: SubHit;
+    out.hit = false;
+    out.color_tint = vec3<f32>(1.0);
+    let vh = hash3f(voxel_min);
+    let vox_shade = 0.90 + fract(vh * 32.0) * 0.20;
+    let yrot = floor(vh * 4.0) * 1.5707963;
+    let phase = voxel_min.x * 0.31 + voxel_min.z * 0.41 + vh * 6.28;
+    let wind = wind_offset(voxel_min, phase, 0.06);
+
+    var best_t: f32 = 1e30;
+    for (var q: i32 = 0; q < 2; q = q + 1) {
+        let ang = select(0.3926991, -0.7853982, q == 1) + yrot;
+        let ca = cos(ang);
+        let sa = sin(ang);
+        var c = voxel_min + vec3<f32>(0.5, 0.5, 0.5);
+        if (q == 1) {
+            c = voxel_min + vec3<f32>(0.0625 + 0.531 * ca, 0.5, 0.1875 - 0.531 * sa);
+        }
+        let n = vec3<f32>(sa, 0.0, ca);
+        let denom = dot(dir, n);
+        if (abs(denom) < 1e-4) { continue; }
+        let t = dot(c - origin, n) / denom;
+        if (t <= t_lo || t >= min(t_hi, best_t)) { continue; }
+        let lp = origin + dir * t - c;
+        let lv = lp.y;
+        if (abs(lv) > 1.0) { continue; }
+        var lu = lp.x * ca - lp.z * sa;
+        if (abs(lu) > 1.15) { continue; }
+        // Gentle waving-mod shear, stronger toward the tuft top.
+        lu = lu - (wind.x * ca - wind.y * sa) * (lv / 2.0 + 0.5);
+        let tx = u32(clamp((lu / 1.15 * 0.5 + 0.5) * 32.0, 0.0, 31.0));
+        let ty = u32(clamp(2.0 + (lv / 2.0 + 0.5) * 28.0, 0.0, 31.0));
+        let val = tuft_texel(tx, ty);
+        if (val == 0u) { continue; }
+        best_t = t;
+        out.hit = true;
+        out.t_hit = t;
+        out.normal = select(n, -n, denom > 0.0);
+        out.color_tint = tuft_tone(val, vox_shade);
+    }
+    return out;
+}
+
+// A fringe cell renders the parts of its neighbouring leaf blocks tuft
+// quads that protrude into it — this is what makes tufts visible from the
+// SIDE (rays grazing past a canopy never enter the leaf cells themselves,
+// only the invisible fringe shell worldgen paints around them).
+fn leaf_fringe_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>) -> SubHit {
+    var out: SubHit;
+    out.hit = false;
+    out.color_tint = vec3<f32>(1.0);
+    let voxel_min = vec3<f32>(f32(voxel.x), f32(voxel.y), f32(voxel.z));
+    let inv_dir = vec3<f32>(safe_inv(dir.x), safe_inv(dir.y), safe_inv(dir.z));
+    let t0 = (voxel_min - origin) * inv_dir;
+    let t1 = (voxel_min + vec3<f32>(1.0) - origin) * inv_dir;
+    let tmin3 = min(t0, t1);
+    let tmax3 = max(t0, t1);
+    let t_enter = max(max(tmin3.x, tmin3.y), max(tmin3.z, 0.0));
+    let t_exit = min(min(tmax3.x, tmax3.y), tmax3.z);
+    if (t_enter >= t_exit) { return out; }
+
+    var best_t: f32 = 1e30;
+    for (var i: i32 = 0; i < 6; i = i + 1) {
+        var off = vec3<i32>(0);
+        if (i == 0) { off.x = 1; } else if (i == 1) { off.x = -1; }
+        else if (i == 2) { off.y = 1; } else if (i == 3) { off.y = -1; }
+        else if (i == 4) { off.z = 1; } else { off.z = -1; }
+        let nb = voxel + off;
+        let nb_mat = voxel_material_at(nb);
+        if (!is_leaf_block_mat(nb_mat)) { continue; }
+        let nb_min = vec3<f32>(f32(nb.x), f32(nb.y), f32(nb.z));
+        var qh = leaf_bl_quads(nb_min, origin, dir, max(t_enter - 0.05, 0.0), t_exit + 0.05);
+        if (qh.hit && qh.t_hit < best_t) {
+            best_t = qh.t_hit;
+            // shade() tints by palette[MAT_LEAF_FRINGE]; fold in the ratio to
+            // the neighbour real leaf colour (autumn/birch/pine correctness).
+            qh.color_tint = qh.color_tint * palette[nb_mat].rgb
+                / max(palette[MAT_LEAF_FRINGE].rgb, vec3<f32>(1e-3));
+            out = qh;
+        }
+    }
+    return out;
+}
+
 fn leaf_bl_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u32) -> SubHit {
     var out: SubHit;
     out.hit = false;
@@ -713,47 +809,19 @@ fn leaf_bl_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u32) ->
 
     let vh = hash3f(voxel_min);
     let vox_shade = 0.90 + fract(vh * 32.0) * 0.20;
-    // The pack's four blockstate rotations, picked per block.
-    let yrot = floor(vh * 4.0) * 1.5707963;
-    let phase = voxel_min.x * 0.31 + voxel_min.z * 0.41 + vh * 6.28;
-    let wind = wind_offset(voxel_min, phase, 0.06);
 
     var best_t: f32 = 1e30;
     var best_n = vec3<f32>(0.0, 1.0, 0.0);
     var tint = vec3<f32>(1.0);
 
-    // ---- the two big diagonal tuft quads ----
-    // Quad 0: 22.5deg through the block centre. Quad 1: -45deg, off-centre
-    // (the pack rotates it about origin (1,0,3)/16 with rect centre x=9.5/16).
-    let t_lo = max(t_enter - 1.3, 0.0);
-    let t_hi = t_exit + 1.3;
-    for (var q: i32 = 0; q < 2; q = q + 1) {
-        let ang = select(0.3926991, -0.7853982, q == 1) + yrot;
-        let ca = cos(ang);
-        let sa = sin(ang);
-        var c = voxel_min + vec3<f32>(0.5, 0.5, 0.5);
-        if (q == 1) {
-            c = voxel_min + vec3<f32>(0.0625 + 0.531 * ca, 0.5, 0.1875 - 0.531 * sa);
-        }
-        let n = vec3<f32>(sa, 0.0, ca);
-        let denom = dot(dir, n);
-        if (abs(denom) < 1e-4) { continue; }
-        let t = dot(c - origin, n) / denom;
-        if (t <= t_lo || t >= min(t_hi, best_t)) { continue; }
-        let lp = origin + dir * t - c;
-        let lv = lp.y;
-        if (abs(lv) > 0.875) { continue; }
-        var lu = lp.x * ca - lp.z * sa;
-        if (abs(lu) > 1.0) { continue; }
-        // Gentle waving-mod shear, stronger toward the tuft's top.
-        lu = lu - (wind.x * ca - wind.y * sa) * (lv / 1.75 + 0.5);
-        let tx = u32(clamp((lu * 0.5 + 0.5) * 32.0, 0.0, 31.0));
-        let ty = u32(clamp(2.0 + (lv / 1.75 + 0.5) * 28.0, 0.0, 31.0));
-        let val = tuft_texel(tx, ty);
-        if (val == 0u) { continue; }
-        best_t = t;
-        best_n = select(n, -n, denom > 0.0);
-        tint = tuft_tone(val, vox_shade);
+    // ---- the two big diagonal tuft quads (shared tester) ----
+    // Overhang beyond this cell is rendered by the surrounding fringe cells,
+    // so the own-cell test stays tight.
+    let qh = leaf_bl_quads(voxel_min, origin, dir, max(t_enter - 0.05, 0.0), t_exit + 0.05);
+    if (qh.hit) {
+        best_t = qh.t_hit;
+        best_n = qh.normal;
+        tint = qh.color_tint;
     }
 
     // ---- the cutout cube faces (centre 16x16 of the tuft) ----
@@ -911,6 +979,8 @@ fn foliage_subvoxel(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u3
     var hit: SubHit;
     if (mat == MAT_TALL_GRASS || mat == MAT_FLOWER) {
         hit = sprite_cross_hit(voxel, origin, dir, mat);
+    } else if (mat == MAT_LEAF_FRINGE) {
+        hit = leaf_fringe_hit(voxel, origin, dir);
     } else {
         hit = leaf_bl_hit(voxel, origin, dir, mat);
     }
@@ -1981,7 +2051,9 @@ fn trace_any(origin: vec3<f32>, dir: vec3<f32>, max_dist: f32) -> bool {
         let vi = brick_voxel_idx(local.x, local.y, local.z);
         if (brick_voxel_solid(bi, vi)) {
             let m = brick_voxel_material(bi, vi);
-            if (is_foliage_mat(m)) {
+            if (m == MAT_LEAF_FRINGE) {
+                // Invisible canopy fringe never occludes shadow rays.
+            } else if (is_foliage_mat(m)) {
                 // Far foliage blocks as a solid cube (cheap); only near foliage
                 // pays for the dappled-shadow cutout test.
                 if (t_cur > FOLIAGE_NEAR_T) { return true; }

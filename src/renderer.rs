@@ -157,6 +157,9 @@ fn default_palette() -> [PaletteEntry; PALETTE_SIZE] {
     p[MAT_FLOWER as usize]      = PaletteEntry([1.10, 0.35, 0.65, 1.0]);
     p[MAT_TALL_GRASS as usize]  = PaletteEntry([0.38, 0.70, 0.25, 1.0]);
     p[MAT_CACTUS as usize]      = PaletteEntry([0.28, 0.50, 0.30, 1.0]);
+    // Canopy fringe: never drawn as a cube, but give it the leaf colour in
+    // case any debug path samples it.
+    p[crate::voxel::MAT_LEAF_FRINGE as usize] = PaletteEntry([0.30, 0.58, 0.20, 1.0]);
     p
 }
 
@@ -1862,7 +1865,7 @@ mod gpu_render_tests {
         tree_close.pos = glam::Vec3::new(
             clamp_anchor(leaf_c.x) + 1.0,
             leaf_ground as f32 + 5.0,
-            clamp_anchor(leaf_c.y) - 11.0,
+            clamp_anchor(leaf_c.y) - 16.0,
         );
         tree_close.pitch = 0.12;
         save("tree_close", &tree_close);

@@ -84,7 +84,9 @@ pub fn raycast(camera_world: Vec3, dir: Vec3, world: &World, world_origin: IVec3
         let ly = sy % BRICK_DIM;
         let lz = sz % BRICK_DIM;
         let vi = brick_voxel_idx(lx, ly, lz);
-        (b.occupancy & (1u64 << vi)) != 0
+        if (b.occupancy & (1u64 << vi)) == 0 { return false; }
+        // Invisible canopy fringe is never a pick target.
+        b.materials[vi as usize] != crate::voxel::MAT_LEAF_FRINGE
     };
 
     let argmin_step = |t_max: &mut [f32; 3], voxel: &mut [i32; 3]| -> i32 {

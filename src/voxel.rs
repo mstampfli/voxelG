@@ -134,6 +134,12 @@ pub const MAT_FIRE: u8 = 29;
 pub const MAT_FLOWER: u8 = 30;
 pub const MAT_TALL_GRASS: u8 = 31;
 pub const MAT_CACTUS: u8 = 32;
+/// Invisible canopy-fringe cells painted around tree leaves (radius + 1):
+/// they give the raymarcher's DDA a cell to stand in so the big Better
+/// Leaves tuft quads that PROTRUDE out of leaf blocks are visible from the
+/// side, not only from above. Never rendered as a cube, never casts
+/// shadows, skipped by picking.
+pub const MAT_LEAF_FRINGE: u8 = 33;
 
 #[inline(always)]
 pub fn is_leaf_mat(m: u8) -> bool {
@@ -1437,8 +1443,11 @@ fn try_write_tree_voxel(
     let bb_idx = (bb_x + bb_y * STORAGE_CHUNK_BRICKS
         + bb_z * STORAGE_CHUNK_BRICKS * STORAGE_CHUNK_BRICKS) as usize;
     let vi = brick_voxel_idx(dx % BRICK_DIM, dy % BRICK_DIM, dz % BRICK_DIM);
-    // Trees never overwrite existing solid voxels (terrain wins).
-    if (bricks[bb_idx].occupancy & (1u64 << vi)) == 0 {
+    // Trees never overwrite existing solid voxels (terrain wins) — except
+    // canopy fringe, which real tree parts always replace.
+    let occupied = (bricks[bb_idx].occupancy & (1u64 << vi)) != 0;
+    let is_fringe = occupied && bricks[bb_idx].materials[vi as usize] == MAT_LEAF_FRINGE;
+    if !occupied || (is_fringe && mat != MAT_LEAF_FRINGE) {
         bricks[bb_idx].set(dx % BRICK_DIM, dy % BRICK_DIM, dz % BRICK_DIM, mat);
     }
 }
@@ -1540,7 +1549,7 @@ fn paint_tree(
                 let t_f = i as f32 / layers as f32;
                 let y = base.y + (trunk_h as f32 * (0.35 + t_f * 0.78)) as i32;
                 let r = ((1.0 - t_f).powf(0.85) * 3.5 + 1.0) as i32;
-                paint_sphere(bricks, cmin, cmax, glam::IVec3::new(base.x, y, base.z), r, MAT_LEAVES_PINE);
+                paint_canopy(bricks, cmin, cmax, glam::IVec3::new(base.x, y, base.z), r, MAT_LEAVES_PINE);
             }
         }
         // Birch: slim trunk + small leaf cluster.
@@ -1560,9 +1569,9 @@ fn paint_tree(
                     base.z + (angle.sin() * len as f32) as i32,
                 );
                 paint_line(bricks, cmin, cmax, glam::IVec3::new(base.x, sy, base.z), end, 0, MAT_WOOD_BIRCH);
-                paint_sphere(bricks, cmin, cmax, end, 2, MAT_LEAVES_BIRCH);
+                paint_canopy(bricks, cmin, cmax, end, 2, MAT_LEAVES_BIRCH);
             }
-            paint_sphere(bricks, cmin, cmax, trunk_top, 3, MAT_LEAVES_BIRCH);
+            paint_canopy(bricks, cmin, cmax, trunk_top, 3, MAT_LEAVES_BIRCH);
         }
         // Cactus (saguaro): thick column + 0-2 arms that go out then bend up.
         4 => {
@@ -1616,11 +1625,22 @@ fn paint_tree(
                     base.z + (angle.sin() * len as f32) as i32,
                 );
                 paint_line(bricks, cmin, cmax, glam::IVec3::new(base.x, sy, base.z), end, 0, MAT_WOOD);
-                paint_sphere(bricks, cmin, cmax, end, 3, leaf_mat);
+                paint_canopy(bricks, cmin, cmax, end, 3, leaf_mat);
             }
-            paint_sphere(bricks, cmin, cmax, trunk_top, 4, leaf_mat);
+            paint_canopy(bricks, cmin, cmax, trunk_top, 4, leaf_mat);
         }
     }
+}
+
+// A canopy blob = a fringe shell (radius + 1, only into empty cells) plus
+// the leaf sphere itself (replacing its own interior fringe). The fringe
+// ring is what lets the renderer show tuft quads protruding sideways.
+fn paint_canopy(
+    bricks: &mut [Brick], cmin: (i32, i32, i32), cmax: (i32, i32, i32),
+    c: glam::IVec3, r: i32, leaf_mat: u8,
+) {
+    paint_sphere(bricks, cmin, cmax, c, r + 1, MAT_LEAF_FRINGE);
+    paint_sphere(bricks, cmin, cmax, c, r, leaf_mat);
 }
 
 // thickness=0 → 1-voxel-wide line (no spheres along the line). Otherwise a
