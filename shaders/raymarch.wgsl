@@ -685,75 +685,46 @@ fn leaf_face_texel(mat: u32, voxel_min: vec3<f32>, face_axis: i32, uv: vec2<f32>
     return sprite_texel(sprite, tx, ty);
 }
 
-// 3D "single leaf" cards scattered through a near leaf voxel: small oriented
-// quads carrying the SPR_LEAF_SINGLE sprite, visible through the cutout holes
-// and along canopy edges. Each card's centre shifts with the wind on its own
-// phase plus a slow vertical bob — real geometric sway. Only tested within
-// LEAF_CARD_T of the camera and only when the entry face was a hole.
-const LEAF_CARD_T: f32 = 56.0;
-// Compile-time gate: lets an A/B isolate the cards' cost.
-const LEAF_CARDS: bool = true;
-
-fn leaf_cards_hit(voxel_min: vec3<f32>, origin: vec3<f32>, dir: vec3<f32>, t_lo: f32, t_hi: f32) -> SubHit {
-    var out: SubHit;
-    out.hit = false;
-    out.color_tint = vec3<f32>(1.0);
-    var best_t: f32 = 1e30;
-    for (var i: i32 = 0; i < 4; i = i + 1) {
-        let fi = f32(i);
-        let h1 = hash3f(voxel_min + vec3<f32>(fi * 1.13, fi * 0.37, fi * 0.71));
-        let h2 = hash3f(voxel_min + vec3<f32>(fi * 0.91, fi * 1.53, fi * 1.27));
-        let h3 = hash3f(voxel_min + vec3<f32>(fi * 1.31, fi * 0.79, fi * 0.83));
-        let h4 = hash3f(voxel_min + vec3<f32>(fi * 2.07, fi * 1.11, fi * 1.93));
-        let w = wind_offset(voxel_min, h4 * 6.28, 0.15);
-        let bob = 0.05 * sin(camera.time * 1.6 + h4 * 6.28);
-        let center = voxel_min + vec3<f32>(
-            0.18 + h1 * 0.64 + w.x,
-            0.18 + h2 * 0.64 + bob,
-            0.18 + h3 * 0.64 + w.y,
-        );
-        // Up-biased random orientation, like leaves lying in a canopy.
-        let n = normalize(vec3<f32>(h1 - 0.5, 0.35 + h4 * 0.55, h3 - 0.5));
-        let denom = dot(dir, n);
-        if (abs(denom) < 1e-4) { continue; }
-        let t = dot(center - origin, n) / denom;
-        if (t <= t_lo || t >= min(t_hi, best_t)) { continue; }
-        let lp = origin + dir * t - center;
-        var ua = cross(n, vec3<f32>(0.0, 1.0, 0.0));
-        if (dot(ua, ua) < 1e-4) { ua = vec3<f32>(1.0, 0.0, 0.0); }
-        ua = normalize(ua);
-        let va = cross(n, ua);
-        // Per-card texture-space rotation so the leaves point every which way.
-        let ang = h2 * 6.28318;
-        let ca = cos(ang);
-        let sa = sin(ang);
-        let lu = dot(lp, ua);
-        let lv = dot(lp, va);
-        let ru = lu * ca - lv * sa;
-        let rv = lu * sa + lv * ca;
-        let half_s = 0.40;
-        if (abs(ru) > half_s || abs(rv) > half_s) { continue; }
-        let tx = u32(clamp((ru / half_s * 0.5 + 0.5) * 16.0, 0.0, 15.0));
-        let ty = u32(clamp((rv / half_s * 0.5 + 0.5) * 16.0, 0.0, 15.0));
-        let val = sprite_texel(SPR_LEAF_SINGLE, tx, ty);
-        if (val == 0u) { continue; }
-        best_t = t;
-        out.hit = true;
-        out.t_hit = t;
-        out.normal = select(n, -n, denom > 0.0);
-        var shade = 0.85 + h2 * 0.30;
-        if (val == 2u) { shade = shade * 0.70; }  // shaded underside edge
-        if (val == 3u) { shade = shade * 1.22; }  // midrib highlight
-        out.color_tint = vec3<f32>(shade);
-    }
-    return out;
+// Coherent whole-block waving, the way Minecraft waving-leaves shaders and
+// Allumeria do it: the ENTIRE leaf cube (all faces together, texture anchored
+// to it) shifts by a smooth traveling wind field evaluated at the block
+// centre. Neighbouring blocks sample nearly the same field value, so the
+// canopy waves as one surface — no cracks, no per-face wobble, no geometry
+// clipping. Amplitude stays small (~0.07 voxels); the visible motion comes
+// from the whole canopy moving coherently against the sky.
+fn leaf_wave(block_center: vec3<f32>, t: f32) -> vec3<f32> {
+    let p1 = block_center.x * 0.31 + block_center.z * 0.17 + block_center.y * 0.11;
+    let p2 = block_center.x * 0.13 - block_center.z * 0.29 + block_center.y * 0.07;
+    let s1 = sin(p1 + t * 1.5);
+    let s2 = sin(p2 + t * 2.3 + 1.3);
+    let s3 = sin(p1 * 0.7 - t * 1.1 + 2.1);
+    return vec3<f32>(
+        (s1 + 0.5 * s2) * 0.05,
+        s3 * 0.025,
+        (s2 + 0.5 * s1) * 0.05,
+    );
 }
 
-fn leaf_cube_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u32, detail: bool) -> SubHit {
+// Leaf tone -> brightness tint. The texture carries three tones (dark
+// background leaves, lit leaves, bright highlight tips); strong contrast is
+// what makes individual leaves readable at 16x16, exactly like the
+// Minecraft/Allumeria leaf textures.
+fn leaf_tone_tint(val: u32, scale: f32) -> vec3<f32> {
+    var b = 1.0;
+    if (val == 2u) { b = 0.52; }
+    if (val == 3u) { b = 1.38; }
+    return vec3<f32>(b * scale);
+}
+
+fn leaf_cube_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u32) -> SubHit {
     var out: SubHit;
     out.hit = false;
     out.color_tint = vec3<f32>(1.0);
-    let voxel_min = vec3<f32>(f32(voxel.x), f32(voxel.y), f32(voxel.z));
+    let voxel_base = vec3<f32>(f32(voxel.x), f32(voxel.y), f32(voxel.z));
+    // The whole cube rides the wind. The texture is anchored to the SHIFTED
+    // cube (uv from the shifted corner) so leaves move with their block; the
+    // pattern hashes stay on the static block coord so the art is stable.
+    let voxel_min = voxel_base + leaf_wave(voxel_base + vec3<f32>(0.5), camera.time);
     let inv_dir = vec3<f32>(safe_inv(dir.x), safe_inv(dir.y), safe_inv(dir.z));
     let t0 = (voxel_min - origin) * inv_dir;
     let t1 = (voxel_min + vec3<f32>(1.0) - origin) * inv_dir;
@@ -773,7 +744,7 @@ fn leaf_cube_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u32, 
     if (entry_axis == 0) { uv_e = vec2<f32>(lp_e.z, lp_e.y); }
     else if (entry_axis == 1) { uv_e = vec2<f32>(lp_e.x, lp_e.z); }
     else { uv_e = vec2<f32>(lp_e.x, lp_e.y); }
-    let val_e = leaf_face_texel(mat, voxel_min, entry_axis, fract(uv_e), 0.0);
+    let val_e = leaf_face_texel(mat, voxel_base, entry_axis, fract(uv_e), 0.0);
     if (val_e != 0u) {
         out.hit = true;
         out.t_hit = t_enter;
@@ -782,20 +753,12 @@ fn leaf_cube_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u32, 
         else if (entry_axis == 1) { n.y = select(1.0, -1.0, dir.y > 0.0); }
         else { n.z = select(1.0, -1.0, dir.z > 0.0); }
         out.normal = n;
-        out.color_tint = vec3<f32>(select(1.0, 0.74, val_e == 2u));
+        out.color_tint = leaf_tone_tint(val_e, 1.0);
         return out;
     }
 
-    // ENTRY transparent — the ray is inside the canopy cell. Near the camera,
-    // test the 3D single-leaf cards floating in the cell before falling back
-    // to the exit face.
-    if (detail && LEAF_CARDS) {
-        let ch = leaf_cards_hit(voxel_min, origin, dir, t_enter, t_exit);
-        if (ch.hit) { return ch; }
-    }
-
-    // Test the EXIT face with a different salt so the back of the cube isn't
-    // a mirror of the front.
+    // ENTRY transparent — test the EXIT face with a different salt so the
+    // back of the cube isn't a mirror of the front. Interior faces darker.
     var exit_axis: i32 = 0;
     if (tmax.x <= tmax.y && tmax.x <= tmax.z) { exit_axis = 0; }
     else if (tmax.y <= tmax.z) { exit_axis = 1; }
@@ -805,7 +768,7 @@ fn leaf_cube_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u32, 
     if (exit_axis == 0) { uv_x = vec2<f32>(lp_x.z, lp_x.y); }
     else if (exit_axis == 1) { uv_x = vec2<f32>(lp_x.x, lp_x.z); }
     else { uv_x = vec2<f32>(lp_x.x, lp_x.y); }
-    let val_x = leaf_face_texel(mat, voxel_min, exit_axis, fract(uv_x), 5.7);
+    let val_x = leaf_face_texel(mat, voxel_base, exit_axis, fract(uv_x), 5.7);
     if (val_x != 0u) {
         out.hit = true;
         out.t_hit = t_exit;
@@ -814,7 +777,7 @@ fn leaf_cube_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u32, 
         else if (exit_axis == 1) { n.y = select(-1.0, 1.0, dir.y > 0.0); }
         else { n.z = select(-1.0, 1.0, dir.z > 0.0); }
         out.normal = n;
-        out.color_tint = vec3<f32>(select(0.88, 0.66, val_x == 2u)); // interior faces darker
+        out.color_tint = leaf_tone_tint(val_x, 0.82);
         return out;
     }
 
@@ -915,14 +878,12 @@ fn sprite_cross_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u3
     return out;
 }
 
-// `detail` enables the 3D leaf cards (primary rays near the camera only —
-// shadow rays and far hits stick to the cheap cutout faces).
-fn foliage_subvoxel(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u32, detail: bool) -> SubHit {
+fn foliage_subvoxel(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u32) -> SubHit {
     var hit: SubHit;
     if (mat == MAT_TALL_GRASS || mat == MAT_FLOWER) {
         hit = sprite_cross_hit(voxel, origin, dir, mat);
     } else {
-        hit = leaf_cube_hit(voxel, origin, dir, mat, detail);
+        hit = leaf_cube_hit(voxel, origin, dir, mat);
     }
     return hit;
 }
@@ -1996,10 +1957,9 @@ fn trace_any(origin: vec3<f32>, dir: vec3<f32>, max_dist: f32) -> bool {
             let m = brick_voxel_material(bi, vi);
             if (is_foliage_mat(m)) {
                 // Far foliage blocks as a solid cube (cheap); only near foliage
-                // pays for the dappled-shadow cutout test. Shadow rays never
-                // test the 3D leaf cards (detail = false).
+                // pays for the dappled-shadow cutout test.
                 if (t_cur > FOLIAGE_NEAR_T) { return true; }
-                let fh = foliage_subvoxel(voxel, origin, dir, m, false);
+                let fh = foliage_subvoxel(voxel, origin, dir, m);
                 if (fh.hit) { return true; }
             } else {
                 return true;
@@ -2279,7 +2239,7 @@ fn trace(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
             // survive, but ground decoration (flowers / tall grass) is skipped
             // entirely — drawing it as a solid cube is the "pink blocks" bug.
             if (is_foliage_mat(m) && t_cur <= FOLIAGE_NEAR_T) {
-                let fh = foliage_subvoxel(voxel, origin, dir, m, t_cur <= LEAF_CARD_T);
+                let fh = foliage_subvoxel(voxel, origin, dir, m);
                 if (fh.hit) {
                     out.hit = true;
                     out.mat = m;

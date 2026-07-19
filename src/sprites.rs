@@ -31,43 +31,47 @@ pub const SPR_LEAF_SINGLE: usize = 6;
 
 #[rustfmt::skip]
 const ART: [[&str; SPRITE_DIM]; 7] = [
-    // SPR_LEAF_DENSE — oak/autumn: ~80% opaque, clumped holes, two-tone.
+    // SPR_LEAF_DENSE — oak/autumn: dense canopy face drawn as overlapping
+    // leaf clusters in THREE tones — dark background leaves (o), lit
+    // foreground leaves (#), bright highlight tips (*). The tone contrast is
+    // what makes individual leaves readable at 16x16 (MC/Allumeria style).
     [
-        "##o##..###o##o##",
-        "#o###..###o###o#",
-        "o###o##o##..##o#",
-        "##o#####o#..###o",
-        "..##o##o###o##.#",
-        "#.##.###o####o##",
-        "###o#o##.##o###o",
-        "o##.####o###o##.",
-        "#o##o#..###o###o",
-        "###o###o##o###.#",
-        ".##o#..##o###o##",
-        "#o###o##.####..#",
-        "##.####o###o##.#",
-        "o###o##.##o###o#",
-        "#.##o###o####.##",
-        "##o#..o###o##o##",
+        "..#o.##*..oo.#*.",
+        ".##*o###o.o##o#.",
+        "####o##.#oo###oo",
+        "o#*#..o##*#o##.#",
+        "###o.o####o###*#",
+        "#*#o#o#*##.oo###",
+        ".###o###oo..###o",
+        "o.####*#o.###*#.",
+        "#o##o###.o####oo",
+        "##*#.o#*#oo#*##.",
+        ".###oo###o####.#",
+        "o##.####o##oo##o",
+        "#*#o##*##.####*#",
+        "###oo###o.o###.#",
+        ".#o###o##oo##o#.",
+        "..##*.###.o.##..",
     ],
-    // SPR_LEAF_LIGHT — birch: airier (~65% opaque), smaller clumps.
+    // SPR_LEAF_LIGHT — birch: airier (~63% opaque), same three-tone leaf
+    // clusters with bigger sky gaps.
     [
-        "#o.##..##o.##o#.",
-        ".###o..###.##..#",
-        "o#..#o#o##..#o##",
-        "#.o####.o#..##.o",
-        "..##o#.o###o#..#",
-        "#..#.###o##.#o##",
-        ".##o#o#..##o###.",
-        "o#..###.o#.#o##.",
-        "#o#.o#..##o#.##o",
-        ".##o##.o##o###..",
-        ".#.o#..##o##.o##",
-        "#o.##o##..###..#",
-        "##..###o#.#o##.#",
-        "o#.#o##..#o#.#o.",
-        "#..##o##o###..##",
-        ".#o#..o##.o##o#.",
+        "..#o..#*...o.#..",
+        ".##*.o##o..o#o#.",
+        "#o#..##.#o.###.o",
+        "o#*#..o#.*#o.#.#",
+        ".##o.o##.#o.##*#",
+        "#*#..o#*#..oo.##",
+        ".###.o#.#o...##o",
+        "o..##.#*o..##*#.",
+        "#o#.o##..o.###oo",
+        "##*#..#*#oo.*#..",
+        ".#.#oo##.o##.#.#",
+        "o#..##.#o#.oo#.o",
+        "#*#..#*##..##.*#",
+        ".##oo#.#o..o##.#",
+        "..o##.o##oo.#o#.",
+        "..#.*..##..o.#..",
     ],
     // SPR_LEAF_PINE — needles: sparse (~50%), diagonal strokes.
     [
@@ -145,24 +149,24 @@ const ART: [[&str; SPRITE_DIM]; 7] = [
         ".....o.oo.o.....",
         ".......oo.......",
     ],
-    // SPR_LEAF_SINGLE — one pointed leaf for the 3D canopy cards: tip
-    // top-right, midrib highlight (*), shaded underside edge (o), stem
-    // curling off bottom-left.
+    // SPR_LEAF_SINGLE — one broad pointed leaf for the face-attached canopy
+    // shingles: tip top-right, midrib highlight (*), shaded underside edge
+    // (o), stem curling off bottom-left.
     [
         ".............#..",
         "...........###..",
-        "..........####..",
-        "........#####...",
-        ".......##*###...",
-        "......##*###....",
-        ".....##*###o....",
-        "....##*###o.....",
-        "...##*###o......",
+        ".........#####..",
+        "........####*#..",
+        ".......###*##...",
+        "......###*###...",
+        ".....###*###o...",
+        "....###*###o....",
+        "...###*###o.....",
+        "..###*###o......",
         "..##*###o.......",
-        "..#*###o........",
+        ".##*###o........",
         ".#*###o.........",
-        ".#*##o..........",
-        ".#o#o...........",
+        ".#o##o..........",
         ".oo.............",
         ".o..............",
     ],
