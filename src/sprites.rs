@@ -169,26 +169,27 @@ const ART: [[&str; SPRITE_DIM]; 8] = [
         "....###*##o.....",
         "......#o.#......",
     ],
-    // SPR_LEAF_FACE — the SOLID leaf-block face: a dense leaf weave where
-    // '.' is not transparency but the deepest shadow crevice tone. Four
-    // tones total give the block mass depth without any see-through gaps.
+    // SPR_LEAF_FACE — the LEAF MOSAIC: distinct overlapping oval leaves,
+    // each with a dark outline side (o), a lit body (#) and a bright tip
+    // (*), separated by deep-shadow gaps (.). Triplanar-projected onto the
+    // canopy surface — this is what makes individual leaves readable.
     [
-        "#o##*##o.###o#*#",
-        "o###.###o##*###o",
-        "##*#o#*##.o####o",
-        "#o###o###*##o.##",
-        ".###*###o####*#o",
-        "#o##o#.###o###.#",
-        "##*###o##*#o##*#",
-        "o###.####o###o##",
-        "#*##o#*#.####*#o",
-        "###o###o##o###.#",
-        "o#*#.###*###o##o",
-        "##o###o###.#*###",
-        "#*###o##*#o###o#",
-        "o##.#*##o####.##",
-        "###o###.##*#o##*",
-        "#o##*#o###o####o",
+        "..o#*..*#o...o#*",
+        ".o##*..*##o..o##",
+        "o###*..*###o.o##",
+        "o#o#....o#o..o#o",
+        ".*#o..o#*...*#o.",
+        "*##o..o##*..*##o",
+        "###o.o####..###o",
+        ".o#..o#o#o...o#.",
+        "..o#*..o#*...o#*",
+        ".o##*.o###*..o##",
+        "o###..o###o..o##",
+        "o#o...o#o#......",
+        ".*#o...*#o..*#o.",
+        "*##o..*##o.*###o",
+        "###o..###o..###o",
+        ".o#....o#....o#.",
     ],
 ];
 
@@ -237,13 +238,13 @@ mod tests {
         assert_eq!(w.len(), 8 * SPRITE_WORDS);
     }
 
-    /// The block-face weave must be dense: '.' is a shadow tone there, but
-    /// too much of it would still read as holes once tinted very dark.
+    /// The leaf mosaic needs enough leaf coverage that the gaps read as
+    /// shadow crevices between leaves, not as the dominant surface.
     #[test]
-    fn leaf_face_weave_is_dense() {
+    fn leaf_mosaic_coverage() {
         let w = encoded();
         let o = opacity(&w, SPR_LEAF_FACE);
-        assert!(o >= 0.80, "leaf face weave too sparse: {o}");
+        assert!((0.60..=0.85).contains(&o), "leaf mosaic coverage: {o}");
     }
 
     #[test]

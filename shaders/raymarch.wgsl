@@ -674,105 +674,82 @@ fn leaf_tone_tint(val: u32, scale: f32) -> vec3<f32> {
     return vec3<f32>(b * scale);
 }
 
-// ---------- LEAVES: solid blocks with attached overhanging leaf fringes ----
-// The canopy MASS is solid leaf blocks — faces textured with a dense 4-tone
-// leaf weave (SPR_LEAF_FACE; '.' texels are the deepest shadow crevice, not
-// holes), so there are never gaps between canopy cells. On every face that
-// touches air, a leaf-cluster quad is ATTACHED: parallel to the face, offset
-// a little outward, and drawn LARGER than the block (its sampling frame spans
-// [-0.15, 1.15]) so the ragged clusters overhang the edges, knit neighbouring
-// blocks together and break the cube silhouette. Tops wear the horizontal
-// rosette cap, sides the bushy clusters, pines the needle fan. The fringe
-// slides with the wind; the solid body stays put (stable cached faces).
-fn leaf_block_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u32) -> SubHit {
+// ---------- LEAVES: merged canopy blobs (the actual Allumeria look) ---------
+// Verified against Allumeria promo screenshots: their crowns are smooth
+// ROUNDED masses — lumpy organic balls with clumpy bright/dark leaf texture
+// and a soft light gradient across the whole crown. No cube edges anywhere.
+// Here every leaf voxel renders as a SPHERE (radius 0.9, slightly jittered
+// and wind-swayed) so neighbouring leaf voxels merge into one lumpy blob;
+// worldgen already places leaves in spherical crowns, so the union of balls
+// IS the broccoli-tree silhouette. The smooth sphere normal gives the crown
+// its shading gradient for free; world-space clump noise bands the surface
+// into bright lit tufts / mid leaves / dark crevices.
+fn leaf_blob_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u32) -> SubHit {
     var out: SubHit;
     out.hit = false;
     out.color_tint = vec3<f32>(1.0);
     let voxel_min = vec3<f32>(f32(voxel.x), f32(voxel.y), f32(voxel.z));
-    let inv_dir = vec3<f32>(safe_inv(dir.x), safe_inv(dir.y), safe_inv(dir.z));
-    let t0 = (voxel_min - origin) * inv_dir;
-    let t1 = (voxel_min + vec3<f32>(1.0) - origin) * inv_dir;
-    let tmin = min(t0, t1);
-    let tmax = max(t0, t1);
-    let t_enter = max(max(tmin.x, tmin.y), max(tmin.z, 0.0));
-    let t_exit = min(min(tmax.x, tmax.y), tmax.z);
-    if (t_enter >= t_exit) { return out; }
-
-    // Entry face axis + outward normal (toward the ray origin).
-    var entry_axis: i32 = 0;
-    if (tmin.x >= tmin.y && tmin.x >= tmin.z) { entry_axis = 0; }
-    else if (tmin.y >= tmin.z) { entry_axis = 1; }
-    else { entry_axis = 2; }
-    var n_e = vec3<f32>(0.0);
-    if (entry_axis == 0) { n_e.x = select(1.0, -1.0, dir.x > 0.0); }
-    else if (entry_axis == 1) { n_e.y = select(1.0, -1.0, dir.y > 0.0); }
-    else { n_e.z = select(1.0, -1.0, dir.z > 0.0); }
-
     let vh = hash3f(voxel_min);
-    let mirror_u = fract(vh * 16.0) > 0.5;
-    // Per-voxel brightness variation so a canopy isn't one flat green.
-    let vox_shade = 0.88 + fract(vh * 32.0) * 0.24;
 
-    // ---- attached fringe on exposed faces ----
-    if (voxel_material_at(voxel + vec3<i32>(i32(n_e.x), i32(n_e.y), i32(n_e.z))) == 0u) {
-        // Face tangent frame.
-        var ta: vec3<f32>;
-        var tb: vec3<f32>;
-        if (entry_axis == 0) { ta = vec3<f32>(0.0, 1.0, 0.0); tb = vec3<f32>(0.0, 0.0, 1.0); }
-        else if (entry_axis == 1) { ta = vec3<f32>(1.0, 0.0, 0.0); tb = vec3<f32>(0.0, 0.0, 1.0); }
-        else { ta = vec3<f32>(1.0, 0.0, 0.0); tb = vec3<f32>(0.0, 1.0, 0.0); }
-        var sprite = select(SPR_LEAF_A, SPR_LEAF_B, fract(vh * 4.0) > 0.5);
-        if (mat == MAT_LEAVES_PINE) { sprite = SPR_LEAF_PINE; }
-        else if (entry_axis == 1 && n_e.y > 0.0) { sprite = SPR_LEAF_TOP; }
+    // Blob centre: cell centre, organically jittered, riding the wind.
+    let jit = (vec3<f32>(fract(vh * 13.0), fract(vh * 29.0), fract(vh * 53.0)) - vec3<f32>(0.5)) * 0.10;
+    let w = wind_offset(voxel_min, vh * 6.28, 0.05);
+    let bob = 0.03 * sin(camera.time * 1.3 + vh * 6.28);
+    let c = voxel_min + vec3<f32>(0.5) + jit + vec3<f32>(w.x, bob, w.y);
+    // Radius covers the cell's corners (sqrt(3)/2 = 0.866) so dense canopies
+    // have no pinholes; the overlap between neighbours makes the lumps merge.
+    let r = 0.90;
 
-        let poke = 0.14 + fract(vh * 64.0) * 0.10;
-        let fc = voxel_min + vec3<f32>(0.5) + n_e * (0.5 + poke);
-        let denom = dot(dir, n_e); // entry-face normal always opposes the ray
-        let t_f = dot(fc - origin, n_e) / denom;
-        if (t_f > 0.0) {
-            let lp = origin + dir * t_f - (voxel_min + n_e * (0.5 + poke));
-            let phase = voxel_min.x * 0.31 + voxel_min.z * 0.41 + vh * 6.28;
-            let wind = wind_offset(voxel_min, phase, 0.12);
-            // Sampling frame spans [-0.15, 1.15] so clusters overhang edges.
-            let la = dot(lp, ta) - wind.x * 0.5;
-            let lb = dot(lp, tb) - wind.y * 0.5;
-            let u = (la + 0.15) / 1.3;
-            let v = (lb + 0.15) / 1.3;
-            if (u >= 0.0 && u < 1.0 && v >= 0.0 && v < 1.0) {
-                var tx = u32(u * 16.0);
-                if (mirror_u) { tx = 15u - tx; }
-                let val = sprite_texel(sprite, tx, u32(v * 16.0));
-                if (val != 0u) {
-                    out.hit = true;
-                    out.t_hit = t_f;
-                    out.normal = n_e;
-                    out.color_tint = leaf_tone_tint(val, vox_shade);
-                    return out;
-                }
-            }
-        }
+    let oc = origin - c;
+    let b_half = dot(oc, dir);
+    let disc = b_half * b_half - (dot(oc, oc) - r * r);
+    if (disc <= 0.0) { return out; }
+    let t = -b_half - sqrt(disc);
+    // t <= 0: the ray starts inside this blob (canopy interior) — let it fall
+    // through; it will hit a neighbouring blob's surface from outside.
+    if (t <= 0.0) { return out; }
+
+    let p = origin + dir * t;
+    let sphere_n = (p - c) / r;
+
+    // Crown-smooth normal: the gradient of leaf occupancy around this voxel
+    // approximates the CANOPY surface normal, so the crown shades as one
+    // rounded mass instead of per-voxel bubbles. Isolated bushes (zero
+    // gradient) keep the plain sphere normal.
+    var g = vec3<f32>(0.0);
+    g.x = f32(is_foliage_mat(voxel_material_at(voxel + vec3<i32>(1, 0, 0))))
+        - f32(is_foliage_mat(voxel_material_at(voxel - vec3<i32>(1, 0, 0))));
+    g.y = f32(is_foliage_mat(voxel_material_at(voxel + vec3<i32>(0, 1, 0))))
+        - f32(is_foliage_mat(voxel_material_at(voxel - vec3<i32>(0, 1, 0))));
+    g.z = f32(is_foliage_mat(voxel_material_at(voxel + vec3<i32>(0, 0, 1))))
+        - f32(is_foliage_mat(voxel_material_at(voxel - vec3<i32>(0, 0, 1))));
+    var n = sphere_n;
+    if (dot(g, g) > 0.5) {
+        n = normalize(sphere_n * 0.25 - normalize(g) * 0.75);
     }
 
-    // ---- solid block body: dense leaf weave, no holes ----
-    let lp_e = origin + dir * t_enter - voxel_min;
-    var uv_e: vec2<f32>;
-    if (entry_axis == 0) { uv_e = vec2<f32>(lp_e.z, lp_e.y); }
-    else if (entry_axis == 1) { uv_e = vec2<f32>(lp_e.x, lp_e.z); }
-    else { uv_e = vec2<f32>(lp_e.x, lp_e.y); }
-    let fh = hash3f(voxel_min + vec3<f32>(f32(entry_axis) * 2.7, 0.0, f32(entry_axis) * 1.3));
-    var tx = u32(clamp(uv_e.x * 16.0, 0.0, 15.0));
-    var ty = u32(clamp(uv_e.y * 16.0, 0.0, 15.0));
-    if (fh > 0.5) { tx = 15u - tx; }
-    if (fract(fh * 8.0) > 0.5) { ty = 15u - ty; }
-    let val_f = sprite_texel(SPR_LEAF_FACE, tx, ty);
-    var b = 1.0;
-    if (val_f == 0u) { b = 0.40; }       // shadow crevice
-    else if (val_f == 2u) { b = 0.62; }  // dark leaf
-    else if (val_f == 3u) { b = 1.35; }  // highlight tip
+    // REAL leaves: the authored leaf mosaic (distinct oval leaves with dark
+    // outlines and bright tips), triplanar-projected on the canopy surface.
+    let an = abs(sphere_n);
+    var uv: vec2<f32>;
+    if (an.y > an.x && an.y > an.z) { uv = p.xz; }
+    else if (an.x > an.z)           { uv = p.zy; }
+    else                            { uv = p.xy; }
+    // Per-voxel pattern offset breaks the world-grid alignment of the mosaic
+    // (without it the gaps line up into visible polka-dot rows).
+    let mu = fract(uv * 2.0 + vec2<f32>(fract(vh * 7.0), fract(vh * 23.0)));
+    let val = sprite_texel(SPR_LEAF_FACE, u32(mu.x * 16.0), u32(mu.y * 16.0));
+    var band = 1.05;                     // leaf body
+    if (val == 0u) { band = 0.55; }      // shadow gap between leaves
+    else if (val == 2u) { band = 0.72; } // dark outline side
+    else if (val == 3u) { band = 1.42; } // lit tip
+    // Per-voxel lump variation so the crown isn't one flat green.
+    let vox_shade = 0.90 + fract(vh * 32.0) * 0.20;
+
     out.hit = true;
-    out.t_hit = t_enter;
-    out.normal = n_e;
-    out.color_tint = vec3<f32>(b * vox_shade);
+    out.t_hit = t;
+    out.normal = n;
+    out.color_tint = vec3<f32>(band * vox_shade);
     return out;
 }
 
@@ -875,7 +852,7 @@ fn foliage_subvoxel(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u3
     if (mat == MAT_TALL_GRASS || mat == MAT_FLOWER) {
         hit = sprite_cross_hit(voxel, origin, dir, mat);
     } else {
-        hit = leaf_block_hit(voxel, origin, dir, mat);
+        hit = leaf_blob_hit(voxel, origin, dir, mat);
     }
     return hit;
 }
@@ -1119,11 +1096,8 @@ fn material_texture(p: vec3<f32>, n: vec3<f32>, mat: u32) -> vec3<f32> {
         let sparkle = max(0.0, (nn - 0.85) * 6.0);
         return vec3<f32>(0.97 + sparkle);
     }
-    // Leaves variants.
-    if (mat == 14u || mat == 25u || mat == 26u || mat == 27u) {
-        let nn = vnoise3(vec3<f32>(uv * 4.0, 0.0));
-        return vec3<f32>(0.80 + nn * 0.40);
-    }
+    // Leaves carry their own mosaic detail in leaf_blob_hit — adding noise
+    // here on top just muddied the colour.
     // Ice.
     if (mat == 17u) {
         let nn = vnoise3(vec3<f32>(uv * 1.2, 0.0));

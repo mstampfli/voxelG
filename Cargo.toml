@@ -43,6 +43,9 @@ flate2 = "1"
 naga = { version = "23", features = ["wgsl-in"] }
 # Microbenchmarks for the CPU hot paths (worldgen + picking raycast).
 criterion = "0.5"
+# PNG dump for the headless look-dev screenshots (visual iteration without
+# opening a game window).
+png = "0.17"
 
 [[bench]]
 name = "trace"

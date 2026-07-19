@@ -138,7 +138,7 @@ fn default_palette() -> [PaletteEntry; PALETTE_SIZE] {
         p[m as usize] = PaletteEntry(water);
     }
     p[MAT_WOOD as usize]   = PaletteEntry([0.42, 0.27, 0.13, 1.0]);
-    p[MAT_LEAVES as usize] = PaletteEntry([0.18, 0.46, 0.16, 1.0]);
+    p[MAT_LEAVES as usize] = PaletteEntry([0.30, 0.58, 0.20, 1.0]);
     p[MAT_SNOW as usize]   = PaletteEntry([0.95, 0.96, 0.99, 1.0]);
     p[MAT_LAVA as usize]   = PaletteEntry([1.40, 0.40, 0.10, 1.0]);
     p[MAT_ICE as usize]    = PaletteEntry([0.70, 0.85, 0.95, 1.0]);
@@ -150,7 +150,7 @@ fn default_palette() -> [PaletteEntry; PALETTE_SIZE] {
     p[MAT_WOOD_BIRCH as usize]    = PaletteEntry([0.85, 0.82, 0.72, 1.0]);
     p[MAT_WOOD_PINE as usize]     = PaletteEntry([0.25, 0.15, 0.08, 1.0]);
     p[MAT_LEAVES_BIRCH as usize]  = PaletteEntry([0.55, 0.78, 0.34, 1.0]);
-    p[MAT_LEAVES_PINE as usize]   = PaletteEntry([0.10, 0.32, 0.12, 1.0]);
+    p[MAT_LEAVES_PINE as usize]   = PaletteEntry([0.14, 0.38, 0.16, 1.0]);
     p[MAT_LEAVES_AUTUMN as usize] = PaletteEntry([0.90, 0.42, 0.15, 1.0]);
     p[MAT_SMOKE as usize]   = PaletteEntry([0.65, 0.65, 0.70, 1.0]);
     p[MAT_FIRE as usize]    = PaletteEntry([1.60, 0.60, 0.10, 1.0]);
@@ -1524,7 +1524,7 @@ mod gpu_render_tests {
         cam.pos.y = s.h as f32 + 30.0;
         cam.pitch = -0.35;
 
-        let rgba = render_rgba(&world, &cam)?;
+        let rgba = render_rgba(&world, &cam, 320, 200)?;
         let mut min = 1.0f32;
         let mut max = 0.0f32;
         let mut sum = 0.0f64;
@@ -1544,9 +1544,8 @@ mod gpu_render_tests {
     /// Render one 320x200 frame of `world` from `cam` through the full
     /// pipeline (half-res clouds, cs_main, a reprojection-validating second
     /// frame, deferred transparent) and read the RGBA bytes back.
-    fn render_rgba(world: &World, cam: &Camera) -> Option<Vec<u8>> {
+    fn render_rgba(world: &World, cam: &Camera, w: u32, h: u32) -> Option<Vec<u8>> {
         let (device, queue) = headless_device()?;
-        let (w, h) = (320u32, 200u32);
         let wo = world.world_origin_voxel();
         let cu = CameraUniform::from_camera(cam, w, h, 0.0, wo, [0.0, 0.0], 0.0);
 
@@ -1811,7 +1810,7 @@ mod gpu_render_tests {
         let mut wcam = Camera::new();
         wcam.pos = glam::Vec3::new(clamp_anchor(water_c.x), 86.0, clamp_anchor(water_c.y) - 40.0);
         wcam.pitch = -0.45;
-        let Some(wframe) = render_rgba(&world, &wcam) else {
+        let Some(wframe) = render_rgba(&world, &wcam, 320, 200) else {
             eprintln!("no GPU adapter — skipping water/foliage content test");
             return;
         };
@@ -1826,10 +1825,65 @@ mod gpu_render_tests {
             clamp_anchor(leaf_c.y) - 30.0,
         );
         fcam.pitch = -0.35;
-        let fframe = render_rgba(&world, &fcam).unwrap();
+        let fframe = render_rgba(&world, &fcam, 320, 200).unwrap();
         let green = ground_fraction(&fframe, 320, 200, |r, g, b| g > r + 0.03 && g > b + 0.03);
         eprintln!("foliage view green fraction: {green:.3}");
         assert!(green > 0.10, "foliage view has too few green pixels ({green:.3})");
+    }
+
+    /// Look-dev screenshots without a window: render a canopy close-up, a
+    /// forest mid-shot and a water view to PNGs under target/lookdev/ so
+    /// visual iteration can happen headlessly (view the PNGs directly).
+    /// `cargo test --lib dump_lookdev_views -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn dump_lookdev_views() {
+        let (w, h) = (960u32, 540u32); // bytes_per_row stays 256-aligned
+        let mut world = World::new();
+        world.fill_demo_terrain();
+        let (water_c, leaf_c, leaf_ground) = find_scene_anchors(&world);
+        std::fs::create_dir_all("target/lookdev").unwrap();
+
+        let mut save = |name: &str, cam: &Camera| {
+            let Some(rgba) = render_rgba(&world, cam, w, h) else {
+                eprintln!("no GPU — skipping lookdev dump");
+                return;
+            };
+            let path = format!("target/lookdev/{name}.png");
+            let file = std::fs::File::create(&path).unwrap();
+            let mut enc = png::Encoder::new(std::io::BufWriter::new(file), w, h);
+            enc.set_color(png::ColorType::Rgba);
+            enc.set_depth(png::BitDepth::Eight);
+            enc.write_header().unwrap().write_image_data(&rgba).unwrap();
+            eprintln!("wrote {path}");
+        };
+
+        let mut tree_close = Camera::new();
+        tree_close.pos = glam::Vec3::new(
+            clamp_anchor(leaf_c.x) + 1.0,
+            leaf_ground as f32 + 5.0,
+            clamp_anchor(leaf_c.y) - 11.0,
+        );
+        tree_close.pitch = 0.12;
+        save("tree_close", &tree_close);
+
+        let mut forest_mid = Camera::new();
+        forest_mid.pos = glam::Vec3::new(
+            clamp_anchor(leaf_c.x),
+            leaf_ground as f32 + 9.0,
+            clamp_anchor(leaf_c.y) - 32.0,
+        );
+        forest_mid.pitch = -0.08;
+        save("forest_mid", &forest_mid);
+
+        let mut water_view = Camera::new();
+        water_view.pos = glam::Vec3::new(
+            clamp_anchor(water_c.x),
+            72.0,
+            clamp_anchor(water_c.y) - 26.0,
+        );
+        water_view.pitch = -0.35;
+        save("water_view", &water_view);
     }
 
     /// Time the raymarch + deferred-transparent dispatches at 1920x1080 for
