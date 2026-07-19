@@ -42,14 +42,16 @@ Shading and effects:
 - **Glass**: Fresnel reflection plus per-channel refraction for chromatic dispersion (n = 1.48/1.50/1.52),
   total-internal-reflection fallback to the reflected ray, distance-compounding tint; the 3-trace
   dispersion path is gated to grazing angles.
-- **Foliage**, resolved sub-voxel inside the DDA with hand-authored pixel art (`src/sprites.rs`, ASCII
-  art encoded to 2-bit texels): rigid cube leaves with authored 16×16 cutout masks tested on entry and
-  exit faces (dense/light/pine variants, hash-picked mirror flips), plus — within 56 voxels — oriented
-  single-leaf sprite cards floating inside each leaf voxel that ride the wind on per-card phases (visible
-  individual leaves with real geometric sway). Tall grass and flowers (poppy, daisy) are crossed quads
-  carrying authored sprites, sheared by the wind in shared world space so the X always intersects. Leaf
-  face hits are stable axis faces, so they receive cube ambient occlusion and reuse the reprojected
-  lighting cache; grass blocks render dirt sides with a ragged grass fringe.
+- **Foliage**, resolved sub-voxel inside the DDA. Leaves port the model and texture of Motschen's
+  [Better Leaves](https://github.com/TeamMidnightDust/BetterLeavesLite) resource pack (MIT): each leaf
+  block is a cutout cube (faces sample the centre of the pack's pre-rounded 32×32 tuft texture, carried
+  as ASCII art in `src/sprites.rs`) plus two big double-sided diagonal tuft quads (2.3×2.0 blocks at
+  22.5°/−45°, four hash-picked rotations per block) that shear gently in the wind. Worldgen paints an
+  invisible one-voxel fringe shell around every canopy whose cells render the neighbouring blocks'
+  protruding tuft parts, so the bushy overhang is visible from every angle — fringe never draws as a
+  cube, casts no shadows and is skipped by picking. Tall grass and flowers (poppy, daisy) are crossed
+  quads carrying authored sprites, sheared by the wind in shared world space so the X always intersects;
+  grass blocks render dirt sides with a ragged grass fringe.
 - **Lighting**: day/night sun cycle with sunset scattering, sun disc, halo and stars; single-sample
   golden-angle PCF soft shadows jittered with interleaved gradient noise (TAA accumulates the penumbra);
   bit-test ambient occlusion bilinearly interpolated across the hit face.
