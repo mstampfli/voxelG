@@ -22,7 +22,8 @@ pub const SPR_LEAF_PINE: usize = 2; // drooping needle fan for pine X-quads
 pub const SPR_TALL_GRASS: usize = 3;
 pub const SPR_POPPY: usize = 4;
 pub const SPR_DAISY: usize = 5;
-pub const SPR_LEAF_TOP: usize = 6; // horizontal canopy layer, seen from above
+pub const SPR_LEAF_TOP: usize = 6; // horizontal canopy cap, seen from above
+pub const SPR_LEAF_FACE: usize = 7; // solid block-face texture (0 = shadow crevice)
 
 /// IMPORTANT (flowers): the cross-quad renderer draws the SAME sprite on two
 /// diagonal planes through the voxel centre. The stem must sit exactly on the
@@ -30,46 +31,45 @@ pub const SPR_LEAF_TOP: usize = 6; // horizontal canopy layer, seen from above
 /// quads render two separate stems instead of one X.
 
 #[rustfmt::skip]
-const ART: [[&str; SPRITE_DIM]; 7] = [
-    // SPR_LEAF_A — upright X-quad leaf cluster: a bush of overlapping
-    // pointed leaves with a ragged silhouette (transparent border texels so
-    // the quad edges never read as straight lines). Three tones: dark
-    // background leaves (o), lit leaves (#), highlight tips (*).
+const ART: [[&str; SPRITE_DIM]; 8] = [
+    // SPR_LEAF_A — bushy leaf-cluster quad for canopy fringes: large clear
+    // leaves with highlight tips (*), dark understory (o), ragged silhouette
+    // (transparent border texels so quad edges never read as straight lines).
     [
-        "......#*........",
-        ".....###..#*....",
-        "..#..####o###...",
-        ".#*#o#####o##*..",
-        ".####o##*####o..",
-        "o#####o######.#.",
-        "###*##o##*##o##.",
-        ".#o#####o#####*.",
-        "#####*##o##o###.",
-        ".o###o#####o##..",
-        "..#####*####o#..",
-        ".#*#o######*##..",
-        "..###o##o####...",
-        "...##*##o##*#...",
-        "....#o..###.....",
-        "......#..o#.....",
+        "....#*....##....",
+        "..######.####*..",
+        ".o##*#########..",
+        "#######o####o#*.",
+        "o####o##*######.",
+        ".#o####*####o##o",
+        "..######o######.",
+        ".#*##o####*###o.",
+        "###*####o######.",
+        "o######o####*##o",
+        ".####*####o####.",
+        "..o###o##*###o..",
+        ".##*#####o##*#..",
+        "..#o##*####o#...",
+        "....###.##o.....",
+        "......#*...#....",
     ],
-    // SPR_LEAF_B — cluster variant: bushier low half, different lobe layout.
+    // SPR_LEAF_B — fringe cluster variant with a different silhouette.
     [
-        "........#*......",
-        "...#*..###......",
-        "..###o#####*....",
-        ".#####o####o#...",
-        "..o###*#####*#..",
-        ".#####o#o#####..",
-        "#*##o#####o###*.",
-        ".###.####*#####o",
-        "o#####o######.#.",
-        ".#*##o##*##o###.",
-        "####o######o##*.",
-        ".o###*##o#####..",
-        ".####o####*##...",
-        "..#*###o####.#..",
-        "...##o.###*.....",
+        ".....##....#*...",
+        "...#####.#####..",
+        ".#########*###o.",
+        ".o###*####o####.",
+        "#########o###*#o",
+        "o###o#*########.",
+        ".#####o###o####o",
+        "#*####o#*######.",
+        ".######o######o.",
+        "o##*#####o##*##.",
+        "#####o#*#######o",
+        ".o####o###o###..",
+        "..##*######*#o..",
+        "..o######o##.#..",
+        "....##o.###.....",
         ".....#...#o.....",
     ],
     // SPR_LEAF_PINE — drooping needle fan for pine X-quads.
@@ -169,6 +169,27 @@ const ART: [[&str; SPRITE_DIM]; 7] = [
         "....###*##o.....",
         "......#o.#......",
     ],
+    // SPR_LEAF_FACE — the SOLID leaf-block face: a dense leaf weave where
+    // '.' is not transparency but the deepest shadow crevice tone. Four
+    // tones total give the block mass depth without any see-through gaps.
+    [
+        "#o##*##o.###o#*#",
+        "o###.###o##*###o",
+        "##*#o#*##.o####o",
+        "#o###o###*##o.##",
+        ".###*###o####*#o",
+        "#o##o#.###o###.#",
+        "##*###o##*#o##*#",
+        "o###.####o###o##",
+        "#*##o#*#.####*#o",
+        "###o###o##o###.#",
+        "o#*#.###*###o##o",
+        "##o###o###.#*###",
+        "#*###o##*#o###o#",
+        "o##.#*##o####.##",
+        "###o###.##*#o##*",
+        "#o##*#o###o####o",
+    ],
 ];
 
 /// Encode all sprites into the flat u32 word array the shader indexes.
@@ -213,7 +234,16 @@ mod tests {
     #[test]
     fn encodes_all_sprites() {
         let w = encoded();
-        assert_eq!(w.len(), 7 * SPRITE_WORDS);
+        assert_eq!(w.len(), 8 * SPRITE_WORDS);
+    }
+
+    /// The block-face weave must be dense: '.' is a shadow tone there, but
+    /// too much of it would still read as holes once tinted very dark.
+    #[test]
+    fn leaf_face_weave_is_dense() {
+        let w = encoded();
+        let o = opacity(&w, SPR_LEAF_FACE);
+        assert!(o >= 0.80, "leaf face weave too sparse: {o}");
     }
 
     #[test]
