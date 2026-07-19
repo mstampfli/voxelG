@@ -83,12 +83,13 @@ struct PlayersBuf {
 // encoded at startup — hand-made cutout art, not hash noise.
 @group(0) @binding(18) var<storage, read> sprites: array<u32>;
 
-const SPR_LEAF_DENSE: u32 = 0u;
-const SPR_LEAF_LIGHT: u32 = 1u;
-const SPR_LEAF_PINE:  u32 = 2u;
-const SPR_TALL_GRASS: u32 = 3u;
-const SPR_POPPY:      u32 = 4u;
-const SPR_DAISY:      u32 = 5u;
+const SPR_LEAF_DENSE:  u32 = 0u;
+const SPR_LEAF_LIGHT:  u32 = 1u;
+const SPR_LEAF_PINE:   u32 = 2u;
+const SPR_TALL_GRASS:  u32 = 3u;
+const SPR_POPPY:       u32 = 4u;
+const SPR_DAISY:       u32 = 5u;
+const SPR_LEAF_SINGLE: u32 = 6u;
 
 // Texel (x, y) of a sprite; y = 0 is the sprite's bottom row. 16 u32s per
 // sprite, bit (y*16 + x)*2.
@@ -418,7 +419,15 @@ fn cs_transparent(@builtin(global_invocation_id) gid: vec3<u32>) {
     var col: vec3<f32>;
     if (rec.y < 1.5) {
         hit.mat = MAT_WATER_L8;
-        hit.normal = decode_water_normal(rec.z);
+        if (i32(rec.z + 0.5) == 2) {
+            // Top surface: exact smooth field normal at the hit point (the
+            // per-pixel derivative of the same field the facets displace by).
+            let p_hit = camera.origin + dir * rec.x;
+            let f = water_field(p_hit.xz, camera.time);
+            hit.normal = normalize(vec3<f32>(-f.y, 1.0, -f.z));
+        } else {
+            hit.normal = decode_face_normal(rec.z);
+        }
         col = shade_water_top(hit, camera.origin, dir);
     } else {
         hit.mat = MAT_GLASS;
@@ -474,9 +483,9 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let cam_mat_chk = voxel_material_at(cam_voxel_chk);
     var cam_in_water = is_water_mat(cam_mat_chk);
     if (cam_in_water && !is_water_mat(voxel_material_at(cam_voxel_chk + vec3<i32>(0, 1, 0)))) {
-        // Surface cell: the eye is only underwater if it's below the plate.
+        // Surface cell: the eye is only underwater if it's below the facet.
         let lf = f32(cam_mat_chk - MAT_WATER_L1 + 1u) * 0.125;
-        let plate = water_plate_for_cell(cam_voxel_chk, lf);
+        let plate = water_cell_plane(cam_voxel_chk, lf);
         let lp = camera.origin - vec3<f32>(f32(cam_voxel_chk.x), f32(cam_voxel_chk.y), f32(cam_voxel_chk.z));
         let s = plate.h + plate.slope.x * (lp.x - 0.5) + plate.slope.y * (lp.z - 0.5);
         cam_in_water = lp.y <= s;
@@ -676,7 +685,71 @@ fn leaf_face_texel(mat: u32, voxel_min: vec3<f32>, face_axis: i32, uv: vec2<f32>
     return sprite_texel(sprite, tx, ty);
 }
 
-fn leaf_cube_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u32) -> SubHit {
+// 3D "single leaf" cards scattered through a near leaf voxel: small oriented
+// quads carrying the SPR_LEAF_SINGLE sprite, visible through the cutout holes
+// and along canopy edges. Each card's centre shifts with the wind on its own
+// phase plus a slow vertical bob — real geometric sway. Only tested within
+// LEAF_CARD_T of the camera and only when the entry face was a hole.
+const LEAF_CARD_T: f32 = 56.0;
+// Compile-time gate: lets an A/B isolate the cards' cost.
+const LEAF_CARDS: bool = true;
+
+fn leaf_cards_hit(voxel_min: vec3<f32>, origin: vec3<f32>, dir: vec3<f32>, t_lo: f32, t_hi: f32) -> SubHit {
+    var out: SubHit;
+    out.hit = false;
+    out.color_tint = vec3<f32>(1.0);
+    var best_t: f32 = 1e30;
+    for (var i: i32 = 0; i < 4; i = i + 1) {
+        let fi = f32(i);
+        let h1 = hash3f(voxel_min + vec3<f32>(fi * 1.13, fi * 0.37, fi * 0.71));
+        let h2 = hash3f(voxel_min + vec3<f32>(fi * 0.91, fi * 1.53, fi * 1.27));
+        let h3 = hash3f(voxel_min + vec3<f32>(fi * 1.31, fi * 0.79, fi * 0.83));
+        let h4 = hash3f(voxel_min + vec3<f32>(fi * 2.07, fi * 1.11, fi * 1.93));
+        let w = wind_offset(voxel_min, h4 * 6.28, 0.15);
+        let bob = 0.05 * sin(camera.time * 1.6 + h4 * 6.28);
+        let center = voxel_min + vec3<f32>(
+            0.18 + h1 * 0.64 + w.x,
+            0.18 + h2 * 0.64 + bob,
+            0.18 + h3 * 0.64 + w.y,
+        );
+        // Up-biased random orientation, like leaves lying in a canopy.
+        let n = normalize(vec3<f32>(h1 - 0.5, 0.35 + h4 * 0.55, h3 - 0.5));
+        let denom = dot(dir, n);
+        if (abs(denom) < 1e-4) { continue; }
+        let t = dot(center - origin, n) / denom;
+        if (t <= t_lo || t >= min(t_hi, best_t)) { continue; }
+        let lp = origin + dir * t - center;
+        var ua = cross(n, vec3<f32>(0.0, 1.0, 0.0));
+        if (dot(ua, ua) < 1e-4) { ua = vec3<f32>(1.0, 0.0, 0.0); }
+        ua = normalize(ua);
+        let va = cross(n, ua);
+        // Per-card texture-space rotation so the leaves point every which way.
+        let ang = h2 * 6.28318;
+        let ca = cos(ang);
+        let sa = sin(ang);
+        let lu = dot(lp, ua);
+        let lv = dot(lp, va);
+        let ru = lu * ca - lv * sa;
+        let rv = lu * sa + lv * ca;
+        let half_s = 0.40;
+        if (abs(ru) > half_s || abs(rv) > half_s) { continue; }
+        let tx = u32(clamp((ru / half_s * 0.5 + 0.5) * 16.0, 0.0, 15.0));
+        let ty = u32(clamp((rv / half_s * 0.5 + 0.5) * 16.0, 0.0, 15.0));
+        let val = sprite_texel(SPR_LEAF_SINGLE, tx, ty);
+        if (val == 0u) { continue; }
+        best_t = t;
+        out.hit = true;
+        out.t_hit = t;
+        out.normal = select(n, -n, denom > 0.0);
+        var shade = 0.85 + h2 * 0.30;
+        if (val == 2u) { shade = shade * 0.70; }  // shaded underside edge
+        if (val == 3u) { shade = shade * 1.22; }  // midrib highlight
+        out.color_tint = vec3<f32>(shade);
+    }
+    return out;
+}
+
+fn leaf_cube_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u32, detail: bool) -> SubHit {
     var out: SubHit;
     out.hit = false;
     out.color_tint = vec3<f32>(1.0);
@@ -713,8 +786,16 @@ fn leaf_cube_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u32) 
         return out;
     }
 
-    // ENTRY transparent — test the EXIT face with a different salt so the
-    // back of the cube isn't a mirror of the front.
+    // ENTRY transparent — the ray is inside the canopy cell. Near the camera,
+    // test the 3D single-leaf cards floating in the cell before falling back
+    // to the exit face.
+    if (detail && LEAF_CARDS) {
+        let ch = leaf_cards_hit(voxel_min, origin, dir, t_enter, t_exit);
+        if (ch.hit) { return ch; }
+    }
+
+    // Test the EXIT face with a different salt so the back of the cube isn't
+    // a mirror of the front.
     var exit_axis: i32 = 0;
     if (tmax.x <= tmax.y && tmax.x <= tmax.z) { exit_axis = 0; }
     else if (tmax.y <= tmax.z) { exit_axis = 1; }
@@ -804,11 +885,14 @@ fn sprite_cross_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u3
          || local.y < 0.0 || local.y > 1.0
          || local.z < 0.0 || local.z > 1.0) { continue; }
 
-        let s = (local.x - 0.5) * pt.x + (local.z - 0.5) * pt.z;
         let v = local.y;
-        // Wind shears the sprite sideways, scaled by height above the root.
-        let wind_along = (wind.x * pt.x + wind.y * pt.z) * v;
-        let s_w = s - wind_along;
+        // Shear the sampling space by the wind in WORLD xz, weighted by
+        // height — identically for both planes, so the two quads keep
+        // intersecting in one vertical line. (Shearing each plane along its
+        // own tangent split the X into two separate stems.)
+        let sx = local.x - wind.x * v;
+        let sz = local.z - wind.y * v;
+        let s_w = (sx - 0.5) * pt.x + (sz - 0.5) * pt.z;
 
         let u = clamp((s_w + 0.70711) / 1.41421, 0.0, 0.99999);
         var tx = u32(u * 16.0);
@@ -831,12 +915,14 @@ fn sprite_cross_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u3
     return out;
 }
 
-fn foliage_subvoxel(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u32) -> SubHit {
+// `detail` enables the 3D leaf cards (primary rays near the camera only —
+// shadow rays and far hits stick to the cheap cutout faces).
+fn foliage_subvoxel(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u32, detail: bool) -> SubHit {
     var hit: SubHit;
     if (mat == MAT_TALL_GRASS || mat == MAT_FLOWER) {
         hit = sprite_cross_hit(voxel, origin, dir, mat);
     } else {
-        hit = leaf_cube_hit(voxel, origin, dir, mat);
+        hit = leaf_cube_hit(voxel, origin, dir, mat, detail);
     }
     return hit;
 }
@@ -1122,17 +1208,19 @@ fn ambient_color() -> vec3<f32> {
 //   ∂h_i/∂z = -A_i · k_i · D_i.z · sin(...)
 //
 // Then normal = normalize(vec3(-Σ∂h/∂x, 1, -Σ∂h/∂z)).
-// The 4-wave Gerstner table: (dir.x, dir.z, k=2π/λ, A, ω-multiplier, phase).
-// Shared by water_normal and water_height so they always model the same ocean.
+// The 4-wave Gerstner table, heights in VOXELS: (dir.x, dir.z, k=2π/λ, A, ω, phase).
+// A proper little spectrum — one long swell, a secondary sea, and two chop
+// waves — so the surface reads as traveling wavefronts, not random bobbing.
+// λ = 26 / 13 / 7 / 3.5 voxels; amplitudes sum to ~0.108 voxels.
 fn wave_param(i: i32) -> array<f32, 6> {
-    if      (i == 0) { return array<f32, 6>(  1.00,  0.20, 0.60, 0.16, 1.10, 0.0); }
-    else if (i == 1) { return array<f32, 6>( -0.55,  0.85, 0.95, 0.10, 1.40, 1.7); }
-    else if (i == 2) { return array<f32, 6>(  0.30, -0.95, 1.50, 0.05, 1.90, 3.1); }
-    else             { return array<f32, 6>( -0.90, -0.30, 2.40, 0.03, 2.60, 5.2); }
+    if      (i == 0) { return array<f32, 6>(  0.97,  0.24, 0.242, 0.055, 0.90, 0.0); }
+    else if (i == 1) { return array<f32, 6>(  0.83, -0.55, 0.483, 0.030, 1.35, 1.7); }
+    else if (i == 2) { return array<f32, 6>( -0.40,  0.92, 0.898, 0.015, 1.95, 3.1); }
+    else             { return array<f32, 6>( -0.90, -0.43, 1.795, 0.008, 2.80, 5.2); }
 }
 
-// Height + gradient of the 4-wave Gerstner field in one loop:
-// returns (h, dh/dx, dh/dz). The amplitudes sum to 0.34 (see wave_param).
+// Height + gradient of the wave field in one loop: returns (h, dh/dx, dh/dz),
+// h in voxels around the resting surface.
 fn water_field(xz: vec2<f32>, t: f32) -> vec3<f32> {
     var h = 0.0;
     var dx = 0.0;
@@ -1148,58 +1236,36 @@ fn water_field(xz: vec2<f32>, t: f32) -> vec3<f32> {
     return vec3<f32>(h, dx, dz);
 }
 
-// ---------- VOXEL WATER: clustered plates instead of a smooth fake normal ----
+// ---------- VOXEL WATER: continuous displaced surface -----------------------
 // The water surface is real sub-voxel geometry: every water voxel with air
-// above renders a flat plate inside its cell. Plates are grouped into
-// WATER_CLUSTER x WATER_CLUSTER clusters that share ONE Gerstner sample —
-// one quantised height (WATER_STEP increments) and ONE quantised orientation:
-// horizontal, or tilted exactly 30 degrees along +-x / +-z. Between clusters
-// the height differences show as small vertical water walls. The result is
-// blocky faceted waves that actually displace (parallax, real silhouettes)
-// instead of a smooth normal painted on a flat plane, and every pixel of a
-// cluster reflects/refracts with the SAME normal, so the deferred secondary
-// rays stay warp-coherent.
-const WATER_DETAIL_T: f32 = 96.0;      // beyond this, water is a plain cube top
-const WATER_CLUSTER: f32 = 4.0;        // plate size in voxels (1.0 = per-voxel)
-const WATER_STEP: f32 = 1.0 / 16.0;    // plate heights snap to sixteenths
-const WATER_BASE: f32 = 0.58;          // resting surface height in the cell
-const WATER_AMP: f32 = 0.12;           // wave amplitude (cell fraction)
-const WATER_TILT: f32 = 0.57735027;    // tan(30 deg): the only non-flat slope
-const WATER_TILT_MIN_GRAD: f32 = 0.09; // gradient below this = flat plate
+// above renders a planar facet inside its cell, sampled from the CONTINUOUS
+// wave field at the cell's own centre (height + true gradient — the standard
+// sum-of-Gerstner displacement every "waving water" shader uses). Adjacent
+// cells sample the same smooth field, so neighbouring facets line up to
+// sub-pixel: no steps, no quantisation, just traveling waves with real
+// parallax and silhouettes. Vertical water walls only appear where they
+// should — shores, waterfalls, and physics level differences. Shading uses
+// the exact per-pixel field normal (cs_transparent); only the ray-facet
+// intersection is piecewise planar.
+// (v1 used 4x4 clusters with 1/16-step heights and 30°-quantised tilts; that
+// read as chaotic bobbing, not waves — see git history.)
+const WATER_DETAIL_T: f32 = 96.0;   // beyond this, water is a plain cube top
+const WATER_BASE: f32 = 0.72;       // resting surface height inside the cell
+const WATER_MAX_SLOPE: f32 = 0.30;  // facet slope clamp: keeps it inside the cell
 
 struct WaterPlate {
     h: f32,           // surface height at THIS cell's centre (cell fraction)
-    slope: vec2<f32>, // (dh/dx, dh/dz); at most one axis non-zero: 0 or +-tan30
+    slope: vec2<f32>, // true field gradient (dh/dx, dh/dz), clamped
 }
 
-fn water_plate_for_cell(voxel: vec3<i32>, level_frac: f32) -> WaterPlate {
-    // One wave sample per cluster, taken at the cluster centre.
-    let cxz = floor(vec2<f32>(f32(voxel.x), f32(voxel.z)) / WATER_CLUSTER);
-    let cc = (cxz + vec2<f32>(0.5)) * WATER_CLUSTER;
-    let f = water_field(cc, camera.time);
-    // Quantised plate height: snapping to WATER_STEP makes the plate rise in
-    // discrete ticks — deliberately chunky, like the rest of the world.
-    let amp = clamp(f.x * (WATER_AMP / 0.34), -WATER_AMP, WATER_AMP);
-    let h_plate = WATER_BASE + floor(amp / WATER_STEP + 0.5) * WATER_STEP;
-    // Quantised orientation: flat unless the Gerstner gradient clearly picks
-    // a dominant axis, then exactly 30 degrees along that axis.
-    var slope = vec2<f32>(0.0);
-    if (max(abs(f.y), abs(f.z)) > WATER_TILT_MIN_GRAD) {
-        if (abs(f.y) >= abs(f.z)) { slope.x = sign(f.y) * WATER_TILT; }
-        else                      { slope.y = sign(f.z) * WATER_TILT; }
-    }
-    // Continue the cluster plane to this cell's centre. Cells where the plane
-    // would poke out of the cell go flat at a clamped height (terraced cluster
-    // edges) so the in-cell facet always stays inside [0, 1].
+fn water_cell_plane(voxel: vec3<i32>, level_frac: f32) -> WaterPlate {
     let vc = vec2<f32>(f32(voxel.x) + 0.5, f32(voxel.z) + 0.5);
-    var h_cell = h_plate + dot(slope, vc - cc);
-    let margin = 0.5 * (abs(slope.x) + abs(slope.y)) + 0.04;
-    if (h_cell < margin || h_cell > 1.0 - margin) {
-        h_cell = clamp(h_cell, 0.06, 0.94);
-        slope = vec2<f32>(0.0);
-    }
+    let f = water_field(vc, camera.time);
+    let slope = clamp(f.yz, vec2<f32>(-WATER_MAX_SLOPE), vec2<f32>(WATER_MAX_SLOPE));
+    let margin = 0.5 * (abs(slope.x) + abs(slope.y)) + 0.02;
+    let h = clamp(WATER_BASE + f.x, margin, 1.0 - margin);
     var p: WaterPlate;
-    p.h = h_cell * level_frac;         // partial (physics) water scales down
+    p.h = h * level_frac;      // partial (physics) water scales down
     p.slope = slope * level_frac;
     return p;
 }
@@ -1228,7 +1294,7 @@ fn water_subvoxel(
         return out;
     }
     let level_frac = f32(m - MAT_WATER_L1 + 1u) * 0.125;
-    let plate = water_plate_for_cell(voxel, level_frac);
+    let plate = water_cell_plane(voxel, level_frac);
     let vmin = vec3<f32>(f32(voxel.x), f32(voxel.y), f32(voxel.z));
     let p0 = origin + dir * t_entry - vmin;
     // Local plate surface: S(xz) = h + slope . (xz - cell centre).
@@ -1255,24 +1321,12 @@ fn water_subvoxel(
     return out;
 }
 
-// Water normals are quantised (6 axis faces + 4 tilted plates), so the
-// deferred transparent record can carry them exactly in one float code.
+// Water normal record code: any up-facing surface hit (facet or cube top)
+// gets code 2; cs_transparent recomputes the exact smooth field normal at
+// the hit point. Walls and undersides keep their axis face codes.
 fn encode_water_normal(n: vec3<f32>) -> f32 {
-    if (n.y > 0.5 && n.y < 0.999) {
-        if (n.x < -0.05) { return 6.0; }
-        if (n.x >  0.05) { return 7.0; }
-        if (n.z < -0.05) { return 8.0; }
-        if (n.z >  0.05) { return 9.0; }
-    }
+    if (n.y > 0.9) { return 2.0; }
     return encode_face_normal(n);
-}
-fn decode_water_normal(c: f32) -> vec3<f32> {
-    let i = i32(c + 0.5);
-    if (i == 6) { return vec3<f32>(-0.5, 0.8660254, 0.0); }
-    if (i == 7) { return vec3<f32>( 0.5, 0.8660254, 0.0); }
-    if (i == 8) { return vec3<f32>(0.0, 0.8660254, -0.5); }
-    if (i == 9) { return vec3<f32>(0.0, 0.8660254,  0.5); }
-    return decode_face_normal(c);
 }
 
 // Face normal + entry distance for the cell a ray just stepped into. `last_axis`
@@ -1570,7 +1624,8 @@ fn shade_water_top(hit: Hit, origin: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
     var foam = 0.0;
     if (under.hit && under.t_hit < 2.5) {
         let shore = 1.0 - clamp(under.t_hit / 2.5, 0.0, 1.0);
-        let crest = clamp(water_field(p_hit.xz, camera.time).x * 4.0 + 0.5, 0.0, 1.0);
+        // Field heights are in voxels (±~0.11), so scale the crest gate up.
+        let crest = clamp(water_field(p_hit.xz, camera.time).x * 9.0 + 0.5, 0.0, 1.0);
         foam = shore * crest * 0.85;
     }
 
@@ -1621,11 +1676,13 @@ fn shade(
         let sway = sin(p_hit.x * 0.40 + t * 1.8) * cos(p_hit.z * 0.40 + t * 1.2)
                  + 0.4 * sin((p_hit.x + p_hit.z) * 0.25 + t * 2.4);
         // Flowers + tall grass sway harder (thin & light) than tree leaves.
-        let amp = select(0.30, 0.55, hit.mat == MAT_FLOWER || hit.mat == MAT_TALL_GRASS);
+        // Leaf amplitude raised 0.30 -> 0.45 (and brightness ripple 0.12 ->
+        // 0.16) so canopies visibly move even past the leaf-card radius.
+        let amp = select(0.45, 0.55, hit.mat == MAT_FLOWER || hit.mat == MAT_TALL_GRASS);
         n.x += sway * amp;
         n.z += sway * amp * 0.7;
         n = normalize(n);
-        base *= 1.0 + sway * 0.12;
+        base *= 1.0 + sway * 0.16;
     } else if (hit.mat == MAT_GRASS && hit.normal.y > 0.5) {
         let t = camera.time;
         let sway = sin(p_hit.x * 0.55 + t * 2.1) * cos(p_hit.z * 0.55 + t * 1.7);
@@ -1939,9 +1996,10 @@ fn trace_any(origin: vec3<f32>, dir: vec3<f32>, max_dist: f32) -> bool {
             let m = brick_voxel_material(bi, vi);
             if (is_foliage_mat(m)) {
                 // Far foliage blocks as a solid cube (cheap); only near foliage
-                // pays for the per-blade dappled-shadow test.
+                // pays for the dappled-shadow cutout test. Shadow rays never
+                // test the 3D leaf cards (detail = false).
                 if (t_cur > FOLIAGE_NEAR_T) { return true; }
-                let fh = foliage_subvoxel(voxel, origin, dir, m);
+                let fh = foliage_subvoxel(voxel, origin, dir, m, false);
                 if (fh.hit) { return true; }
             } else {
                 return true;
@@ -2221,7 +2279,7 @@ fn trace(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
             // survive, but ground decoration (flowers / tall grass) is skipped
             // entirely — drawing it as a solid cube is the "pink blocks" bug.
             if (is_foliage_mat(m) && t_cur <= FOLIAGE_NEAR_T) {
-                let fh = foliage_subvoxel(voxel, origin, dir, m);
+                let fh = foliage_subvoxel(voxel, origin, dir, m, t_cur <= LEAF_CARD_T);
                 if (fh.hit) {
                     out.hit = true;
                     out.mat = m;

@@ -22,9 +22,15 @@ pub const SPR_LEAF_PINE: usize = 2;
 pub const SPR_TALL_GRASS: usize = 3;
 pub const SPR_POPPY: usize = 4;
 pub const SPR_DAISY: usize = 5;
+pub const SPR_LEAF_SINGLE: usize = 6;
+
+/// IMPORTANT (flowers): the cross-quad renderer draws the SAME sprite on two
+/// diagonal planes through the voxel centre. The stem must sit exactly on the
+/// centre columns (7-8, which are also mirror-invariant: 15-7 = 8) or the two
+/// quads render two separate stems instead of one X.
 
 #[rustfmt::skip]
-const ART: [[&str; SPRITE_DIM]; 6] = [
+const ART: [[&str; SPRITE_DIM]; 7] = [
     // SPR_LEAF_DENSE — oak/autumn: ~80% opaque, clumped holes, two-tone.
     [
         "##o##..###o##o##",
@@ -101,43 +107,64 @@ const ART: [[&str; SPRITE_DIM]; 6] = [
         "...#oo#o#o#.##..",
         "..o#o#oo#oo#o...",
     ],
-    // SPR_POPPY — red petal head, dark centre, leafy stem.
+    // SPR_POPPY — red petal head, dark centre, stem dead-centre on cols 7-8.
     [
         "................",
-        "................",
-        ".....###........",
-        "....#####.......",
-        "....##*##.......",
-        "....#***#.......",
-        ".....###........",
-        "......o.........",
-        "......o.........",
-        "......o..o......",
-        "......o.o.......",
-        "...o..oo........",
-        "....o.o.........",
-        ".....oo.........",
-        "......o.........",
-        ".....oo.........",
+        "......####......",
+        ".....######.....",
+        ".....##**##.....",
+        ".....##**##.....",
+        "......####......",
+        ".......##.......",
+        ".......oo.......",
+        ".......oo.......",
+        ".......oo.......",
+        "....o..oo.......",
+        ".....o.oo..o....",
+        "......ooo.o.....",
+        ".......oo.......",
+        ".......oo.......",
+        ".......oo.......",
     ],
-    // SPR_DAISY — white radiating petals, yellow centre, stem.
+    // SPR_DAISY — white radiating petals, yellow centre, stem on cols 7-8.
     [
         "................",
-        ".......#........",
-        "....#..#..#.....",
-        ".....#.#.#......",
-        "....#######.....",
-        ".....##*##......",
-        "....##***##.....",
-        ".....##*##......",
-        "....#######.....",
-        ".....#.#.#......",
-        "....#..#..#.....",
-        ".......o........",
-        ".......o........",
-        "....o..o........",
-        ".....o.o........",
-        "......oo........",
+        "......#..#......",
+        "...#..####..#...",
+        "....########....",
+        "....##****##....",
+        "...###****###...",
+        "....##****##....",
+        "....########....",
+        "...#..####..#...",
+        "......#..#......",
+        ".......oo.......",
+        ".......oo.......",
+        "...o...oo...o...",
+        "....o..oo..o....",
+        ".....o.oo.o.....",
+        ".......oo.......",
+    ],
+    // SPR_LEAF_SINGLE — one pointed leaf for the 3D canopy cards: tip
+    // top-right, midrib highlight (*), shaded underside edge (o), stem
+    // curling off bottom-left.
+    [
+        ".............#..",
+        "...........###..",
+        "..........####..",
+        "........#####...",
+        ".......##*###...",
+        "......##*###....",
+        ".....##*###o....",
+        "....##*###o.....",
+        "...##*###o......",
+        "..##*###o.......",
+        "..#*###o........",
+        ".#*###o.........",
+        ".#*##o..........",
+        ".#o#o...........",
+        ".oo.............",
+        ".o..............",
     ],
 ];
 
@@ -183,18 +210,48 @@ mod tests {
     #[test]
     fn encodes_all_sprites() {
         let w = encoded();
-        assert_eq!(w.len(), 6 * SPRITE_WORDS);
+        assert_eq!(w.len(), 7 * SPRITE_WORDS);
     }
 
     #[test]
     fn round_trips_known_texels() {
         let w = encoded();
-        // SPR_POPPY art row 5 (top-down) = "....#***#......." -> texel y = 10.
-        assert_eq!(texel(&w, SPR_POPPY, 4, 10), 1); // '#'
-        assert_eq!(texel(&w, SPR_POPPY, 5, 10), 3); // '*'
-        assert_eq!(texel(&w, SPR_POPPY, 0, 10), 0); // '.'
-        // SPR_POPPY art row 7 "......o........." -> y = 8, stem at x=6.
-        assert_eq!(texel(&w, SPR_POPPY, 6, 8), 2); // 'o'
+        // SPR_POPPY art row 3 (top-down) = ".....##**##....." -> texel y = 12.
+        assert_eq!(texel(&w, SPR_POPPY, 5, 12), 1); // '#'
+        assert_eq!(texel(&w, SPR_POPPY, 7, 12), 3); // '*'
+        assert_eq!(texel(&w, SPR_POPPY, 0, 12), 0); // '.'
+        // SPR_POPPY art row 8 ".......oo......." -> y = 7, stem at x=7.
+        assert_eq!(texel(&w, SPR_POPPY, 7, 7), 2); // 'o'
+    }
+
+    /// The cross-quad renderer draws the same sprite on two planes through
+    /// the voxel centre: a flower's stem must sit exactly on the centre
+    /// columns 7-8 (mirror-invariant) or the X renders as two split stems.
+    #[test]
+    fn flower_stems_centred() {
+        let w = encoded();
+        for s in [SPR_POPPY, SPR_DAISY] {
+            for y in [0usize, 1, 4, 5] {
+                assert_eq!(texel(&w, s, 7, y), 2, "sprite {s} stem col 7 y {y}");
+                assert_eq!(texel(&w, s, 8, y), 2, "sprite {s} stem col 8 y {y}");
+                assert_eq!(texel(&w, s, 6, y), 0, "sprite {s} col 6 clear y {y}");
+                assert_eq!(texel(&w, s, 9, y), 0, "sprite {s} col 9 clear y {y}");
+            }
+        }
+    }
+
+    #[test]
+    fn single_leaf_shape() {
+        let w = encoded();
+        let n: usize = (0..SPRITE_DIM)
+            .flat_map(|y| (0..SPRITE_DIM).map(move |x| (x, y)))
+            .filter(|&(x, y)| texel(&w, SPR_LEAF_SINGLE, x, y) != 0)
+            .count();
+        let opacity = n as f32 / 256.0;
+        assert!((0.15..=0.40).contains(&opacity), "single leaf {opacity}");
+        // Tip at top-right, stem at bottom-left.
+        assert_eq!(texel(&w, SPR_LEAF_SINGLE, 13, 15), 1, "leaf tip");
+        assert_eq!(texel(&w, SPR_LEAF_SINGLE, 1, 1), 2, "leaf stem");
     }
 
     #[test]
