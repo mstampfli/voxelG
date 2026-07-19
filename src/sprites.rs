@@ -16,13 +16,13 @@ pub const SPRITE_DIM: usize = 16;
 pub const SPRITE_WORDS: usize = SPRITE_DIM * SPRITE_DIM * 2 / 32;
 
 // Sprite indices — keep in sync with the SPR_* consts in shaders/raymarch.wgsl.
-pub const SPR_LEAF_DENSE: usize = 0;
-pub const SPR_LEAF_LIGHT: usize = 1;
-pub const SPR_LEAF_PINE: usize = 2;
+pub const SPR_LEAF_A: usize = 0; // upright X-quad leaf cluster, variant A
+pub const SPR_LEAF_B: usize = 1; // upright X-quad leaf cluster, variant B
+pub const SPR_LEAF_PINE: usize = 2; // drooping needle fan for pine X-quads
 pub const SPR_TALL_GRASS: usize = 3;
 pub const SPR_POPPY: usize = 4;
 pub const SPR_DAISY: usize = 5;
-pub const SPR_LEAF_SINGLE: usize = 6;
+pub const SPR_LEAF_TOP: usize = 6; // horizontal canopy layer, seen from above
 
 /// IMPORTANT (flowers): the cross-quad renderer draws the SAME sprite on two
 /// diagonal planes through the voxel centre. The stem must sit exactly on the
@@ -31,66 +31,65 @@ pub const SPR_LEAF_SINGLE: usize = 6;
 
 #[rustfmt::skip]
 const ART: [[&str; SPRITE_DIM]; 7] = [
-    // SPR_LEAF_DENSE — oak/autumn: dense canopy face drawn as overlapping
-    // leaf clusters in THREE tones — dark background leaves (o), lit
-    // foreground leaves (#), bright highlight tips (*). The tone contrast is
-    // what makes individual leaves readable at 16x16 (MC/Allumeria style).
+    // SPR_LEAF_A — upright X-quad leaf cluster: a bush of overlapping
+    // pointed leaves with a ragged silhouette (transparent border texels so
+    // the quad edges never read as straight lines). Three tones: dark
+    // background leaves (o), lit leaves (#), highlight tips (*).
     [
-        "..#o.##*..oo.#*.",
-        ".##*o###o.o##o#.",
-        "####o##.#oo###oo",
-        "o#*#..o##*#o##.#",
-        "###o.o####o###*#",
-        "#*#o#o#*##.oo###",
-        ".###o###oo..###o",
-        "o.####*#o.###*#.",
-        "#o##o###.o####oo",
-        "##*#.o#*#oo#*##.",
-        ".###oo###o####.#",
-        "o##.####o##oo##o",
-        "#*#o##*##.####*#",
-        "###oo###o.o###.#",
-        ".#o###o##oo##o#.",
-        "..##*.###.o.##..",
+        "......#*........",
+        ".....###..#*....",
+        "..#..####o###...",
+        ".#*#o#####o##*..",
+        ".####o##*####o..",
+        "o#####o######.#.",
+        "###*##o##*##o##.",
+        ".#o#####o#####*.",
+        "#####*##o##o###.",
+        ".o###o#####o##..",
+        "..#####*####o#..",
+        ".#*#o######*##..",
+        "..###o##o####...",
+        "...##*##o##*#...",
+        "....#o..###.....",
+        "......#..o#.....",
     ],
-    // SPR_LEAF_LIGHT — birch: airier (~63% opaque), same three-tone leaf
-    // clusters with bigger sky gaps.
+    // SPR_LEAF_B — cluster variant: bushier low half, different lobe layout.
     [
-        "..#o..#*...o.#..",
-        ".##*.o##o..o#o#.",
-        "#o#..##.#o.###.o",
-        "o#*#..o#.*#o.#.#",
-        ".##o.o##.#o.##*#",
-        "#*#..o#*#..oo.##",
-        ".###.o#.#o...##o",
-        "o..##.#*o..##*#.",
-        "#o#.o##..o.###oo",
-        "##*#..#*#oo.*#..",
-        ".#.#oo##.o##.#.#",
-        "o#..##.#o#.oo#.o",
-        "#*#..#*##..##.*#",
-        ".##oo#.#o..o##.#",
-        "..o##.o##oo.#o#.",
-        "..#.*..##..o.#..",
+        "........#*......",
+        "...#*..###......",
+        "..###o#####*....",
+        ".#####o####o#...",
+        "..o###*#####*#..",
+        ".#####o#o#####..",
+        "#*##o#####o###*.",
+        ".###.####*#####o",
+        "o#####o######.#.",
+        ".#*##o##*##o###.",
+        "####o######o##*.",
+        ".o###*##o#####..",
+        ".####o####*##...",
+        "..#*###o####.#..",
+        "...##o.###*.....",
+        ".....#...#o.....",
     ],
-    // SPR_LEAF_PINE — needles: sparse (~50%), diagonal strokes.
+    // SPR_LEAF_PINE — drooping needle fan for pine X-quads.
     [
-        "#o..#..#o..#..o#",
-        ".#.o.#..#.#.#.#.",
-        "..#.#.o#.o#.#..#",
-        "#.#o#.#..#.o#.#.",
-        ".o#.#.#.#.#.#o..",
-        "#.#.o#.#o#.#..#.",
-        ".#.#.#.#.#.o#.#o",
-        "o..#.#o#.#.#.#..",
-        ".#.#.#.#o#.#.#.#",
-        "#.o#.#.#.#.#o..#",
-        ".#.#o#.#.#o#.#..",
-        "..#.#.#o#.#.#.#o",
-        "#.#.#.#.#.#.#.#.",
-        ".#o#.#.#.o#.#.o#",
-        "#.#.#.o#.#.#.#..",
-        "o#..#.#.#.#.#.#.",
+        ".......##.......",
+        "....o.####.o....",
+        "..#..######..#..",
+        ".#o.###*###.o#..",
+        "#..##o####o##..#",
+        ".#.#####o####.#.",
+        "#.###o##*##o##.#",
+        ".###.##o##.###o.",
+        "#o#.####o##.#o#.",
+        ".##.#o####.##.#o",
+        "#.#.####o#.#.#..",
+        ".#..#o###.#o.#..",
+        "#...####.#..#...",
+        ".#..#o##.#...o..",
+        "....###..o......",
+        ".....#o...#.....",
     ],
     // SPR_TALL_GRASS — a tuft of tapering blades, dark toward the base.
     [
@@ -149,26 +148,26 @@ const ART: [[&str; SPRITE_DIM]; 7] = [
         ".....o.oo.o.....",
         ".......oo.......",
     ],
-    // SPR_LEAF_SINGLE — one broad pointed leaf for the face-attached canopy
-    // shingles: tip top-right, midrib highlight (*), shaded underside edge
-    // (o), stem curling off bottom-left.
+    // SPR_LEAF_TOP — horizontal canopy layer seen from above: a ragged
+    // radial rosette of leaves, transparent at the corners so stacked layers
+    // never read as square plates.
     [
-        ".............#..",
-        "...........###..",
-        ".........#####..",
-        "........####*#..",
-        ".......###*##...",
-        "......###*###...",
-        ".....###*###o...",
-        "....###*###o....",
-        "...###*###o.....",
-        "..###*###o......",
-        "..##*###o.......",
-        ".##*###o........",
-        ".#*###o.........",
-        ".#o##o..........",
-        ".oo.............",
-        ".o..............",
+        ".....o#..#o.....",
+        "...####*###o....",
+        "..o######*###...",
+        ".#####o######o..",
+        ".###*#####o###*.",
+        "o###o##*######..",
+        "######o###o####o",
+        ".#*###o#*#####*.",
+        "o####*#o######o.",
+        "#####o####o####.",
+        ".####o##*###o##.",
+        "..##*######o##..",
+        ".o######*#####..",
+        "..####o####o#...",
+        "....###*##o.....",
+        "......#o.#......",
     ],
 ];
 
@@ -244,37 +243,38 @@ mod tests {
         }
     }
 
-    #[test]
-    fn single_leaf_shape() {
-        let w = encoded();
+
+    fn opacity(w: &[u32], s: usize) -> f32 {
         let n: usize = (0..SPRITE_DIM)
             .flat_map(|y| (0..SPRITE_DIM).map(move |x| (x, y)))
-            .filter(|&(x, y)| texel(&w, SPR_LEAF_SINGLE, x, y) != 0)
+            .filter(|&(x, y)| texel(w, s, x, y) != 0)
             .count();
-        let opacity = n as f32 / 256.0;
-        assert!((0.15..=0.40).contains(&opacity), "single leaf {opacity}");
-        // Tip at top-right, stem at bottom-left.
-        assert_eq!(texel(&w, SPR_LEAF_SINGLE, 13, 15), 1, "leaf tip");
-        assert_eq!(texel(&w, SPR_LEAF_SINGLE, 1, 1), 2, "leaf stem");
+        n as f32 / 256.0
     }
 
     #[test]
-    fn leaf_opacity_in_authored_range() {
+    fn leaf_clusters_in_authored_range() {
         let w = encoded();
-        let opacity = |s: usize| {
-            let n: usize = (0..SPRITE_DIM)
-                .flat_map(|y| (0..SPRITE_DIM).map(move |x| (x, y)))
-                .filter(|&(x, y)| texel(&w, s, x, y) != 0)
-                .count();
-            n as f32 / 256.0
-        };
-        let dense = opacity(SPR_LEAF_DENSE);
-        let light = opacity(SPR_LEAF_LIGHT);
-        let pine = opacity(SPR_LEAF_PINE);
-        assert!((0.70..=0.90).contains(&dense), "dense leaves {dense}");
-        assert!((0.55..=0.75).contains(&light), "light leaves {light}");
-        assert!((0.35..=0.60).contains(&pine), "pine needles {pine}");
-        assert!(dense > light && light > pine, "opacity ordering");
+        let a = opacity(&w, SPR_LEAF_A);
+        let b = opacity(&w, SPR_LEAF_B);
+        let pine = opacity(&w, SPR_LEAF_PINE);
+        let top = opacity(&w, SPR_LEAF_TOP);
+        assert!((0.45..=0.78).contains(&a), "cluster A {a}");
+        assert!((0.45..=0.78).contains(&b), "cluster B {b}");
+        assert!((0.30..=0.60).contains(&pine), "pine fan {pine}");
+        assert!((0.45..=0.80).contains(&top), "top rosette {top}");
+    }
+
+    /// Quad edges must never read as straight lines: every leaf-cluster
+    /// sprite needs transparent corners (ragged silhouette).
+    #[test]
+    fn leaf_clusters_have_ragged_corners() {
+        let w = encoded();
+        for s in [SPR_LEAF_A, SPR_LEAF_B, SPR_LEAF_PINE, SPR_LEAF_TOP] {
+            for (x, y) in [(0, 0), (15, 0), (0, 15), (15, 15)] {
+                assert_eq!(texel(&w, s, x, y), 0, "sprite {s} corner ({x},{y})");
+            }
+        }
     }
 
     #[test]

@@ -83,13 +83,13 @@ struct PlayersBuf {
 // encoded at startup — hand-made cutout art, not hash noise.
 @group(0) @binding(18) var<storage, read> sprites: array<u32>;
 
-const SPR_LEAF_DENSE:  u32 = 0u;
-const SPR_LEAF_LIGHT:  u32 = 1u;
-const SPR_LEAF_PINE:   u32 = 2u;
-const SPR_TALL_GRASS:  u32 = 3u;
-const SPR_POPPY:       u32 = 4u;
-const SPR_DAISY:       u32 = 5u;
-const SPR_LEAF_SINGLE: u32 = 6u;
+const SPR_LEAF_A:     u32 = 0u; // upright X-quad leaf cluster, variant A
+const SPR_LEAF_B:     u32 = 1u; // upright X-quad leaf cluster, variant B
+const SPR_LEAF_PINE:  u32 = 2u; // drooping needle fan for pine X-quads
+const SPR_TALL_GRASS: u32 = 3u;
+const SPR_POPPY:      u32 = 4u;
+const SPR_DAISY:      u32 = 5u;
+const SPR_LEAF_TOP:   u32 = 6u; // horizontal canopy layer, seen from above
 
 // Texel (x, y) of a sprite; y = 0 is the sprite's bottom row. 16 u32s per
 // sprite, bit (y*16 + x)*2.
@@ -663,52 +663,9 @@ fn wind_offset(voxel_min: vec3<f32>, phase: f32, base_amp: f32) -> vec2<f32> {
     return vec2<f32>(wind_x * strength, wind_z * strength);
 }
 
-// ---------- LEAVES: rigid cube faces with an AUTHORED cutout sprite ----------
-// The Allumeria/Minecraft recipe: the leaf voxel stays a rigid cube and its
-// faces carry a hand-drawn 16x16 cutout texture (binding 18, drawn in
-// src/sprites.rs) — deliberate hole clumps and a two-tone shade, not hash
-// dither. A per-voxel/per-face hash picks mirror flips and (except pine) one
-// of two masks so the tiling doesn't visibly repeat. Because the cube no
-// longer deforms in the wind, leaf hits are stable axis faces: they get cube
-// AO and reuse the reprojected lighting cache like any other solid face
-// (motion comes from the cheap shading sway in shade()).
-// Returns 0 (transparent) / 1 (lit leaf) / 2 (dark leaf).
-fn leaf_face_texel(mat: u32, voxel_min: vec3<f32>, face_axis: i32, uv: vec2<f32>, salt: f32) -> u32 {
-    let h = hash3f(voxel_min + vec3<f32>(f32(face_axis) * 2.7 + salt, salt * 0.31, f32(face_axis) * 1.3));
-    var tx = u32(clamp(uv.x * 16.0, 0.0, 15.0));
-    var ty = u32(clamp(uv.y * 16.0, 0.0, 15.0));
-    if (h > 0.5) { tx = 15u - tx; }
-    if (fract(h * 8.0) > 0.5) { ty = 15u - ty; }
-    var sprite = SPR_LEAF_DENSE;
-    if (mat == MAT_LEAVES_PINE) { sprite = SPR_LEAF_PINE; }
-    else if (fract(h * 64.0) > 0.5) { sprite = SPR_LEAF_LIGHT; }
-    return sprite_texel(sprite, tx, ty);
-}
-
-// Coherent whole-block waving, the way Minecraft waving-leaves shaders and
-// Allumeria do it: the ENTIRE leaf cube (all faces together, texture anchored
-// to it) shifts by a smooth traveling wind field evaluated at the block
-// centre. Neighbouring blocks sample nearly the same field value, so the
-// canopy waves as one surface — no cracks, no per-face wobble, no geometry
-// clipping. Amplitude stays small (~0.07 voxels); the visible motion comes
-// from the whole canopy moving coherently against the sky.
-fn leaf_wave(block_center: vec3<f32>, t: f32) -> vec3<f32> {
-    let p1 = block_center.x * 0.31 + block_center.z * 0.17 + block_center.y * 0.11;
-    let p2 = block_center.x * 0.13 - block_center.z * 0.29 + block_center.y * 0.07;
-    let s1 = sin(p1 + t * 1.5);
-    let s2 = sin(p2 + t * 2.3 + 1.3);
-    let s3 = sin(p1 * 0.7 - t * 1.1 + 2.1);
-    return vec3<f32>(
-        (s1 + 0.5 * s2) * 0.05,
-        s3 * 0.025,
-        (s2 + 0.5 * s1) * 0.05,
-    );
-}
-
-// Leaf tone -> brightness tint. The texture carries three tones (dark
+// Leaf tone -> brightness tint. The sprites carry three tones (dark
 // background leaves, lit leaves, bright highlight tips); strong contrast is
-// what makes individual leaves readable at 16x16, exactly like the
-// Minecraft/Allumeria leaf textures.
+// what makes individual leaves readable at 16x16.
 fn leaf_tone_tint(val: u32, scale: f32) -> vec3<f32> {
     var b = 1.0;
     if (val == 2u) { b = 0.52; }
@@ -716,71 +673,105 @@ fn leaf_tone_tint(val: u32, scale: f32) -> vec3<f32> {
     return vec3<f32>(b * scale);
 }
 
-fn leaf_cube_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u32) -> SubHit {
+// ---------- LEAVES: layered upright X-cross leaf clusters -------------------
+// Each leaf voxel is a little bush of REAL leaf geometry in the same shape
+// language as the rest of the foliage: two upright diagonal quads (an X
+// through the voxel centre — always intersecting cleanly, like the grass and
+// flowers) plus ONE horizontal layer quad at a per-voxel height, all carrying
+// authored leaf-cluster sprites with ragged silhouettes. The X sways with the
+// shared world-space wind shear; the layer slides subtly. Consistent upright
+// orientation is the point — free-floating and face-attached leaf cards both
+// read as clipping confetti (see git history).
+fn leaf_cross_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u32) -> SubHit {
     var out: SubHit;
     out.hit = false;
     out.color_tint = vec3<f32>(1.0);
-    let voxel_base = vec3<f32>(f32(voxel.x), f32(voxel.y), f32(voxel.z));
-    // The whole cube rides the wind. The texture is anchored to the SHIFTED
-    // cube (uv from the shifted corner) so leaves move with their block; the
-    // pattern hashes stay on the static block coord so the art is stable.
-    let voxel_min = voxel_base + leaf_wave(voxel_base + vec3<f32>(0.5), camera.time);
-    let inv_dir = vec3<f32>(safe_inv(dir.x), safe_inv(dir.y), safe_inv(dir.z));
-    let t0 = (voxel_min - origin) * inv_dir;
-    let t1 = (voxel_min + vec3<f32>(1.0) - origin) * inv_dir;
-    let tmin = min(t0, t1);
-    let tmax = max(t0, t1);
-    let t_enter = max(max(tmin.x, tmin.y), max(tmin.z, 0.0));
-    let t_exit = min(min(tmax.x, tmax.y), tmax.z);
-    if (t_enter >= t_exit) { return out; }
+    let voxel_min = vec3<f32>(f32(voxel.x), f32(voxel.y), f32(voxel.z));
+    let vh = hash3f(voxel_min);
+    let voxel_center = voxel_min + vec3<f32>(0.5);
 
-    // ENTRY-face cutout test.
-    var entry_axis: i32 = 0;
-    if (tmin.x >= tmin.y && tmin.x >= tmin.z) { entry_axis = 0; }
-    else if (tmin.y >= tmin.z) { entry_axis = 1; }
-    else { entry_axis = 2; }
-    let lp_e = origin + dir * t_enter - voxel_min;
-    var uv_e: vec2<f32>;
-    if (entry_axis == 0) { uv_e = vec2<f32>(lp_e.z, lp_e.y); }
-    else if (entry_axis == 1) { uv_e = vec2<f32>(lp_e.x, lp_e.z); }
-    else { uv_e = vec2<f32>(lp_e.x, lp_e.y); }
-    let val_e = leaf_face_texel(mat, voxel_base, entry_axis, fract(uv_e), 0.0);
-    if (val_e != 0u) {
-        out.hit = true;
-        out.t_hit = t_enter;
-        var n = vec3<f32>(0.0);
-        if (entry_axis == 0) { n.x = select(1.0, -1.0, dir.x > 0.0); }
-        else if (entry_axis == 1) { n.y = select(1.0, -1.0, dir.y > 0.0); }
-        else { n.z = select(1.0, -1.0, dir.z > 0.0); }
-        out.normal = n;
-        out.color_tint = leaf_tone_tint(val_e, 1.0);
-        return out;
+    var sprite = select(SPR_LEAF_A, SPR_LEAF_B, fract(vh * 4.0) > 0.5);
+    if (mat == MAT_LEAVES_PINE) { sprite = SPR_LEAF_PINE; }
+    let phase = voxel_min.x * 0.31 + voxel_min.z * 0.41 + vh * 6.28;
+    // Leaves on branches sway subtler than grass in the open.
+    let wind = wind_offset(voxel_min, phase, 0.10);
+    let mirror_u = fract(vh * 16.0) > 0.5;
+    // Per-voxel brightness variation so a canopy isn't one flat green.
+    let vox_shade = 0.88 + fract(vh * 32.0) * 0.24;
+
+    var best_t: f32 = 1e30;
+    var best_n = vec3<f32>(0.0, 1.0, 0.0);
+    var tint = vec3<f32>(1.0);
+
+    // The upright X (two diagonal planes through the voxel centre).
+    for (var i: i32 = 0; i < 2; i = i + 1) {
+        var pn: vec3<f32>;
+        var pt: vec3<f32>;
+        if (i == 0) {
+            pn = vec3<f32>(0.7071, 0.0, 0.7071);
+            pt = vec3<f32>(0.7071, 0.0, -0.7071);
+        } else {
+            pn = vec3<f32>(0.7071, 0.0, -0.7071);
+            pt = vec3<f32>(0.7071, 0.0, 0.7071);
+        }
+        let denom = dot(dir, pn);
+        if (abs(denom) < 0.0001) { continue; }
+        let t = dot(voxel_center - origin, pn) / denom;
+        if (t < 0.0 || t >= best_t) { continue; }
+        let p_hit = origin + dir * t;
+        let local = p_hit - voxel_min;
+        if (local.x < 0.0 || local.x > 1.0
+         || local.y < 0.0 || local.y > 1.0
+         || local.z < 0.0 || local.z > 1.0) { continue; }
+
+        let v = local.y;
+        // Shared world-space wind shear (same mechanism as grass/flowers).
+        let sx = local.x - wind.x * v;
+        let sz = local.z - wind.y * v;
+        let s_w = (sx - 0.5) * pt.x + (sz - 0.5) * pt.z;
+        let u = clamp((s_w + 0.70711) / 1.41421, 0.0, 0.99999);
+        var tx = u32(u * 16.0);
+        if (mirror_u) { tx = 15u - tx; }
+        let ty = u32(clamp(v * 16.0, 0.0, 15.0));
+        let val = sprite_texel(sprite, tx, ty);
+        if (val == 0u) { continue; }
+
+        best_t = t;
+        best_n = select(pn, -pn, denom > 0.0);
+        tint = leaf_tone_tint(val, vox_shade);
     }
 
-    // ENTRY transparent — test the EXIT face with a different salt so the
-    // back of the cube isn't a mirror of the front. Interior faces darker.
-    var exit_axis: i32 = 0;
-    if (tmax.x <= tmax.y && tmax.x <= tmax.z) { exit_axis = 0; }
-    else if (tmax.y <= tmax.z) { exit_axis = 1; }
-    else { exit_axis = 2; }
-    let lp_x = origin + dir * t_exit - voxel_min;
-    var uv_x: vec2<f32>;
-    if (exit_axis == 0) { uv_x = vec2<f32>(lp_x.z, lp_x.y); }
-    else if (exit_axis == 1) { uv_x = vec2<f32>(lp_x.x, lp_x.z); }
-    else { uv_x = vec2<f32>(lp_x.x, lp_x.y); }
-    let val_x = leaf_face_texel(mat, voxel_base, exit_axis, fract(uv_x), 5.7);
-    if (val_x != 0u) {
-        out.hit = true;
-        out.t_hit = t_exit;
-        var n = vec3<f32>(0.0);
-        if (exit_axis == 0) { n.x = select(-1.0, 1.0, dir.x > 0.0); }
-        else if (exit_axis == 1) { n.y = select(-1.0, 1.0, dir.y > 0.0); }
-        else { n.z = select(-1.0, 1.0, dir.z > 0.0); }
-        out.normal = n;
-        out.color_tint = leaf_tone_tint(val_x, 0.82);
-        return out;
+    // The horizontal layer quad ("layered" canopy) at a per-voxel height.
+    if (abs(dir.y) > 0.0001) {
+        let ly = voxel_min.y + 0.30 + fract(vh * 8.0) * 0.45;
+        let t = (ly - origin.y) / dir.y;
+        if (t >= 0.0 && t < best_t) {
+            let p_hit = origin + dir * t;
+            let local = p_hit - voxel_min;
+            if (local.x >= 0.0 && local.x <= 1.0 && local.z >= 0.0 && local.z <= 1.0) {
+                // The layer slides gently with the wind.
+                let u = clamp(fract(local.x - wind.x * 0.4), 0.0, 0.99999);
+                let v = clamp(fract(local.z - wind.y * 0.4), 0.0, 0.99999);
+                var tx = u32(u * 16.0);
+                if (mirror_u) { tx = 15u - tx; }
+                let val = sprite_texel(SPR_LEAF_TOP, tx, u32(v * 16.0));
+                if (val != 0u) {
+                    best_t = t;
+                    best_n = vec3<f32>(0.0, select(1.0, -1.0, dir.y > 0.0), 0.0);
+                    // Underside of a layer is in its own shade.
+                    let under = select(1.0, 0.72, dir.y > 0.0);
+                    tint = leaf_tone_tint(val, vox_shade * under);
+                }
+            }
+        }
     }
 
+    if (best_t < 1e30) {
+        out.hit = true;
+        out.t_hit = best_t;
+        out.normal = best_n;
+        out.color_tint = tint;
+    }
     return out;
 }
 
@@ -883,7 +874,7 @@ fn foliage_subvoxel(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u3
     if (mat == MAT_TALL_GRASS || mat == MAT_FLOWER) {
         hit = sprite_cross_hit(voxel, origin, dir, mat);
     } else {
-        hit = leaf_cube_hit(voxel, origin, dir, mat);
+        hit = leaf_cross_hit(voxel, origin, dir, mat);
     }
     return hit;
 }
