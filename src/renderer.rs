@@ -193,6 +193,7 @@ pub struct Renderer {
     brick_uniform_buf: wgpu::Buffer,
     tile_uniform_buf: wgpu::Buffer,
     palette_buf: wgpu::Buffer,
+    sprites_buf: wgpu::Buffer,
     tile_dirty_buf: wgpu::Buffer,
     players_buf: wgpu::Buffer,
 
@@ -392,6 +393,13 @@ impl Renderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
+        // Authored foliage sprites (src/sprites.rs ASCII art, 2bpp texels).
+        let sprites_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("foliage sprites"),
+            contents: bytemuck::cast_slice(&crate::sprites::encoded()),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+
         // Tile-dirty bitmask.
         let tile_dirty_words: u64 = ((3840u64 / 8 + 1) * (2160u64 / 8 + 1) + 31) / 32;
         let tile_dirty_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -474,6 +482,7 @@ impl Renderer {
             &tile_mask_buf, &chunk_mask_buf, &palette_buf, &output_view, &beam_view,
             &tile_dirty_buf, &players_buf, &brick_uniform_buf, &tile_uniform_buf, &l4_mask_buf,
             &cloud_sampled_view, &sampler, &light_hist_view, &light_out_view, &transp_buf,
+            &sprites_buf,
         );
 
         // -- deferred transparent pipeline (cs_transparent, same module + bgl) --
@@ -656,6 +665,7 @@ impl Renderer {
             size: (width, height),
             surface_size: (surface_w, surface_h),
             camera_buf, bricks_buf, tile_mask_buf, chunk_mask_buf, l4_mask_buf, palette_buf,
+            sprites_buf,
             brick_uniform_buf, tile_uniform_buf,
             tile_dirty_buf, players_buf,
             output_tex, output_view, beam_tex, beam_view,
@@ -716,6 +726,7 @@ impl Renderer {
             &self.tile_dirty_buf, &self.players_buf, &self.brick_uniform_buf, &self.tile_uniform_buf,
             &self.l4_mask_buf, &self.cloud_sampled_view, &self.sampler,
             &self.light_hist_view, &self.light_out_view, &self.transp_buf,
+            &self.sprites_buf,
         );
         self.cloud_bg = make_cloud_bg(
             &self.device, &self.cloud_bgl, &self.camera_buf, &self.cloud_storage_view,
@@ -1212,6 +1223,7 @@ fn create_compute_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
             bgl_tex(15, false),    // light_in: previous-frame lighting G-buffer
             bgl_storage_tex(16, wgpu::TextureFormat::Rgba32Float), // light_out
             bgl_storage(17, false), // transp_buf: deferred transparent records (rw)
+            bgl_storage(18, true),  // foliage sprites (2bpp authored cutout art)
         ],
     })
 }
@@ -1313,6 +1325,7 @@ fn make_compute_bg(
     light_in_view: &wgpu::TextureView,
     light_out_view: &wgpu::TextureView,
     transp_buf: &wgpu::Buffer,
+    sprites_buf: &wgpu::Buffer,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("compute bg"),
@@ -1335,6 +1348,7 @@ fn make_compute_bg(
             wgpu::BindGroupEntry { binding: 15, resource: wgpu::BindingResource::TextureView(light_in_view) },
             wgpu::BindGroupEntry { binding: 16, resource: wgpu::BindingResource::TextureView(light_out_view) },
             wgpu::BindGroupEntry { binding: 17, resource: transp_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 18, resource: sprites_buf.as_entire_binding() },
         ],
     })
 }
@@ -1553,11 +1567,13 @@ mod gpu_render_tests {
         let (_ltex, light_in_view) = create_lighting_texture(&device, w, h);
         let (_ltex2, light_out_view) = create_lighting_texture(&device, w, h);
         let transp_buf = create_transp_buf(&device, w, h);
+        let sprites_buf = storage(&device, "sprites", bytemuck::cast_slice(&crate::sprites::encoded()));
         let bg = make_compute_bg(
             &device, &bgl, &camera_buf, &bricks_buf, &tile_mask_buf, &chunk_mask_buf,
             &palette_buf, &output_view, &beam_view, &tile_dirty_buf, &players_buf,
             &brick_uniform_buf, &tile_uniform_buf, &l4_mask_buf,
             &cloud_sampled_view, &cloud_sampler, &light_in_view, &light_out_view, &transp_buf,
+            &sprites_buf,
         );
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("test pl"),
@@ -1821,8 +1837,9 @@ mod gpu_render_tests {
         let (_li, liv) = create_lighting_texture(&device, w, h);
         let (_lo, lov) = create_lighting_texture(&device, w, h);
         let tpb = create_transp_buf(&device, w, h);
+        let spr = storage(&device, "sprites", bytemuck::cast_slice(&crate::sprites::encoded()));
         let bgl = create_compute_bgl(&device);
-        let bg = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &ov, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &liv, &lov, &tpb);
+        let bg = make_compute_bg(&device, &bgl, &camera_buf, &bricks_buf, &tm, &cm, &palette_buf, &ov, &bv, &td, &players, &bu, &tu, &l4, &csv, &csamp, &liv, &lov, &tpb, &spr);
         let pll = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[&bgl], push_constant_ranges: &[] });
         let src = format!("{}\n{}\n{}", WORLD_CONSTS_WGSL, COMMON_WGSL, include_str!("../shaders/raymarch.wgsl"));
         let m = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(src.into()) });

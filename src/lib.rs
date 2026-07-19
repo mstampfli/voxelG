@@ -6,6 +6,7 @@
 
 pub mod world_dims;
 pub mod voxel;
+pub mod sprites;
 pub mod camera;
 pub mod raycast;
 pub mod physics;

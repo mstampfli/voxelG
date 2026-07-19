@@ -78,6 +78,26 @@ struct PlayersBuf {
 // passes share this binding without a read/write aliasing hazard.
 @group(0) @binding(17) var<storage, read_write> transp_buf: array<vec4<f32>>;
 
+// Authored 16x16 foliage sprites, 2 bits per texel (0 transparent, 1 primary,
+// 2 secondary/dark, 3 accent). Drawn as ASCII art in src/sprites.rs and
+// encoded at startup — hand-made cutout art, not hash noise.
+@group(0) @binding(18) var<storage, read> sprites: array<u32>;
+
+const SPR_LEAF_DENSE: u32 = 0u;
+const SPR_LEAF_LIGHT: u32 = 1u;
+const SPR_LEAF_PINE:  u32 = 2u;
+const SPR_TALL_GRASS: u32 = 3u;
+const SPR_POPPY:      u32 = 4u;
+const SPR_DAISY:      u32 = 5u;
+
+// Texel (x, y) of a sprite; y = 0 is the sprite's bottom row. 16 u32s per
+// sprite, bit (y*16 + x)*2.
+fn sprite_texel(sprite: u32, x: u32, y: u32) -> u32 {
+    let bit = (y * 16u + x) * 2u;
+    let w = sprites[sprite * 16u + (bit >> 5u)];
+    return (w >> (bit & 31u)) & 3u;
+}
+
 fn brick_uniform_mat(bi: i32) -> u32 {
     let w = brick_uniform_packed[bi >> 2];
     let shift = u32(bi & 3) * 8u;
@@ -293,6 +313,10 @@ struct Hit {
     voxel: vec3<i32>,
     last_axis: i32,
     t_hit: f32,
+    // Sub-voxel colour tint (leaf shade, blade gradient, petal/stem colour).
+    // (1,1,1) for plain cube hits. Carried in the Hit so secondary rays can't
+    // read a stale value, which a module-global tint could leak.
+    tint: vec3<f32>,
 };
 
 // IGN (interleaved gradient noise) — high-quality low-discrepancy per-pixel
@@ -390,6 +414,7 @@ fn cs_transparent(@builtin(global_invocation_id) gid: vec3<u32>) {
     hit.t_hit = rec.x;
     hit.last_axis = 0;
     hit.voxel = vec3<i32>(0);
+    hit.tint = vec3<f32>(1.0);
     var col: vec3<f32>;
     if (rec.y < 1.5) {
         hit.mat = MAT_WATER_L8;
@@ -489,9 +514,10 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         } else {
             // Solid terrain faces have stable (view-independent) shadow + AO, so
             // reproject them from last frame's G-buffer and reuse on a position
-            // match — only foliage/sub-voxel hits always re-trace.
+            // match. Leaf cutout faces are stable cube faces too (axis >= 0);
+            // only oblique sub-voxel hits (grass/flower cross-quads) re-trace.
             let hitpos_rel = (camera.origin - vec3<f32>(camera.world_origin)) + dir * hit.t_hit;
-            let cacheable = hit.last_axis >= 0 && !is_foliage_mat(hit.mat);
+            let cacheable = hit.last_axis >= 0;
             var light = vec2<f32>(0.0);
             var reuse = false;
             if (REPROJECT_LIGHTING && cacheable && camera.reproject_lighting > 0.5) {
@@ -613,11 +639,6 @@ struct SubHit {
     color_tint: vec3<f32>,  // multiplier for palette colour (1,1,1 = no change)
 }
 
-// Module-level: most recent foliage hit's colour tint. Set inside trace()
-// when a foliage SubHit returns, read inside shade() to multiply the
-// material colour (stem → green, blade → brightness variation).
-var<private> g_foliage_tint: vec3<f32> = vec3<f32>(1.0);
-
 // ---------- Wind: ONE consistent direction at any moment ----------
 // A single wind direction blowing across the whole map, with slow rotation
 // and time-varying strength. Per-voxel phase offsets the strength so not
@@ -633,92 +654,54 @@ fn wind_offset(voxel_min: vec3<f32>, phase: f32, base_amp: f32) -> vec2<f32> {
     return vec2<f32>(wind_x * strength, wind_z * strength);
 }
 
-// ---------- LEAVES: Minecraft-style full-cube with alpha-cutout texture ----------
-// The leaf voxel keeps its CUBE shape. When the ray hits a face, we sample
-// a 16x16 alpha-cutout "leaf texture" at that face's (u, v). If the texel
-// is opaque we hit; if transparent we continue ray to test the EXIT face.
-// Result: chunky cube-shaped foliage that looks like solid leaf tiles with
-// holes (exactly Minecraft "fast" leaves). Wind shifts the UV sample.
-fn leaf_face_alpha(voxel_min: vec3<f32>, face_axis: i32, uv: vec2<f32>, salt: f32) -> bool {
-    let texel = clamp(floor(uv * 16.0), vec2<f32>(0.0), vec2<f32>(15.0));
-    let h1 = hash3f(vec3<f32>(
-        voxel_min.x * 16.0 + texel.x,
-        voxel_min.y * 16.0 + texel.y + salt,
-        voxel_min.z * 16.0 + f32(face_axis) * 2.7,
-    ));
-    let h2 = hash3f(vec3<f32>(
-        voxel_min.x * 8.0 + floor(texel.x * 0.5),
-        voxel_min.y * 8.0 + floor(texel.y * 0.5) + salt * 0.3,
-        voxel_min.z * 8.0 + f32(face_axis),
-    ));
-    // Cluster bias — lower threshold = more see-through (about 50% opaque
-    // pixels). Real Minecraft "fancy leaves" are sparser than my previous
-    // 72% — the gaps make tree silhouettes feel actually leafy.
-    let combined = h1 * 0.4 + h2 * 0.6;
-    return combined < 0.52;
+// ---------- LEAVES: rigid cube faces with an AUTHORED cutout sprite ----------
+// The Allumeria/Minecraft recipe: the leaf voxel stays a rigid cube and its
+// faces carry a hand-drawn 16x16 cutout texture (binding 18, drawn in
+// src/sprites.rs) — deliberate hole clumps and a two-tone shade, not hash
+// dither. A per-voxel/per-face hash picks mirror flips and (except pine) one
+// of two masks so the tiling doesn't visibly repeat. Because the cube no
+// longer deforms in the wind, leaf hits are stable axis faces: they get cube
+// AO and reuse the reprojected lighting cache like any other solid face
+// (motion comes from the cheap shading sway in shade()).
+// Returns 0 (transparent) / 1 (lit leaf) / 2 (dark leaf).
+fn leaf_face_texel(mat: u32, voxel_min: vec3<f32>, face_axis: i32, uv: vec2<f32>, salt: f32) -> u32 {
+    let h = hash3f(voxel_min + vec3<f32>(f32(face_axis) * 2.7 + salt, salt * 0.31, f32(face_axis) * 1.3));
+    var tx = u32(clamp(uv.x * 16.0, 0.0, 15.0));
+    var ty = u32(clamp(uv.y * 16.0, 0.0, 15.0));
+    if (h > 0.5) { tx = 15u - tx; }
+    if (fract(h * 8.0) > 0.5) { ty = 15u - ty; }
+    var sprite = SPR_LEAF_DENSE;
+    if (mat == MAT_LEAVES_PINE) { sprite = SPR_LEAF_PINE; }
+    else if (fract(h * 64.0) > 0.5) { sprite = SPR_LEAF_LIGHT; }
+    return sprite_texel(sprite, tx, ty);
 }
 
-fn leaf_density_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>) -> SubHit {
+fn leaf_cube_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u32) -> SubHit {
     var out: SubHit;
     out.hit = false;
     out.color_tint = vec3<f32>(1.0);
-    let voxel_min_base = vec3<f32>(f32(voxel.x), f32(voxel.y), f32(voxel.z));
-    let vh_pre = hash3f(voxel_min_base);
-    // PER-FACE sway: only the faces that aren't pressed against another
-    // leaf voxel actually move. Inner leaf-to-leaf faces stay put; outer
-    // faces extrude in the wind. Each of the 4 horizontal faces shifts
-    // independently — the cube deforms into an asymmetric box.
-    let n_xm = is_foliage_mat(voxel_material_at(voxel + vec3<i32>(-1, 0, 0)));
-    let n_xp = is_foliage_mat(voxel_material_at(voxel + vec3<i32>( 1, 0, 0)));
-    let n_zm = is_foliage_mat(voxel_material_at(voxel + vec3<i32>( 0, 0,-1)));
-    let n_zp = is_foliage_mat(voxel_material_at(voxel + vec3<i32>( 0, 0, 1)));
-
-    let phase_pre = voxel_min_base.x * 0.25 + voxel_min_base.z * 0.31 + vh_pre * 6.28;
-    let wind_pre = wind_offset(voxel_min_base, phase_pre, 0.40);
-
-    // Each face shifts ONLY if its corresponding neighbour is non-foliage.
-    let s_xm = select(wind_pre.x, 0.0, n_xm);
-    let s_xp = select(wind_pre.x, 0.0, n_xp);
-    let s_zm = select(wind_pre.y, 0.0, n_zm);
-    let s_zp = select(wind_pre.y, 0.0, n_zp);
-
-    let voxel_min = vec3<f32>(
-        voxel_min_base.x + s_xm,
-        voxel_min_base.y,
-        voxel_min_base.z + s_zm,
-    );
-    let voxel_max = vec3<f32>(
-        voxel_min_base.x + 1.0 + s_xp,
-        voxel_min_base.y + 1.0,
-        voxel_min_base.z + 1.0 + s_zp,
-    );
+    let voxel_min = vec3<f32>(f32(voxel.x), f32(voxel.y), f32(voxel.z));
     let inv_dir = vec3<f32>(safe_inv(dir.x), safe_inv(dir.y), safe_inv(dir.z));
     let t0 = (voxel_min - origin) * inv_dir;
-    let t1 = (voxel_max - origin) * inv_dir;
+    let t1 = (voxel_min + vec3<f32>(1.0) - origin) * inv_dir;
     let tmin = min(t0, t1);
     let tmax = max(t0, t1);
     let t_enter = max(max(tmin.x, tmin.y), max(tmin.z, 0.0));
     let t_exit = min(min(tmax.x, tmax.y), tmax.z);
     if (t_enter >= t_exit) { return out; }
 
-    let vh = vh_pre;
-    // Cube already moves — leave UV LOCKED to the (shifted) voxel so the
-    // texture doesn't slide on top of the wobble. Was creating glitch
-    // double-motion before.
-    let uv_wind = vec2<f32>(0.0);
-
-    // ENTRY-face alpha test.
+    // ENTRY-face cutout test.
     var entry_axis: i32 = 0;
     if (tmin.x >= tmin.y && tmin.x >= tmin.z) { entry_axis = 0; }
     else if (tmin.y >= tmin.z) { entry_axis = 1; }
     else { entry_axis = 2; }
-    let p_entry = origin + dir * t_enter;
-    let lp_e = p_entry - voxel_min;
+    let lp_e = origin + dir * t_enter - voxel_min;
     var uv_e: vec2<f32>;
-    if (entry_axis == 0) { uv_e = vec2<f32>(lp_e.y, lp_e.z + uv_wind.y); }
-    else if (entry_axis == 1) { uv_e = vec2<f32>(lp_e.x + uv_wind.x, lp_e.z + uv_wind.y); }
-    else { uv_e = vec2<f32>(lp_e.x + uv_wind.x, lp_e.y); }
-    if (leaf_face_alpha(voxel_min_base, entry_axis, fract(uv_e), 0.0)) {
+    if (entry_axis == 0) { uv_e = vec2<f32>(lp_e.z, lp_e.y); }
+    else if (entry_axis == 1) { uv_e = vec2<f32>(lp_e.x, lp_e.z); }
+    else { uv_e = vec2<f32>(lp_e.x, lp_e.y); }
+    let val_e = leaf_face_texel(mat, voxel_min, entry_axis, fract(uv_e), 0.0);
+    if (val_e != 0u) {
         out.hit = true;
         out.t_hit = t_enter;
         var n = vec3<f32>(0.0);
@@ -726,22 +709,23 @@ fn leaf_density_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>) -> SubH
         else if (entry_axis == 1) { n.y = select(1.0, -1.0, dir.y > 0.0); }
         else { n.z = select(1.0, -1.0, dir.z > 0.0); }
         out.normal = n;
+        out.color_tint = vec3<f32>(select(1.0, 0.74, val_e == 2u));
         return out;
     }
 
-    // ENTRY transparent — test EXIT face. Same pattern, different salt so
-    // the back of the cube isn't a mirror of the front.
+    // ENTRY transparent — test the EXIT face with a different salt so the
+    // back of the cube isn't a mirror of the front.
     var exit_axis: i32 = 0;
     if (tmax.x <= tmax.y && tmax.x <= tmax.z) { exit_axis = 0; }
     else if (tmax.y <= tmax.z) { exit_axis = 1; }
     else { exit_axis = 2; }
-    let p_exit = origin + dir * t_exit;
-    let lp_x = p_exit - voxel_min;
+    let lp_x = origin + dir * t_exit - voxel_min;
     var uv_x: vec2<f32>;
-    if (exit_axis == 0) { uv_x = vec2<f32>(lp_x.y, lp_x.z + uv_wind.y); }
-    else if (exit_axis == 1) { uv_x = vec2<f32>(lp_x.x + uv_wind.x, lp_x.z + uv_wind.y); }
-    else { uv_x = vec2<f32>(lp_x.x + uv_wind.x, lp_x.y); }
-    if (leaf_face_alpha(voxel_min_base, exit_axis, fract(uv_x), 5.7)) {
+    if (exit_axis == 0) { uv_x = vec2<f32>(lp_x.z, lp_x.y); }
+    else if (exit_axis == 1) { uv_x = vec2<f32>(lp_x.x, lp_x.z); }
+    else { uv_x = vec2<f32>(lp_x.x, lp_x.y); }
+    let val_x = leaf_face_texel(mat, voxel_min, exit_axis, fract(uv_x), 5.7);
+    if (val_x != 0u) {
         out.hit = true;
         out.t_hit = t_exit;
         var n = vec3<f32>(0.0);
@@ -749,173 +733,52 @@ fn leaf_density_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>) -> SubH
         else if (exit_axis == 1) { n.y = select(-1.0, 1.0, dir.y > 0.0); }
         else { n.z = select(-1.0, 1.0, dir.z > 0.0); }
         out.normal = n;
+        out.color_tint = vec3<f32>(select(0.88, 0.66, val_x == 2u)); // interior faces darker
         return out;
     }
 
     return out;
 }
 
-// ---------- GRASS: 3D bundle of tapered blades scattered through cell ----------
-// Each grass voxel = ~14 thin vertical blades at hash-randomised xz positions
-// across the FULL cell (not an X cross), with varied heights and per-blade
-// tints. Each blade is a tapered AABB-bounded silhouette that tilts in the
-// wind. Fills the volume of the voxel like a real tuft.
-// (Flowers still use the simple X-plane silhouette below.)
-// Returns (is_opaque, blade_brightness 0..1).
-fn grass_blade_alpha(voxel_min: vec3<f32>, plane_id: i32, s: f32, v: f32) -> vec2<f32> {
-    let plane_span = 0.92;
-    let n_strips: i32 = 8;
-    let strip_w = plane_span / f32(n_strips);
-    for (var b: i32 = 0; b < 8; b = b + 1) {
-        let strip_center_base = -plane_span * 0.5 + strip_w * (f32(b) + 0.5);
-        let h1 = hash3f(vec3<f32>(voxel_min.x + f32(b) * 1.3, f32(plane_id) + voxel_min.z, voxel_min.y));
-        if (h1 > 0.82) { continue; }
-        let jitter = (h1 - 0.5) * strip_w * 0.7;
-        let strip_center = strip_center_base + jitter;
-        let h2 = hash3f(vec3<f32>(voxel_min.x + f32(b) * 0.9, f32(plane_id) * 0.5 + voxel_min.z + 11.0, voxel_min.y));
-        let blade_top = 0.55 + h2 * 0.40;
-        if (v > blade_top) { continue; }
-        let v_norm = v / blade_top;
-        let half_w = 0.045 * mix(1.0, 0.22, v_norm);
-        if (abs(s - strip_center) < half_w) {
-            let bright = 0.75 + v_norm * 0.35 + (h2 - 0.5) * 0.15;
-            return vec2<f32>(1.0, bright);
-        }
+// ---------- GRASS + FLOWERS: crossed quads with authored sprites ----------
+// The classic rasterizer trick, ported to the raymarcher: every decoration
+// voxel is two diagonal planes ("X") carrying a hand-drawn 16x16 sprite.
+// Two plane intersections + one texel fetch replaces the old 22-blade
+// procedural bundle (22 AABBs x 5 samples in the hottest DDA loop).
+// The whole quad shears sideways with the wind, weighted by height, exactly
+// like a vertex-shader wave on a crossed billboard.
+fn cross_sprite_tint(mat: u32, sprite: u32, val: u32, v: f32, vh: f32) -> vec3<f32> {
+    if (mat == MAT_TALL_GRASS) {
+        // Dark base -> bright tip, darker secondary texels, per-voxel hue.
+        let b = (0.60 + 0.55 * v) * select(1.0, 0.72, val == 2u);
+        return vec3<f32>(b) * (0.85 + vh * 0.30);
     }
-    return vec2<f32>(0.0, 1.0);
+    // Flowers. Tints are target-colour / flower-palette-colour ratios
+    // (palette MAT_FLOWER = 1.10, 0.35, 0.65).
+    if (val == 2u) { return vec3<f32>(0.182, 1.286, 0.200); } // stem/leaf green
+    if (sprite == SPR_POPPY) {
+        if (val == 3u) { return vec3<f32>(0.109, 0.257, 0.077); } // dark centre
+        return vec3<f32>(0.864, 0.429, 0.185);                    // red petals
+    }
+    if (val == 3u) { return vec3<f32>(1.045, 2.429, 0.231); }     // yellow centre
+    return vec3<f32>(0.864, 2.714, 1.385);                        // white petals
 }
 
-// Returns (is_opaque, is_stem). Stem and petals need different colours.
-fn flower_alpha_part(s: f32, v: f32) -> vec2<f32> {
-    // STEM: thin vertical strip from bottom up to 0.55. (is_stem = 1)
-    if (v < 0.55 && abs(s) < 0.025) { return vec2<f32>(1.0, 1.0); }
-    // PETALS: 5 lobes around the top centre at y=0.78. Plus a small bud.
-    let pc = vec2<f32>(0.0, 0.78);
-    let d = vec2<f32>(s, v) - pc;
-    if (dot(d, d) < 0.05 * 0.05) { return vec2<f32>(1.0, 0.0); }
-    for (var i: i32 = 0; i < 5; i = i + 1) {
-        let ang = f32(i) * 1.2566;
-        let lobe_c = pc + vec2<f32>(cos(ang), sin(ang) * 0.6) * 0.12;
-        let ld = vec2<f32>(s, v) - lobe_c;
-        if (dot(ld, ld) < 0.07 * 0.07) { return vec2<f32>(1.0, 0.0); }
-    }
-    return vec2<f32>(0.0, 0.0);
-}
-
-fn grass_bundle_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u32) -> SubHit {
+fn sprite_cross_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u32) -> SubHit {
     var out: SubHit;
     out.hit = false;
     out.color_tint = vec3<f32>(1.0);
     let voxel_min = vec3<f32>(f32(voxel.x), f32(voxel.y), f32(voxel.z));
     let vh = hash3f(voxel_min);
-    if (vh > 0.92) { return out; }
+    if (vh > 0.92) { return out; } // sparse gaps, same density as before
 
-    // Flowers stay on the X-plane silhouette (recognisable shape).
-    if (mat == MAT_FLOWER) {
-        return flower_planes_hit(voxel, origin, dir, voxel_min, vh);
-    }
+    var sprite = SPR_TALL_GRASS;
+    if (mat == MAT_FLOWER) { sprite = select(SPR_POPPY, SPR_DAISY, vh > 0.46); }
 
-    // GRASS — packed bundle of 22 tapered, bowed blades filling the cell.
-    // Each blade has independent xz position, height, lean direction, and
-    // colour tint. Looks like a proper bushy tuft, not strips.
-    let phase = voxel_min.x * 0.40 + voxel_min.z * 0.55 + vh * 6.28;
-    let wind = wind_offset(voxel_min, phase, 0.22);
-    let inv_dir = vec3<f32>(safe_inv(dir.x), safe_inv(dir.y), safe_inv(dir.z));
-
-    let n_blades: i32 = 22;
-    let blade_half_w_base = 0.030;
-
-    var best_t: f32 = 1e30;
-    var best_n = vec3<f32>(0.0, 1.0, 0.0);
-    var best_bright: f32 = 1.0;
-
-    for (var i: i32 = 0; i < 22; i = i + 1) {
-        if (i >= n_blades) { break; }
-        let h1 = hash3f(voxel_min + vec3<f32>(f32(i) * 1.13, 0.0, f32(i) * 0.71));
-        let h2 = hash3f(voxel_min + vec3<f32>(f32(i) * 0.91, 0.0, f32(i) * 1.27));
-        let h3 = hash3f(voxel_min + vec3<f32>(f32(i) * 1.31, 0.0, f32(i) * 0.83));
-        let h4 = hash3f(voxel_min + vec3<f32>(f32(i) * 2.07, 0.0, f32(i) * 1.93));
-        if (h1 > 0.93) { continue; }
-        let bx_local = 0.05 + h1 * 0.90;
-        let bz_local = 0.05 + h2 * 0.90;
-        // VERY varied heights: short stubs (~0.2) to tall blades (~1.0).
-        let blade_top = 0.20 + h3 * 0.80;
-        // Per-blade natural lean direction (independent of wind) — gives
-        // the tuft a curly random look rather than every blade ramrod.
-        let lean_angle = h4 * 6.28318;
-        let lean_amt = 0.05 + h4 * 0.10;
-        let lean_x = cos(lean_angle) * lean_amt;
-        let lean_z = sin(lean_angle) * lean_amt;
-
-        // Combined sway = natural lean + wind shift.
-        let total_x = lean_x + wind.x;
-        let total_z = lean_z + wind.y;
-        let sway_max_x = max(0.0, total_x);
-        let sway_min_x = max(0.0, -total_x);
-        let sway_max_z = max(0.0, total_z);
-        let sway_min_z = max(0.0, -total_z);
-        let bmin = vec3<f32>(
-            voxel_min.x + bx_local - blade_half_w_base - sway_min_x,
-            voxel_min.y,
-            voxel_min.z + bz_local - blade_half_w_base - sway_min_z,
-        );
-        let bmax = vec3<f32>(
-            voxel_min.x + bx_local + blade_half_w_base + sway_max_x,
-            voxel_min.y + blade_top,
-            voxel_min.z + bz_local + blade_half_w_base + sway_max_z,
-        );
-        let t0b = (bmin - origin) * inv_dir;
-        let t1b = (bmax - origin) * inv_dir;
-        let tmin_b = min(t0b, t1b);
-        let tmax_b = max(t0b, t1b);
-        let t_enter_b = max(max(tmin_b.x, tmin_b.y), max(tmin_b.z, 0.0));
-        let t_exit_b = min(min(tmax_b.x, tmax_b.y), tmax_b.z);
-        if (t_enter_b >= t_exit_b) { continue; }
-
-        let n_in: i32 = 5;
-        let s_step = (t_exit_b - t_enter_b) / f32(n_in);
-        for (var j: i32 = 0; j < n_in; j = j + 1) {
-            let t = t_enter_b + s_step * (f32(j) + 0.5);
-            let p = origin + dir * t;
-            let y_n = (p.y - voxel_min.y) / blade_top;
-            if (y_n < 0.0 || y_n > 1.0) { continue; }
-            let half_w = blade_half_w_base * mix(1.0, 0.15, y_n);
-            // Bowed blade arcing in (lean + wind) direction. pow(y, 1.7)
-            // curves smoothly from straight base to arched tip.
-            let bow = pow(y_n, 1.7);
-            let cx = voxel_min.x + bx_local + total_x * bow;
-            let cz = voxel_min.z + bz_local + total_z * bow;
-            let dxc = p.x - cx;
-            let dzc = p.z - cz;
-            if (abs(dxc) > half_w || abs(dzc) > half_w) { continue; }
-            if (t < best_t) {
-                best_t = t;
-                best_n = normalize(vec3<f32>(dxc, 0.15, dzc) + vec3<f32>(0.0001));
-                // Wider tint range: dark base 0.55 → bright tip 1.20.
-                // Per-blade hue offset adds the colour variation a real
-                // tuft has (some yellow-green tips, some deeper green).
-                best_bright = 0.55 + y_n * 0.55 + (h4 - 0.5) * 0.30;
-            }
-            break;
-        }
-    }
-
-    if (best_t < 1e30) {
-        out.hit = true;
-        out.t_hit = best_t;
-        out.normal = best_n;
-        out.color_tint = vec3<f32>(best_bright);
-    }
-    return out;
-}
-
-fn flower_planes_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, voxel_min: vec3<f32>, vh: f32) -> SubHit {
-    var out: SubHit;
-    out.hit = false;
-    out.color_tint = vec3<f32>(1.0);
     let voxel_center = voxel_min + vec3<f32>(0.5);
     let phase = voxel_min.x * 0.40 + voxel_min.z * 0.55 + vh * 6.28;
     let wind = wind_offset(voxel_min, phase, 0.22);
+    let mirror_u = fract(vh * 16.0) > 0.5;
 
     var best_t: f32 = 1e30;
     var best_n = vec3<f32>(0.0, 1.0, 0.0);
@@ -934,7 +797,7 @@ fn flower_planes_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, voxel_
         let denom = dot(dir, pn);
         if (abs(denom) < 0.0001) { continue; }
         let t = dot(voxel_center - origin, pn) / denom;
-        if (t < 0.0) { continue; }
+        if (t < 0.0 || t >= best_t) { continue; }
         let p_hit = origin + dir * t;
         let local = p_hit - voxel_min;
         if (local.x < 0.0 || local.x > 1.0
@@ -943,21 +806,20 @@ fn flower_planes_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, voxel_
 
         let s = (local.x - 0.5) * pt.x + (local.z - 0.5) * pt.z;
         let v = local.y;
+        // Wind shears the sprite sideways, scaled by height above the root.
         let wind_along = (wind.x * pt.x + wind.y * pt.z) * v;
         let s_w = s - wind_along;
 
-        let fa = flower_alpha_part(s_w, v);
-        if (fa.x < 0.5) { continue; }
-        var local_tint = vec3<f32>(1.0);
-        if (fa.y > 0.5) {
-            // Stem → green.
-            local_tint = vec3<f32>(0.32 / 1.10, 0.62 / 0.35, 0.20 / 0.65);
-        }
-        if (t < best_t) {
-            best_t = t;
-            best_n = select(pn, -pn, denom > 0.0);
-            tint = local_tint;
-        }
+        let u = clamp((s_w + 0.70711) / 1.41421, 0.0, 0.99999);
+        var tx = u32(u * 16.0);
+        if (mirror_u) { tx = 15u - tx; }
+        let ty = u32(clamp(v * 16.0, 0.0, 15.0));
+        let val = sprite_texel(sprite, tx, ty);
+        if (val == 0u) { continue; }
+
+        best_t = t;
+        best_n = select(pn, -pn, denom > 0.0);
+        tint = cross_sprite_tint(mat, sprite, val, v, vh);
     }
 
     if (best_t < 1e30) {
@@ -972,11 +834,21 @@ fn flower_planes_hit(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, voxel_
 fn foliage_subvoxel(voxel: vec3<i32>, origin: vec3<f32>, dir: vec3<f32>, mat: u32) -> SubHit {
     var hit: SubHit;
     if (mat == MAT_TALL_GRASS || mat == MAT_FLOWER) {
-        hit = grass_bundle_hit(voxel, origin, dir, mat);
+        hit = sprite_cross_hit(voxel, origin, dir, mat);
     } else {
-        hit = leaf_density_hit(voxel, origin, dir);
+        hit = leaf_cube_hit(voxel, origin, dir, mat);
     }
     return hit;
+}
+
+// Axis index of an exact axis-aligned face normal, or -1 for oblique normals
+// (cross-quad sprites). Leaf cube hits keep their face axis so they qualify
+// for cube AO and the reprojected lighting cache.
+fn axis_from_face_normal(n: vec3<f32>) -> i32 {
+    if (abs(n.x) > 0.99) { return 0; }
+    if (abs(n.y) > 0.99) { return 1; }
+    if (abs(n.z) > 0.99) { return 2; }
+    return -1;
 }
 
 // Sun rotates east→up→west→under. Start near midday so the very first frame
@@ -1168,10 +1040,29 @@ fn material_texture(p: vec3<f32>, n: vec3<f32>, mat: u32) -> vec3<f32> {
     if (mat == 13u || mat == 23u || mat == 24u) {
         return vec3<f32>(wood_pattern(p, n));
     }
-    // Grass — small clumpy variation.
+    // Grass block — the Minecraft/Allumeria treatment: green top, dirt sides
+    // with a ragged green fringe hanging over the top edge, dirt bottom.
+    // Side/bottom colours are expressed as (dirt palette / grass palette)
+    // channel ratios so the multiplier recolours green -> dirt.
     if (mat == 2u) {
-        let nn = vnoise3(vec3<f32>(uv * 2.2, 0.0));
-        return vec3<f32>(0.85 + nn * 0.30);
+        if (n.y > 0.5) {
+            // Top face: small clumpy variation (unchanged).
+            let nn = vnoise3(vec3<f32>(uv * 2.2, 0.0));
+            return vec3<f32>(0.85 + nn * 0.30);
+        }
+        let dirt = vec3<f32>(1.3333, 0.4154, 0.75); // (0.40,0.27,0.15)/(0.30,0.65,0.20)
+        let nn = vnoise3(vec3<f32>(uv * 1.6, 0.0));
+        if (n.y < -0.5) {
+            return dirt * (0.78 + nn * 0.30);
+        }
+        // Side face: uv = (world horizontal, world y). Fringe depth varies
+        // per 1/16-texel column so the edge looks torn, not ruler-straight.
+        let hcol = hash3f(vec3<f32>(floor(uv.x * 16.0) * 0.37, floor(uv.y) * 0.11, 3.7));
+        let fringe_depth = (2.0 + hcol * 4.0) / 16.0;
+        if (fract(uv.y) > 1.0 - fringe_depth) {
+            return vec3<f32>(0.85 + nn * 0.25);
+        }
+        return dirt * (0.78 + nn * 0.30);
     }
     // Dirt.
     if (mat == 3u) {
@@ -1527,6 +1418,7 @@ fn trace_no_water(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
     out.voxel = vec3<i32>(0);
     out.last_axis = -1;
     out.t_hit = 0.0;
+    out.tint = vec3<f32>(1.0);
 
     let init = dda_init(origin, dir);
     if (!init.valid) { return out; }
@@ -1707,12 +1599,9 @@ fn shade(
 ) -> vec3<f32> {
     let p_hit = origin + dir * hit.t_hit;
     let tex = material_texture(p_hit, hit.normal, hit.mat);
-    var base = palette[hit.mat].rgb * tex;
-    // Foliage sub-hit may override colour (flower stem → green, blade
-    // shading variations etc.)
-    if (hit.last_axis < 0 && is_foliage_mat(hit.mat)) {
-        base = base * g_foliage_tint;
-    }
+    // hit.tint carries the sub-voxel colour (leaf shade, blade gradient,
+    // petal/stem); (1,1,1) for plain cube hits.
+    var base = palette[hit.mat].rgb * tex * hit.tint;
     // Skip the cube-face AO for sub-voxel sphere hits (foliage). The curved
     // sphere normal already gives rim/falloff that reads as 3D.
     // AO (12 hierarchical neighbour lookups) only near the camera — its
@@ -2144,12 +2033,11 @@ const TILE_LOD_T: f32 = 520.0;
 // window (the camera sits at its centre).
 const MAX_RAY_DIST: f32 = 700.0;
 
-// Beyond this distance, procedural sub-voxel foliage (22-blade grass, leaf
-// alpha-cutouts) is treated as a solid cube rather than ray-marched. The
-// per-blade detail is sub-pixel far away and that inner loop is the single most
-// divergent/expensive thing a ray can hit (checklist: limit procedural foliage
-// to the nearest few metres).
-const FOLIAGE_NEAR_T: f32 = 72.0;
+// Beyond this distance, sub-voxel foliage (sprite cross-quads, leaf cutout
+// faces) is treated as a solid cube rather than ray-marched. Authored-sprite
+// foliage is cheap (2 plane tests + 1 texel fetch vs the old 22-blade
+// procedural bundle), so the detail radius is much wider than the old 72.
+const FOLIAGE_NEAR_T: f32 = 128.0;
 
 // Shadow / occlusion rays give up past this distance (treated as lit). Far
 // shadows contribute little and are the most expensive secondary rays
@@ -2173,6 +2061,7 @@ fn trace(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
     out.voxel = vec3<i32>(0);
     out.last_axis = -1;
     out.t_hit = 0.0;
+    out.tint = vec3<f32>(1.0);
 
     let init = dda_init(origin, dir);
     if (!init.valid) { return out; }
@@ -2338,9 +2227,12 @@ fn trace(origin: vec3<f32>, dir: vec3<f32>) -> Hit {
                     out.mat = m;
                     out.normal = fh.normal;
                     out.voxel = voxel;
-                    out.last_axis = -1;
+                    // Leaf cutout hits are stable cube faces (axis >= 0): they
+                    // get cube AO + the lighting cache. Cross-quad sprites
+                    // return oblique normals -> -1, as before.
+                    out.last_axis = axis_from_face_normal(fh.normal);
                     out.t_hit = fh.t_hit;
-                    g_foliage_tint = fh.color_tint;
+                    out.tint = fh.color_tint;
                     return out;
                 }
                 // cutout missed → fall through to the DDA step below.
