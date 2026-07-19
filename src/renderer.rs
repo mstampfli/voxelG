@@ -1506,9 +1506,6 @@ mod gpu_render_tests {
     /// precision) and read the frame back. Returns per-pixel luma
     /// (min, max, mean), or None if no GPU.
     pub(super) fn render_luma_stats_at(origin_chunk: glam::IVec2) -> Option<(f32, f32, f32)> {
-        let (device, queue) = headless_device()?;
-        let (w, h) = (320u32, 200u32);
-
         let mut world = World::new();
         world.fill_demo_terrain();
         if origin_chunk != glam::IVec2::ZERO {
@@ -1526,7 +1523,32 @@ mod gpu_render_tests {
         let s = crate::voxel::sample_terrain(cam.pos.x, cam.pos.z, world.seed);
         cam.pos.y = s.h as f32 + 30.0;
         cam.pitch = -0.35;
-        let cu = CameraUniform::from_camera(&cam, w, h, 0.0, wo, [0.0, 0.0], 0.0);
+
+        let rgba = render_rgba(&world, &cam)?;
+        let mut min = 1.0f32;
+        let mut max = 0.0f32;
+        let mut sum = 0.0f64;
+        let n = rgba.len() / 4;
+        for px in rgba.chunks_exact(4) {
+            let r = px[0] as f32 / 255.0;
+            let g = px[1] as f32 / 255.0;
+            let b = px[2] as f32 / 255.0;
+            let luma = 0.299 * r + 0.587 * g + 0.114 * b;
+            min = min.min(luma);
+            max = max.max(luma);
+            sum += luma as f64;
+        }
+        Some((min, max, (sum / n as f64) as f32))
+    }
+
+    /// Render one 320x200 frame of `world` from `cam` through the full
+    /// pipeline (half-res clouds, cs_main, a reprojection-validating second
+    /// frame, deferred transparent) and read the RGBA bytes back.
+    fn render_rgba(world: &World, cam: &Camera) -> Option<Vec<u8>> {
+        let (device, queue) = headless_device()?;
+        let (w, h) = (320u32, 200u32);
+        let wo = world.world_origin_voxel();
+        let cu = CameraUniform::from_camera(cam, w, h, 0.0, wo, [0.0, 0.0], 0.0);
 
         let camera_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("camera"),
@@ -1699,21 +1721,7 @@ mod gpu_render_tests {
         slice.map_async(wgpu::MapMode::Read, |_| {});
         device.poll(wgpu::Maintain::Wait);
         let data = slice.get_mapped_range();
-
-        let mut min = 1.0f32;
-        let mut max = 0.0f32;
-        let mut sum = 0.0f64;
-        let n = (w * h) as usize;
-        for px in data.chunks_exact(4) {
-            let r = px[0] as f32 / 255.0;
-            let g = px[1] as f32 / 255.0;
-            let b = px[2] as f32 / 255.0;
-            let luma = 0.299 * r + 0.587 * g + 0.114 * b;
-            min = min.min(luma);
-            max = max.max(luma);
-            sum += luma as f64;
-        }
-        Some((min, max, (sum / n as f64) as f32))
+        Some(data.to_vec())
     }
 
     fn assert_sane(label: &str, min: f32, max: f32, mean: f32) {
@@ -1725,26 +1733,12 @@ mod gpu_render_tests {
         assert!(mean > 0.05 && mean < 0.95, "[{label}] implausible mean luma {mean:.3}");
     }
 
-    /// Time the raymarch + deferred-transparent dispatches at 1920x1080 for
-    /// three scenarios: a high terrain overview, a water-heavy view, and a
-    /// foliage-heavy view (found by scanning the demo world), so water and
-    /// foliage shader changes can be A/B'd headlessly. Run with
-    /// `cargo test --lib raymarch_timing -- --nocapture --ignored`.
-    #[test]
-    #[ignore]
-    fn raymarch_timing() {
+    /// Densest water / leaf 32x32-column cells of a filled world (columns
+    /// sampled at stride 4), plus the ground height under the leaf cell —
+    /// deterministic camera anchors shared by the water/foliage content test
+    /// and the timing benchmark.
+    fn find_scene_anchors(world: &World) -> (glam::IVec2, glam::IVec2, i32) {
         use crate::voxel::{is_water_mat, is_leaf_mat};
-        let Some((device, queue)) = headless_device() else {
-            eprintln!("no GPU — skipping");
-            return;
-        };
-        let (w, h) = (1920u32, 1080u32);
-        let mut world = World::new();
-        world.fill_demo_terrain();
-
-        // Scan 32x32-column cells (columns sampled at stride 4) for the densest
-        // water cell (topmost solid is water) and the densest leaf cell, so the
-        // scenario cameras deterministically frame what they claim to measure.
         let cells = 512 / 32;
         let mut best_water = (0usize, glam::IVec2::ZERO);
         let mut best_leaf = (0usize, glam::IVec2::ZERO);
@@ -1770,7 +1764,6 @@ mod gpu_render_tests {
                 if leaf_n > best_leaf.0 { best_leaf = (leaf_n, c); }
             }
         }
-        // Surface height under the foliage cell for camera placement.
         let leaf_ground = (1..200)
             .rev()
             .find(|&y| world.material_at_world(best_leaf.1.x, y, best_leaf.1.y) != MAT_AIR)
@@ -1779,6 +1772,82 @@ mod gpu_render_tests {
             "scenario anchors: water cell {:?} ({} cols), leaf cell {:?} ({} voxels, ground y={})",
             best_water.1, best_water.0, best_leaf.1, best_leaf.0, leaf_ground
         );
+        (best_water.1, best_leaf.1, leaf_ground)
+    }
+
+    fn clamp_anchor(v: i32) -> f32 {
+        v.max(48).min(464) as f32
+    }
+
+    /// Fraction of pixels in the bottom 60% of the frame matching a colour
+    /// class. The top rows are excluded so sky can't satisfy a "blue water"
+    /// check.
+    fn ground_fraction(rgba: &[u8], w: usize, h: usize, class: fn(f32, f32, f32) -> bool) -> f32 {
+        let y0 = h * 2 / 5;
+        let mut n = 0usize;
+        let mut hits = 0usize;
+        for y in y0..h {
+            for x in 0..w {
+                let i = (y * w + x) * 4;
+                let r = rgba[i] as f32 / 255.0;
+                let g = rgba[i + 1] as f32 / 255.0;
+                let b = rgba[i + 2] as f32 / 255.0;
+                n += 1;
+                if class(r, g, b) { hits += 1; }
+            }
+        }
+        hits as f32 / n.max(1) as f32
+    }
+
+    /// The water view must contain water-blue pixels and the foliage view
+    /// green foliage pixels — catches "water/foliage renders black, pink, or
+    /// vanishes" regressions that the pure luma-stats tests can't see.
+    #[test]
+    fn renders_water_blue_and_foliage_green() {
+        let mut world = World::new();
+        world.fill_demo_terrain();
+        let (water_c, leaf_c, leaf_ground) = find_scene_anchors(&world);
+
+        let mut wcam = Camera::new();
+        wcam.pos = glam::Vec3::new(clamp_anchor(water_c.x), 86.0, clamp_anchor(water_c.y) - 40.0);
+        wcam.pitch = -0.45;
+        let Some(wframe) = render_rgba(&world, &wcam) else {
+            eprintln!("no GPU adapter — skipping water/foliage content test");
+            return;
+        };
+        let blue = ground_fraction(&wframe, 320, 200, |r, g, b| b > r + 0.05 && b > g + 0.02);
+        eprintln!("water view blue fraction: {blue:.3}");
+        assert!(blue > 0.10, "water view has too few water-blue pixels ({blue:.3})");
+
+        let mut fcam = Camera::new();
+        fcam.pos = glam::Vec3::new(
+            clamp_anchor(leaf_c.x),
+            leaf_ground as f32 + 14.0,
+            clamp_anchor(leaf_c.y) - 30.0,
+        );
+        fcam.pitch = -0.35;
+        let fframe = render_rgba(&world, &fcam).unwrap();
+        let green = ground_fraction(&fframe, 320, 200, |r, g, b| g > r + 0.03 && g > b + 0.03);
+        eprintln!("foliage view green fraction: {green:.3}");
+        assert!(green > 0.10, "foliage view has too few green pixels ({green:.3})");
+    }
+
+    /// Time the raymarch + deferred-transparent dispatches at 1920x1080 for
+    /// three scenarios: a high terrain overview, a water-heavy view, and a
+    /// foliage-heavy view (found by scanning the demo world), so water and
+    /// foliage shader changes can be A/B'd headlessly. Run with
+    /// `cargo test --lib raymarch_timing -- --nocapture --ignored`.
+    #[test]
+    #[ignore]
+    fn raymarch_timing() {
+        let Some((device, queue)) = headless_device() else {
+            eprintln!("no GPU — skipping");
+            return;
+        };
+        let (w, h) = (1920u32, 1080u32);
+        let mut world = World::new();
+        world.fill_demo_terrain();
+        let (water_anchor, leaf_anchor, leaf_ground) = find_scene_anchors(&world);
 
         let mk_cam = |pos: glam::Vec3, pitch: f32| {
             let mut cam = Camera::new();
@@ -1786,13 +1855,12 @@ mod gpu_render_tests {
             cam.pitch = pitch;
             cam
         };
-        let clampi = |v: i32| (v.max(48).min(464)) as f32;
         let scenarios = [
             ("terrain", mk_cam(glam::Vec3::new(256.0, 150.0, 256.0), -0.5)),
             (
                 "water",
                 mk_cam(
-                    glam::Vec3::new(clampi(best_water.1.x), 86.0, clampi(best_water.1.y) - 40.0),
+                    glam::Vec3::new(clamp_anchor(water_anchor.x), 86.0, clamp_anchor(water_anchor.y) - 40.0),
                     -0.45,
                 ),
             ),
@@ -1800,9 +1868,9 @@ mod gpu_render_tests {
                 "foliage",
                 mk_cam(
                     glam::Vec3::new(
-                        clampi(best_leaf.1.x),
+                        clamp_anchor(leaf_anchor.x),
                         leaf_ground as f32 + 14.0,
-                        clampi(best_leaf.1.y) - 30.0,
+                        clamp_anchor(leaf_anchor.y) - 30.0,
                     ),
                     -0.35,
                 ),
